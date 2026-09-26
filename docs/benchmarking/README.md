@@ -21,8 +21,8 @@ python scripts/run_perf.py
 
 The [final logit softcap benchmark](../operators/final-logit-softcap.md#benchmark)
 compares eager PyTorch and Triton forward, backward, and forward+backward on the
-same NVIDIA GPU. It reuses the profiler's timer and writes JSON/Markdown reports;
-it is a standalone entry point, not a `--workloads` selection.
+same GPU, on CUDA or ROCm. It reuses the profiler's timer and writes JSON/Markdown
+reports; it is a standalone entry point, not a `--workloads` selection.
 
 ## Unified ROCm deterministic FFN benchmark
 

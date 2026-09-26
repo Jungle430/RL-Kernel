@@ -46,7 +46,7 @@ def test_workload_reuses_inputs_without_accumulating_gradients(mode):
 
 def test_benchmark_rejects_cpu_instead_of_timing_fallback():
     args = build_arg_parser().parse_args(["--device", "cpu"])
-    with pytest.raises(RuntimeError, match="requires an NVIDIA CUDA GPU"):
+    with pytest.raises(RuntimeError, match="requires an NVIDIA CUDA or AMD ROCm GPU"):
         run_benchmark(args)
 
 

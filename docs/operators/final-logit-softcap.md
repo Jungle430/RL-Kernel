@@ -131,7 +131,8 @@ The elapsed time above is for the whole test suite, not operator latency.
 
 ## Benchmark
 
-Run on an NVIDIA CUDA host with the development dependencies installed:
+Run on a CUDA (NVIDIA) or ROCm (AMD) host with the development dependencies
+installed:
 
 ```bash
 # Quick execution check before the complete run.
@@ -145,9 +146,10 @@ python benchmarks/benchmark_final_logit_softcap.py \
 ```
 
 This standalone operator benchmark reuses the existing `PerformanceProfiler`
-CUDA-event timer. It directly constructs the native and Triton wrappers on the
-same GPU, checks output and gradient accuracy before timing, and writes
-`results.json` and `report.md`. Failure to import or run Triton is an error.
+accelerator-event timer (CUDA events on NVIDIA, HIP events on ROCm). It directly
+constructs the native and Triton wrappers on the same GPU, checks output and
+gradient accuracy before timing, and writes `results.json` and `report.md`.
+Failure to import or run Triton is an error.
 
 Default shapes are `1x1x1025`, `1x1x262144`, `1x16x262144` and `1x64x262144`.
 Inputs are contiguous, with random FP32 upstream gradients. Noncontiguous layouts
@@ -164,12 +166,13 @@ allocated memory, and `native_ms / triton_ms` speedup. Extra peak allocation exc
 existing inputs and any prebuilt backward graph, so it is not total training memory.
 Input generation, correctness checks and compilation are outside the timing window.
 Public-wrapper allocation and autograd dispatch are included. For small tensors,
-host dispatch gaps can dominate CUDA-event measurements. This compares eager
-PyTorch with Triton, not `torch.compile` or CUDA graph execution.
+host dispatch gaps can dominate accelerator-event measurements. This compares eager
+PyTorch with Triton, not `torch.compile` or graph capture.
 
-The report records the GPU, compute capability, software versions, commit, tracked
-changes, input shapes/dtypes, warmup/repetitions, seed, block size and tolerance
-contract fingerprint.
+The report records the backend and its runtime version, the GPU and architecture,
+compute capability (CUDA only), software versions, commit, tracked changes, input
+shapes/dtypes, warmup/repetitions, seed, block size and tolerance contract
+fingerprint.
 
 ### Initial CUDA Results
 
