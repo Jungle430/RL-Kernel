@@ -94,6 +94,7 @@ def _check_accuracy(native, candidate, x, grad_y):
         (torch.float32, x.dtype),
         expected,
         actual,
+        strict=True,
     ):
         assert result.shape == x.shape and result.dtype == dtype
         tolerance = resolve_tolerance(
