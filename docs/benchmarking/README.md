@@ -19,11 +19,6 @@ python benchmarks/benchmark_rocm_ffn.py --help
 python scripts/run_perf.py
 ```
 
-The [final logit softcap benchmark](../operators/final-logit-softcap.md#benchmark)
-compares eager PyTorch and Triton forward, backward, and forward+backward on the
-same GPU, on CUDA or ROCm. It reuses the profiler's timer and writes JSON/Markdown
-reports; it is a standalone entry point, not a `--workloads` selection.
-
 ## Unified ROCm deterministic FFN benchmark
 
 The RCCL/FFN benchmark has one entry point. It measures the deterministic
