@@ -43,7 +43,7 @@ method: `forward` already returns FP32.
 
 | Platform | Registry priority | Validation status |
 | --- | --- | --- |
-| NVIDIA CUDA | Triton → PyTorch native | Focused correctness suite passed on RTX 2000 Ada |
+| NVIDIA CUDA | Triton → PyTorch native | CUDA correctness validated; evidence linked below |
 | ROCm | Triton → PyTorch native | Hardware execution pending |
 | CPU | PyTorch native | Covered by the reference and integration tests |
 | MUSA / NPU | PyTorch native | Registry selection tested; hardware execution not validated |
@@ -114,20 +114,8 @@ views, random upstream gradients, registry fallback and the accuracy harness.
 CPU-only runs skip GPU cases. On a GPU host, a missing Triton backend fails the
 GPU tests instead of silently testing the native fallback.
 
-Contributor-supplied CUDA run on 2026-09-25 at commit
-`ae5e34c87328183e233a2affdde011748d0f503e`:
-
-| Environment | Value |
-| --- | --- |
-| GPU | NVIDIA RTX 2000 Ada Generation, compute capability 8.9 |
-| Python | 3.12.3 |
-| PyTorch | 2.13.0+cu130 |
-| PyTorch CUDA runtime | 13.0 |
-| Triton | 3.7.1 |
-| Command | `python -m pytest tests/test_final_logit_softcap.py -v -rs` |
-| Result | **76 passed in 10.46s**, no skips or failures |
-
-The elapsed time above is for the whole test suite, not operator latency.
+CUDA validation logs and hardware details are recorded in
+[PR #444](https://github.com/RL-Align/RL-Kernel/pull/444#validation).
 
 ## Benchmark
 
@@ -138,11 +126,11 @@ installed:
 # Quick execution check before the complete run.
 python benchmarks/benchmark_final_logit_softcap.py \
   --shapes 1x1x1025 --dtypes fp32 --warmup 3 --repeat 5 \
-  --output-dir reports/final-logit-softcap-smoke
+  --output-dir ../softcap-results/smoke
 
 # FP16, BF16 and FP32; small tails through 64 vocabulary rows.
 python benchmarks/benchmark_final_logit_softcap.py \
-  --output-dir reports/final-logit-softcap
+  --output-dir ../softcap-results/run-1
 ```
 
 This standalone operator benchmark reuses the existing `PerformanceProfiler`
@@ -174,44 +162,13 @@ compute capability (CUDA only), software versions, commit, tracked changes, inpu
 shapes/dtypes, warmup/repetitions, seed, block size and tolerance contract
 fingerprint.
 
-### Initial CUDA Results
+### Reports and validation evidence
 
-The contributor ran the default benchmark on an NVIDIA RTX 2000 Ada Generation
-with PyTorch 2.13.0+cu130 and Triton 3.7.1, at commit
-`ec0b1dd6b70984c5b6c21425490ab0ae7592feb8` with no tracked changes. All 12
-shape/dtype combinations passed output and gradient accuracy checks before
-timing. The run used 10 warmups and 50 measured repetitions.
-
-For `1x64x262144` (16,777,216 elements), the measured speedups over eager PyTorch
-were:
-
-| Input dtype | Forward | Backward | Forward + backward |
-| --- | ---: | ---: | ---: |
-| FP16 | 4.65x | 3.59x | 4.36x |
-| BF16 | 4.65x | 3.62x | 4.35x |
-| FP32 | 2.85x | 2.12x | 2.53x |
-
-These gains do not apply to every size. For `1x1x1025` and `1x1x262144`, all
-FP32 modes were slower, with speedup ratios of 0.78x–0.96x. The smallest BF16
-backward case measured 0.92x. These are observed medians from one run, not a
-claim of statistically significant differences. The timer includes host dispatch
-gaps; it does not isolate kernel execution time or identify the cause of the
-small-input regressions.
-
-The [full report](https://github.com/Jungle430/RL-Kernel/blob/codex/final-logit-softcap/benchmarks/results/final_logit_softcap_rtx2000ada/report.md)
-preserves all 36 timing rows, including regressions and incremental peak memory.
-The original JSON is archived alongside it, including per-case standard deviations,
-accuracy errors and environment metadata. All rounded report values and the
-tolerance contract fingerprint were checked against that JSON. It identifies
-driver 580.159.04, 22 multiprocessors and 15.57 GiB of device memory.
-
-Some timings have substantial dispersion: for BF16 `1x16x262144`
-forward+backward, native median/std are 0.981376/0.873993 ms; for FP32
-`1x64x262144` forward, Triton median/std are 0.692240/0.382200 ms.
-The reported standard deviation describes individual repetitions, not uncertainty
-in the median. Raw per-repetition samples were not saved, so this run does not
-establish confidence intervals or statistical significance. Repeated runs on an
-idle GPU and separate kernel-time measurements should precede tuning decisions.
+See [PR #444](https://github.com/RL-Align/RL-Kernel/pull/444#cuda-benchmark-results)
+for measured results, hardware/software fingerprints, timing variability and
+regressions. Markdown reports, JSON measurements and validation logs are PR
+attachments rather than tracked repository files. Keep generated reports outside
+the checkout, as in the commands above.
 
 ## Known Limitations
 
