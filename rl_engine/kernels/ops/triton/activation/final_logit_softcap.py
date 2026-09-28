@@ -22,7 +22,8 @@ _SUPPORTED_DEVICES = ("cuda", "hip", "xpu", "musa")
 
 @triton.jit
 def _final_logit_softcap_fwd_kernel(x_ptr, y_ptr, n_elements, BLOCK: tl.constexpr):
-    pid = tl.program_id(0)
+    # Widen before multiplying so element offsets can cross the int32 boundary.
+    pid = tl.program_id(0).to(tl.int64)
     offs = pid * BLOCK + tl.arange(0, BLOCK)
     mask = offs < n_elements
 
@@ -37,7 +38,8 @@ def _final_logit_softcap_fwd_kernel(x_ptr, y_ptr, n_elements, BLOCK: tl.constexp
 
 @triton.jit
 def _final_logit_softcap_bwd_kernel(dy_ptr, x_ptr, dx_ptr, n_elements, BLOCK: tl.constexpr):
-    pid = tl.program_id(0)
+    # Widen before multiplying, as in the forward kernel.
+    pid = tl.program_id(0).to(tl.int64)
     offs = pid * BLOCK + tl.arange(0, BLOCK)
     mask = offs < n_elements
 

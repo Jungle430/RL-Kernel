@@ -74,6 +74,11 @@ add allocation and copy costs. Inputs and upstream gradients are not modified.
 Backward saves the contiguous input in its original dtype and recomputes tanh.
 Empty inputs return empty buffers without launching a kernel.
 
+Both Triton kernels convert the program ID to `int64` before multiplying by
+the block size, keeping element-offset arithmetic in 64 bits. This removes the
+previous $2^{31}$-element indexing restriction without changing floating-point
+arithmetic or output dtypes. Allocation and launch limits still apply.
+
 ## Accuracy and Invariance
 
 Tests obtain thresholds from the shared WS1 `tolerance_contract.json` through
@@ -111,11 +116,15 @@ python scripts/check_operator.py --op final_logit_softcap --candidate triton \
 The focused operator suite covers all three input dtypes, block boundaries,
 scalar/empty tensors, multidimensional shapes, saturation, strided/expanded
 views, random upstream gradients, registry fallback and the accuracy harness.
+An index regression exercises the production forward/backward kernels on blocks
+straddling $2^{31}$, rebasing pointers into small buffers and checking the masked
+tail. Earlier blocks perform no memory access; the test does not allocate a
+multi-billion-element tensor.
 CPU-only runs skip GPU cases. On a GPU host, a missing Triton backend fails the
 GPU tests instead of silently testing the native fallback.
 
 CUDA validation logs and hardware details are recorded in
-[PR #444](https://github.com/RL-Align/RL-Kernel/pull/444#validation).
+[PR #444](https://github.com/RL-Align/RL-Kernel/pull/444#2-validation-and-performance).
 
 ## Benchmark
 
@@ -164,7 +173,7 @@ fingerprint.
 
 ### Reports and validation evidence
 
-See [PR #444](https://github.com/RL-Align/RL-Kernel/pull/444#cuda-benchmark-results)
+See [PR #444](https://github.com/RL-Align/RL-Kernel/pull/444#2-validation-and-performance)
 for measured results, hardware/software fingerprints, timing variability and
 regressions. Markdown reports, JSON measurements and validation logs are PR
 attachments rather than tracked repository files. Keep generated reports outside
@@ -175,8 +184,6 @@ the checkout, as in the commands above.
 - The cap is fixed at 30; configurable or trainable caps are not implemented.
 - The Triton autograd wrapper supports first-order gradients only.
 - The current Triton configuration uses a fixed block size of 1024, without autotuning.
-- The Triton kernels use 32-bit offsets; tensors with $2^{31}$ or more elements
-  are outside the supported range. The wrapper does not enforce this bound.
 - FP64, integer and complex inputs are rejected. NaN/Inf semantics have not been
   separately validated.
 - ROCm and other accelerator hardware validation remain pending.

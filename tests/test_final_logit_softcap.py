@@ -186,6 +186,64 @@ def test_triton_forward_backward_and_block_boundaries(triton_op, dtype, shape):
 
 
 @pytest.mark.parametrize("dtype", _DTYPES)
+def test_triton_forward_backward_across_int32_index_boundary(triton_op, dtype):
+    """Exercise real kernel offsets around 2**31 using small rebased buffers."""
+    import triton
+    import triton.language as tl
+
+    from rl_engine.kernels.ops.triton.activation.final_logit_softcap import (
+        _BLOCK,
+        _final_logit_softcap_bwd_kernel,
+        _final_logit_softcap_fwd_kernel,
+    )
+
+    @triton.jit
+    def run_last_blocks(
+        x_ptr,
+        grad_y_ptr,
+        out_ptr,
+        n_elements,
+        START_PID: tl.constexpr,
+        BACKWARD: tl.constexpr,
+        BLOCK: tl.constexpr,
+    ):
+        # Earlier programs do no memory access. The last three programs call
+        # the production kernels with their real, large program IDs. Rebasing
+        # maps those logical offsets into the small allocations below.
+        if tl.program_id(0) >= START_PID:
+            base = tl.full((), START_PID * BLOCK, tl.int64)
+            if BACKWARD:
+                _final_logit_softcap_bwd_kernel(
+                    grad_y_ptr - base, x_ptr - base, out_ptr - base, n_elements, BLOCK
+                )
+            else:
+                _final_logit_softcap_fwd_kernel(x_ptr - base, out_ptr - base, n_elements, BLOCK)
+
+    start_pid = (2**31 // _BLOCK) - 1
+    valid = 2 * _BLOCK + 17
+    n_elements = start_pid * _BLOCK + valid
+    x = _rand((3 * _BLOCK,), dtype=dtype, device="cuda", scale=30.0)
+    grad_y = _rand(x.shape, device="cuda", seed=416)
+    expected = _evaluate(NativeFinalLogitSoftcapOp(), x[:valid].cpu(), grad_y[:valid].cpu())
+    grid = (triton.cdiv(n_elements, _BLOCK),)
+    for backward, reference in enumerate(expected):
+        out = torch.full_like(x, -123.0, dtype=dtype if backward else torch.float32)
+        run_last_blocks[grid](
+            x,
+            grad_y,
+            out,
+            n_elements,
+            START_PID=start_pid,
+            BACKWARD=bool(backward),
+            BLOCK=_BLOCK,
+        )
+        _assert_accuracy(
+            out[:valid], reference, "gradient_accuracy" if backward else "forward_accuracy"
+        )
+        assert torch.equal(out[valid:], torch.full_like(out[valid:], -123.0))
+
+
+@pytest.mark.parametrize("dtype", _DTYPES)
 def test_triton_near_zero_and_saturated_values(triton_op, dtype):
     x = torch.tensor(_VALUES, dtype=dtype, device="cuda")
     _check_triton_against_native(triton_op, x, _rand(x.shape, device="cuda", seed=416))
