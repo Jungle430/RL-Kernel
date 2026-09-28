@@ -107,8 +107,8 @@ bitwise equality.
 ```bash
 uv sync --extra dev
 source .venv/bin/activate
-python -m pytest tests/test_final_logit_softcap.py -v -rs
-python -m pytest tests/test_final_logit_softcap_benchmark.py -v
+python -m pytest tests/gemma/test_final_logit_softcap.py -v -rs
+python -m pytest tests/gemma/test_final_logit_softcap_benchmark.py -v
 python scripts/check_operator.py --op final_logit_softcap --candidate triton \
   --device cuda --dtype bf16 --batch 2 --seq 3 --vocab 262144 --check-grad
 ```
