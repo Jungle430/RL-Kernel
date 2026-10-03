@@ -74,8 +74,8 @@ saved for backward. Both launches use the current stream and four warps with
 FP fusion disabled. Both forward implementations save the same `[M]` FP32
 `log_sum_exp` interface and share the tiled backward. No implementation is
 selected automatically by row count, device occupancy or gradient mode.
-Performance and cross-platform equality remain unmeasured; GPU tests and the
-benchmark require bitwise agreement between the forward variants on one device.
+GPU tests and the benchmark require bitwise agreement between the forward
+variants on one device. Cross-platform equality requires separate validation.
 
 ```bash
 python -m pytest tests/gemma/test_softcapped_selected_logprob*.py -q -rs
@@ -89,6 +89,14 @@ python benchmarks/benchmark_softcapped_selected_logprob.py \
 python benchmarks/benchmark_softcapped_selected_logprob.py \
   --modes forward --shapes 1x262144 4x262144 16x262144 64x262144 \
   --output-dir ../softcapped-logprob-results/forward-comparison
+python benchmarks/benchmark_softcapped_selected_logprob.py \
+  --suite dispatch --list-cases
+python benchmarks/benchmark_softcapped_selected_logprob.py \
+  --suite dispatch --output-dir ../softcapped-logprob-results/dispatch
+python benchmarks/benchmark_softcapped_selected_logprob.py \
+  --suite dispatch --rows 1 4 16 64 256 --vocab-sizes 4096 6144 8192 12288 16384 \
+  --rounds 8 --warmup 50 --repeat 200 \
+  --output-dir ../softcapped-logprob-results/refine
 ```
 
 Tests include an independent FP64 reference, random upstream gradients, the
@@ -106,7 +114,49 @@ and possible host dispatch gaps, not a separate synchronized CPU wall-time metri
 The benchmark checks native-relative accuracy and bitwise equality of the two
 fused variants' output, saved statistics and gradient before timing. It reports
 median latency, sample standard deviation, incremental peak allocation and
-speedups. `Row/parallel` is row-loop latency divided by parallel latency, so
+speedups. With multiple rounds, the table uses the median of round medians,
+maximum within-round sample standard deviation and maximum extra peak allocation;
+every round's measurements remain in JSON. `Row/parallel` is row-loop latency divided by parallel latency, so
 values below one expose a regression. JSON and Markdown reports
 include environment/source fingerprints. Keep generated reports outside the
 checkout and attach measured evidence to the PR after GPU validation.
+
+The `dispatch` suite measures forward by default to locate where vocabulary
+parallelism pays off. It still checks output and backward accuracy, plus bitwise
+equality of output, saved statistics and gradients, before timing every case.
+All four implementations are measured, including both baselines.
+
+| Axis | Dispatch cases | Purpose |
+| --- | --- | --- |
+| Input dtype | FP16, BF16, FP32 | Compare input bandwidth/cast costs; all math and outputs remain FP32 |
+| Rows `M` | 1, 4, 16, 64, 256 | Check whether existing parallelism across rows changes the winner |
+| Small widths and tails `V` | 512, 1023, 1024, 1025, 2048, 4096, 4097 | Expose launch overhead and tile-boundary effects |
+| Intermediate widths `V` | 8192, 16384, 32768, 32769, 65536 | Locate the crossover region |
+| Large widths `V` | 128256, 131072, 151936, 256000, 262144 | Cover large vocabularies, including Gemma's target width |
+
+This is 255 dtype/shape cases, each measured in four rounds with 25 warmups and
+100 repetitions per implementation per round. Implementation order rotates so
+each occupies every position once per four rounds. Use `--list-cases` to inspect
+the plan without a GPU. `--rows` and `--vocab-sizes` replace the sweep axes;
+`--shapes` supplies explicit cases instead. `--dtypes` can narrow the sweep.
+Add `--modes forward forward_backward` to also verify end-to-end training costs.
+The `standard` suite retains the original five shapes and all three modes.
+
+The report's forward selection table groups results by dtype and vocabulary
+width, retaining each row count. A per-shape candidate must win by at least
+1.05x in every round, with within-round std/median and the range of round medians
+divided by their median both at most 10%. Complete four-round rotations and at
+least two repetitions are required. This conservative screen is not a statistical
+confidence interval. Close, noisy or incomplete results stay `inconclusive`;
+opposite winners at different row counts are labeled `depends_on_rows`.
+The JSON contains the screening criteria and individual reasons.
+
+These candidates apply only to measured shapes on that GPU/software and
+contiguous inputs. They do not install an automatic selector or infer a monotonic
+vocabulary threshold. Refine around observed transitions and repeat measurements
+before selecting a rule; check whether a rule based on only dtype and vocabulary
+can cover all tested row counts. Keep hardware results separate, and validate
+bitwise invariance again when introducing any selector. Backward uses the same
+kernel for both forward variants and cannot establish a forward dispatch rule.
+Completed cases are checkpointed outside timing; interrupted reports carry
+`complete: false` and list missing row counts in already-started groups.
