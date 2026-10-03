@@ -42,10 +42,10 @@ of hardware qualification. For explicit Triton validation, instantiate
 `TritonSoftcappedSelectedLogprobOp` from `rl_engine.kernels.ops.triton.loss`
 directly; the tests and benchmark do this, without timing a native fallback.
 
-Default Triton forward uses one program per row, fixed 1024-element vocabulary tiles, four warps,
+The row-loop Triton forward uses one program per row, fixed 1024-element vocabulary tiles, four warps,
 FP32 tile reductions and ascending FP32 accumulation, with FP fusion disabled.
 Kernels specialize on the actual vocabulary width from `logits.shape[1]`
-via `tl.constexpr` and retain masked boundary handling. Default forward uses an ordinary loop.
+via `tl.constexpr` and retain masked boundary handling. Row forward uses an ordinary loop.
 The fixed cap bounds scores to `[-30, 30]`, keeping the direct exponential sum
 in range for the 262144-token vocabulary. Forward also saves one FP32
 `log_sum_exp` per row (`4 * M` bytes of tensor data) for backward. Backward reuses
@@ -55,14 +55,20 @@ or a merge kernel. Backward also uses four warps with FP fusion disabled and
 casts gradients only on store. Autograd supports first-order gradients.
 Native PyTorch supplies its own autograd and reduction schedule.
 
-An experimental forward is available through an explicit constructor option;
-the registry continues to use the row-loop default:
+The default constructor and registry now select a forward strategy automatically.
+Pass `None` for automatic selection or an explicit strategy enum to bypass it.
+The constructor relies on the `SoftcappedLogprobStrategy | None` type annotation
+and caller contract, without runtime type validation of this parameter:
 
 ```python
-from rl_engine.kernels.ops.triton.loss import TritonSoftcappedSelectedLogprobOp
+from rl_engine.kernels.ops.triton.loss import (
+    SoftcappedLogprobStrategy,
+    TritonSoftcappedSelectedLogprobOp,
+)
 
-row_op = TritonSoftcappedSelectedLogprobOp(forward_impl="row")
-parallel_op = TritonSoftcappedSelectedLogprobOp(forward_impl="parallel")
+auto_op = TritonSoftcappedSelectedLogprobOp()  # forward_impl=None
+row_op = TritonSoftcappedSelectedLogprobOp(forward_impl=SoftcappedLogprobStrategy.ROW)
+parallel_op = TritonSoftcappedSelectedLogprobOp(forward_impl=SoftcappedLogprobStrategy.PARALLEL)
 ```
 
 Parallel forward launches a `(M, ceil(V / 1024))` grid to compute the same FP32
@@ -72,10 +78,40 @@ rather than replacing the merge with a tree reduction or atomics. Scratch is
 `4 * M * ceil(V / 1024)` bytes (1024 bytes per row for `V = 262144`) and is not
 saved for backward. Both launches use the current stream and four warps with
 FP fusion disabled. Both forward implementations save the same `[M]` FP32
-`log_sum_exp` interface and share the tiled backward. No implementation is
-selected automatically by row count, device occupancy or gradient mode.
+`log_sum_exp` interface and share the tiled backward. Selection uses device
+identity, input dtype, vocabulary width and row count; it never uses gradient
+mode, tensor contents, live occupancy or runtime timing. GPU model names are
+cached per device index, using the input tensor's device rather than the
+current GPU. CUDA and ROCm use separate configuration keys.
 GPU tests and the benchmark require bitwise agreement between the forward
 variants on one device. Cross-platform equality requires separate validation.
+
+The enum, static configuration map and selector live alongside the kernels in
+[`softcapped_selected_logprob.py`](../../rl_engine/kernels/ops/triton/loss/softcapped_selected_logprob.py).
+Map keys are frozen `ForwardConfigKey` objects with named fields `device_key`,
+`dtype`, `n_rows` and `vocab_size`; values are strategy enums. Lookup checks an
+exact device entry first, then the same
+dtype/shape under `default`, then falls back to `ROW`. Initially the map contains
+only `default` entries, derived from A40 measurements; A40 uses that same fallback.
+Add device-specific entries when measurements justify a different strategy.
+Using the default on another device does not establish its performance crossover.
+
+The initial policy selects `PARALLEL` for 47 exact dtype/row/vocabulary
+combinations that passed the conservative screen across both A40 refinement
+runs (2026-10-03 11:41:39 and 11:43:51 UTC; benchmark commit `18ec2ae`, PyTorch
+2.13.0+cu130, Triton 3.7.1, four rounds/run, 50 warmups and 200 repetitions/round).
+The screen is applied across all eight rounds, including timing drift between
+runs. Every other combination uses `ROW`. The table uses exact sizes rather
+than unmeasured ranges: for example FP32, 256 rows selects `PARALLEL` at width
+49152 but keeps `ROW` at widths 65536 and 262144. Additional devices can override
+individual combinations, including an explicit `ROW` override of a default
+`PARALLEL` rule. No rules are loaded from local benchmark files at runtime.
+
+The new automatic entry point still needs GPU regression/performance validation.
+Tests cover switching strategies when a batch is split, including bitwise
+output, saved-statistic and gradient equality, reordering and noncontiguous
+inputs. The recorded calibration timings measured explicit implementations;
+they do not measure the added Python selection overhead.
 
 ```bash
 python -m pytest tests/gemma/test_softcapped_selected_logprob*.py -q -rs
@@ -104,8 +140,9 @@ shared `logprob` tolerance contract, and exact per-row batch/layout invariance.
 These are operator-level checks, not full-model training/rollout or TP acceptance.
 GPU tests skip on CPU hosts and fail if a GPU host cannot load the Triton backend.
 
-The benchmark compares eager PyTorch, the existing Triton softcap + logprob
-sequence, fused row-loop forward and fused parallel forward, for forward,
+The benchmark explicitly pins `ROW` and `PARALLEL` enum values, regardless of the
+operator's automatic default. It compares eager PyTorch, the existing Triton
+softcap + logprob sequence, fused row-loop forward and fused parallel forward, for forward,
 backward and both together. Use `--modes forward` for a forward-only timing run;
 output and gradient correctness are still checked first. The parallel timed
 call includes scratch allocation, both kernel launches and the merge; no
@@ -152,11 +189,11 @@ opposite winners at different row counts are labeled `depends_on_rows`.
 The JSON contains the screening criteria and individual reasons.
 
 These candidates apply only to measured shapes on that GPU/software and
-contiguous inputs. They do not install an automatic selector or infer a monotonic
-vocabulary threshold. Refine around observed transitions and repeat measurements
-before selecting a rule; check whether a rule based on only dtype and vocabulary
-can cover all tested row counts. Keep hardware results separate, and validate
-bitwise invariance again when introducing any selector. Backward uses the same
+contiguous inputs. Running the benchmark does not edit strategy configuration
+or infer a monotonic vocabulary threshold. Refine around observed transitions
+and repeat measurements before changing rules. Keep hardware results separate,
+preserve row-count dependence, and validate bitwise invariance when changing
+selection. Backward uses the same
 kernel for both forward variants and cannot establish a forward dispatch rule.
 Completed cases are checkpointed outside timing; interrupted reports carry
 `complete: false` and list missing row counts in already-started groups.

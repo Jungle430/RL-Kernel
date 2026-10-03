@@ -2,17 +2,23 @@
 # Copyright (c) 2026 RL-Kernel Contributors
 """Triton forward/backward cores for Gemma's softcapped selected logprob.
 
-Default forward uses one program per row. It reduces vocabulary tiles of 1024 elements in
-ascending order, accumulating in FP32 with four warps and no FP contraction.
-An experimental parallel forward writes the same tile sums to FP32 scratch,
+Automatic forward selects a row loop or a two-kernel parallel implementation
+using device, dtype, vocabulary width and row count. Both reduce vocabulary
+tiles of 1024 elements in the same order, accumulating in FP32 with four warps
+and no FP contraction. Parallel forward writes tile sums to FP32 scratch,
 then merges them in the same ascending order in a second kernel.
-The schedule does not depend on batch size or the number of SMs/CUs. The
+Selection changes the launch schedule but preserves the arithmetic order. The
 launchers prepare contiguous inputs; no full softcapped/probability buffer is
 written to global memory. Forward saves one FP32 log_sum_exp per row so backward
 can reuse it without repeating the reduction. Backward uses one program per
 row/vocabulary tile, with disjoint gradient stores. The autograd wrapper saves the
 inputs and these statistics. The registry exposes this as softcapped_selected_logprob.
 """
+
+from collections.abc import Callable
+from dataclasses import dataclass
+from enum import Enum
+from functools import lru_cache
 
 import torch
 import triton
@@ -25,6 +31,129 @@ _SUPPORTED_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 _SUPPORTED_DEVICES = ("cuda", "hip", "xpu", "musa")
 
 _BLOCK_V = 1024
+
+
+class SoftcappedLogprobStrategy(str, Enum):
+    ROW = "row"
+    PARALLEL = "parallel"
+
+
+# Freeze fields so equal metadata produces equal, hashable dictionary keys.
+@dataclass(frozen=True)
+class ForwardConfigKey:
+    """Exact input metadata used to select a forward implementation."""
+
+    # "default" matches when no device-specific entry exists for this dtype/shape.
+    # A specific device uses (backend, GPU model), e.g. ("cuda", "NVIDIA A40")
+    # or ("rocm", "AMD Instinct MI300X"). This identifies the model, not its index
+    # such as cuda:0; different backends have distinct configuration keys.
+    device_key: str | tuple[str, str]
+
+    # Storage dtype of the input logits: torch.float16, torch.bfloat16 or
+    # torch.float32. This is separate from the FP32 intermediate computation
+    # and output dtype; input dtype can change which implementation is faster.
+    dtype: torch.dtype
+
+    # M in logits.shape == [M, V]: the number of rows (token positions) processed
+    # by this call. Matching uses this exact count, not a range. Row count affects
+    # how much parallel work the row-loop implementation already exposes.
+    n_rows: int
+
+    # V in logits.shape == [M, V]: the number of vocabulary scores in each row.
+    # This is the full vocabulary width, not the BLOCK_V tile size. Matching uses
+    # this exact width, including non-multiples of BLOCK_V; no threshold is inferred.
+    vocab_size: int
+
+
+# A40, PyTorch 2.13.0+cu130, Triton 3.7.1, benchmark commit 18ec2ae.
+# Two independent runs on 2026-10-03, four rounds per run, 200 samples/round.
+# These 47 exact combinations passed the screen across all eight rounds:
+# speedup >= 1.05x in every round, std/median and round-median spread <= 10%.
+# Do not interpolate between vocabulary widths or row counts.
+FORWARD_STRATEGY_CONFIGS: dict[ForwardConfigKey, SoftcappedLogprobStrategy] = {
+    # Initially all devices use this A40-derived default policy.
+    # Add device-specific entries only when measurements justify an override.
+    # Performance on other devices remains unverified.
+    ForwardConfigKey("default", torch.float16, 4, 36864): SoftcappedLogprobStrategy.PARALLEL,
+    ForwardConfigKey("default", torch.float16, 4, 65536): SoftcappedLogprobStrategy.PARALLEL,
+    ForwardConfigKey("default", torch.float16, 4, 262144): SoftcappedLogprobStrategy.PARALLEL,
+    ForwardConfigKey("default", torch.float16, 16, 36864): SoftcappedLogprobStrategy.PARALLEL,
+    ForwardConfigKey("default", torch.float16, 16, 49152): SoftcappedLogprobStrategy.PARALLEL,
+    ForwardConfigKey("default", torch.float16, 16, 65536): SoftcappedLogprobStrategy.PARALLEL,
+    ForwardConfigKey("default", torch.float16, 16, 262144): SoftcappedLogprobStrategy.PARALLEL,
+    ForwardConfigKey("default", torch.float16, 64, 36864): SoftcappedLogprobStrategy.PARALLEL,
+    ForwardConfigKey("default", torch.float16, 64, 49152): SoftcappedLogprobStrategy.PARALLEL,
+    ForwardConfigKey("default", torch.float16, 64, 65536): SoftcappedLogprobStrategy.PARALLEL,
+    ForwardConfigKey("default", torch.float16, 64, 262144): SoftcappedLogprobStrategy.PARALLEL,
+    ForwardConfigKey("default", torch.float16, 256, 28672): SoftcappedLogprobStrategy.PARALLEL,
+    ForwardConfigKey("default", torch.float16, 256, 32768): SoftcappedLogprobStrategy.PARALLEL,
+    ForwardConfigKey("default", torch.float16, 256, 32769): SoftcappedLogprobStrategy.PARALLEL,
+    ForwardConfigKey("default", torch.float16, 256, 36864): SoftcappedLogprobStrategy.PARALLEL,
+    ForwardConfigKey("default", torch.float16, 256, 49152): SoftcappedLogprobStrategy.PARALLEL,
+    ForwardConfigKey("default", torch.float16, 256, 65536): SoftcappedLogprobStrategy.PARALLEL,
+    ForwardConfigKey("default", torch.float16, 256, 262144): SoftcappedLogprobStrategy.PARALLEL,
+    ForwardConfigKey("default", torch.bfloat16, 1, 36864): SoftcappedLogprobStrategy.PARALLEL,
+    ForwardConfigKey("default", torch.bfloat16, 1, 49152): SoftcappedLogprobStrategy.PARALLEL,
+    ForwardConfigKey("default", torch.bfloat16, 1, 65536): SoftcappedLogprobStrategy.PARALLEL,
+    ForwardConfigKey("default", torch.bfloat16, 1, 262144): SoftcappedLogprobStrategy.PARALLEL,
+    ForwardConfigKey("default", torch.bfloat16, 4, 36864): SoftcappedLogprobStrategy.PARALLEL,
+    ForwardConfigKey("default", torch.bfloat16, 4, 262144): SoftcappedLogprobStrategy.PARALLEL,
+    ForwardConfigKey("default", torch.bfloat16, 16, 36864): SoftcappedLogprobStrategy.PARALLEL,
+    ForwardConfigKey("default", torch.bfloat16, 16, 49152): SoftcappedLogprobStrategy.PARALLEL,
+    ForwardConfigKey("default", torch.bfloat16, 16, 65536): SoftcappedLogprobStrategy.PARALLEL,
+    ForwardConfigKey("default", torch.bfloat16, 16, 262144): SoftcappedLogprobStrategy.PARALLEL,
+    ForwardConfigKey("default", torch.bfloat16, 64, 49152): SoftcappedLogprobStrategy.PARALLEL,
+    ForwardConfigKey("default", torch.bfloat16, 64, 65536): SoftcappedLogprobStrategy.PARALLEL,
+    ForwardConfigKey("default", torch.bfloat16, 64, 262144): SoftcappedLogprobStrategy.PARALLEL,
+    ForwardConfigKey("default", torch.bfloat16, 256, 28672): SoftcappedLogprobStrategy.PARALLEL,
+    ForwardConfigKey("default", torch.bfloat16, 256, 32768): SoftcappedLogprobStrategy.PARALLEL,
+    ForwardConfigKey("default", torch.bfloat16, 256, 32769): SoftcappedLogprobStrategy.PARALLEL,
+    ForwardConfigKey("default", torch.bfloat16, 256, 36864): SoftcappedLogprobStrategy.PARALLEL,
+    ForwardConfigKey("default", torch.float32, 1, 32769): SoftcappedLogprobStrategy.PARALLEL,
+    ForwardConfigKey("default", torch.float32, 4, 36864): SoftcappedLogprobStrategy.PARALLEL,
+    ForwardConfigKey("default", torch.float32, 4, 65536): SoftcappedLogprobStrategy.PARALLEL,
+    ForwardConfigKey("default", torch.float32, 4, 262144): SoftcappedLogprobStrategy.PARALLEL,
+    ForwardConfigKey("default", torch.float32, 16, 65536): SoftcappedLogprobStrategy.PARALLEL,
+    ForwardConfigKey("default", torch.float32, 16, 262144): SoftcappedLogprobStrategy.PARALLEL,
+    ForwardConfigKey("default", torch.float32, 64, 32768): SoftcappedLogprobStrategy.PARALLEL,
+    ForwardConfigKey("default", torch.float32, 64, 32769): SoftcappedLogprobStrategy.PARALLEL,
+    ForwardConfigKey("default", torch.float32, 64, 49152): SoftcappedLogprobStrategy.PARALLEL,
+    ForwardConfigKey("default", torch.float32, 64, 65536): SoftcappedLogprobStrategy.PARALLEL,
+    ForwardConfigKey("default", torch.float32, 64, 262144): SoftcappedLogprobStrategy.PARALLEL,
+    ForwardConfigKey("default", torch.float32, 256, 49152): SoftcappedLogprobStrategy.PARALLEL,
+}
+
+
+def select_softcapped_logprob_strategy(
+    device_key: tuple[str, str], dtype: torch.dtype, n_rows: int, vocab_size: int
+) -> SoftcappedLogprobStrategy:
+    """Look up exact metadata: device entry, default entry, then ROW."""
+    key = ForwardConfigKey(device_key, dtype, n_rows, vocab_size)
+    strategy = FORWARD_STRATEGY_CONFIGS.get(key)
+    if strategy is not None:
+        return strategy
+    return FORWARD_STRATEGY_CONFIGS.get(
+        ForwardConfigKey("default", dtype, n_rows, vocab_size), SoftcappedLogprobStrategy.ROW
+    )
+
+
+@lru_cache(maxsize=None)
+def _cuda_device_key(backend: str, index: int) -> tuple[str, str]:
+    return backend, torch.cuda.get_device_name(index)
+
+
+def softcapped_logprob_device_key(device: torch.device) -> tuple[str, str]:
+    """Use the input tensor's GPU, including ROCm's torch.cuda namespace.
+
+    Resolve an unspecified index before caching so changing the current GPU
+    cannot accidentally reuse another GPU's configuration.
+    """
+    if device.type == "cuda":
+        backend = "rocm" if torch.version.hip is not None else "cuda"
+        index = device.index if device.index is not None else torch.cuda.current_device()
+        return _cuda_device_key(backend, index)
+    # No model-specific tuning is available for the other accepted backends.
+    return device.type, ""
 
 
 @triton.jit
@@ -256,7 +385,7 @@ def _launch_softcapped_selected_logprob_fwd(
 def _launch_softcapped_selected_logprob_fwd_parallel(
     logits: torch.Tensor, token_ids: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Experimental two-kernel forward with FP32 [M, ceil(V / 1024)] scratch.
+    """Two-kernel forward with FP32 [M, ceil(V / 1024)] scratch.
 
     Return the same FP32 [M] output/statistics pair as the row-loop version.
     Allocation, partial reduction and ordered merge all belong to this call.
@@ -336,20 +465,27 @@ def _launch_softcapped_selected_logprob_bwd(
     return grad_logits
 
 
+# Each forward strategy accepts (logits, token_ids) and returns (output, log_sum_exp).
+# Register new implementations here; the autograd wrapper only dispatches by key.
+_FORWARD_LAUNCHERS: dict[
+    SoftcappedLogprobStrategy,
+    Callable[[torch.Tensor, torch.Tensor], tuple[torch.Tensor, torch.Tensor]],
+] = {
+    SoftcappedLogprobStrategy.ROW: _launch_softcapped_selected_logprob_fwd,
+    SoftcappedLogprobStrategy.PARALLEL: _launch_softcapped_selected_logprob_fwd_parallel,
+}
+
+
 class _SoftcappedSelectedLogprobTritonFunction(torch.autograd.Function):
     """Connect the Triton forward/backward cores to PyTorch autograd."""
 
     @staticmethod
     def forward(
-        ctx, logits: torch.Tensor, token_ids: torch.Tensor, forward_impl: str
+        ctx, logits: torch.Tensor, token_ids: torch.Tensor, strategy: SoftcappedLogprobStrategy
     ) -> torch.Tensor:
         logits_c = logits.contiguous()
         token_ids_c = token_ids.contiguous()
-        launch_forward = (
-            _launch_softcapped_selected_logprob_fwd_parallel
-            if forward_impl == "parallel"
-            else _launch_softcapped_selected_logprob_fwd
-        )
+        launch_forward = _FORWARD_LAUNCHERS[strategy]
         selected_logprob, log_sum_exp = launch_forward(logits_c, token_ids_c)
         ctx.save_for_backward(logits_c, token_ids_c, log_sum_exp)
         return selected_logprob
@@ -372,19 +508,27 @@ class TritonSoftcappedSelectedLogprobOp:
     logits [M, V] must use a supported floating dtype on an accepted GPU; token_ids
     [M] must be int64 on the same device with values in [0, V). Output is FP32
     [M], and gradients use the logits dtype. Softcap is fixed at 30.0.
-    forward_impl="row" keeps the original loop; "parallel" explicitly opts in
-    to the experimental two-kernel forward. Both reuse the same backward.
+    forward_impl=None selects by device, dtype, vocabulary width and row count.
+    Explicit SoftcappedLogprobStrategy values bypass
+    selection. Both implementations reuse the same backward and arithmetic order.
     """
 
     op_class = "logprob"
 
-    def __init__(self, *, forward_impl: str = "row"):
-        if forward_impl not in ("row", "parallel"):
-            raise ValueError("forward_impl must be 'row' or 'parallel'.")
+    def __init__(self, *, forward_impl: SoftcappedLogprobStrategy | None = None):
         self.forward_impl = forward_impl
 
     def __call__(self, logits: torch.Tensor, token_ids: torch.Tensor) -> torch.Tensor:
         return self.forward(logits, token_ids)
 
     def forward(self, logits: torch.Tensor, token_ids: torch.Tensor) -> torch.Tensor:
-        return _SoftcappedSelectedLogprobTritonFunction.apply(logits, token_ids, self.forward_impl)
+        # Validate before reading [M, V] or querying hardware. No GPU data is
+        # read to choose a strategy, and training/inference use the same rule.
+        _validate_inputs(logits, token_ids)
+        strategy = self.forward_impl
+        if strategy is None:
+            n_rows, vocab_size = logits.shape
+            strategy = select_softcapped_logprob_strategy(
+                softcapped_logprob_device_key(logits.device), logits.dtype, n_rows, vocab_size
+            )
+        return _SoftcappedSelectedLogprobTritonFunction.apply(logits, token_ids, strategy)

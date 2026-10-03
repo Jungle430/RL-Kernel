@@ -291,17 +291,22 @@ def test_triton_backward_row_invariance(dtype, vocab, forward_impl):
     _assert_bitwise(changed[1:], together[1:])
 
 
-@pytest.fixture(params=("pytorch", "triton", "triton_parallel"))
+@pytest.fixture(params=("pytorch", "triton", "triton_parallel", "triton_auto"))
 def operator_impl(request):
     if request.param == "pytorch":
         return NativeSoftcappedSelectedLogprobOp(), "cpu"
     if not torch.cuda.is_available():
         pytest.skip("A CUDA or ROCm GPU is required")
     from rl_engine.kernels.ops.triton.loss.softcapped_selected_logprob import (
+        SoftcappedLogprobStrategy,
         TritonSoftcappedSelectedLogprobOp,
     )
 
-    impl = "parallel" if request.param == "triton_parallel" else "row"
+    impl = {
+        "triton": SoftcappedLogprobStrategy.ROW,
+        "triton_parallel": SoftcappedLogprobStrategy.PARALLEL,
+        "triton_auto": None,
+    }[request.param]
     return TritonSoftcappedSelectedLogprobOp(forward_impl=impl), "cuda"
 
 
@@ -359,7 +364,10 @@ def test_operator_autograd_and_inference(operator_impl, dtype, layout):
 def test_triton_saved_log_sum_exp_and_repeated_backward(dtype, shape, forward_impl):
     if not torch.cuda.is_available():
         pytest.skip("A CUDA or ROCm GPU is required")
-    from rl_engine.kernels.ops.triton.loss import TritonSoftcappedSelectedLogprobOp
+    from rl_engine.kernels.ops.triton.loss import (
+        SoftcappedLogprobStrategy,
+        TritonSoftcappedSelectedLogprobOp,
+    )
 
     generator = torch.Generator().manual_seed(424)
     logits = (torch.randn(shape, generator=generator) * 15).to(device="cuda", dtype=dtype)
@@ -367,7 +375,7 @@ def test_triton_saved_log_sum_exp_and_repeated_backward(dtype, shape, forward_im
     ids = torch.tensor(
         [0, shape[1] - 1, shape[1] // 2][: shape[0]], device="cuda", dtype=torch.int64
     )
-    op = TritonSoftcappedSelectedLogprobOp(forward_impl=forward_impl)
+    op = TritonSoftcappedSelectedLogprobOp(forward_impl=SoftcappedLogprobStrategy(forward_impl))
     output = op(logits, ids)
     _, _, log_sum_exp = output.grad_fn.saved_tensors
     assert log_sum_exp.shape == logits.shape[:1]
@@ -460,9 +468,12 @@ def test_shared_accuracy_harness(dtype, backend):
 def test_triton_padding_and_strided_layout_invariance(dtype, forward_impl):
     if not torch.cuda.is_available():
         pytest.skip("A CUDA or ROCm GPU is required")
-    from rl_engine.kernels.ops.triton.loss import TritonSoftcappedSelectedLogprobOp
+    from rl_engine.kernels.ops.triton.loss import (
+        SoftcappedLogprobStrategy,
+        TritonSoftcappedSelectedLogprobOp,
+    )
 
-    op = TritonSoftcappedSelectedLogprobOp(forward_impl=forward_impl)
+    op = TritonSoftcappedSelectedLogprobOp(forward_impl=SoftcappedLogprobStrategy(forward_impl))
     generator = torch.Generator().manual_seed(422)
     row = (torch.randn((1, 1025), generator=generator) * 15).to(device="cuda", dtype=dtype)
     target = torch.tensor([1024], device="cuda")
@@ -517,6 +528,113 @@ def test_triton_forward_variants_match_bitwise(dtype, vocab):
     grad_expected = _launch_softcapped_selected_logprob_bwd(logits, ids, upstream, expected[1])
     grad_actual = _launch_softcapped_selected_logprob_bwd(logits, ids, upstream, actual[1])
     _assert_bitwise(grad_actual, grad_expected)
+
+
+def _evaluate_triton_with_statistics(op, logits, token_ids, upstream):
+    leaf = logits.detach().requires_grad_(True)
+    output = op(leaf, token_ids)
+    _, _, log_sum_exp = output.grad_fn.saved_tensors
+    gradient = torch.autograd.grad(output, leaf, grad_outputs=upstream)[0]
+    return output.detach(), log_sum_exp, gradient
+
+
+@pytest.mark.parametrize("dtype", _DTYPES)
+@pytest.mark.parametrize("shape", [(0, 7), (4, 36864), (16, 49152), (64, 32768), (256, 65536)])
+def test_triton_auto_matches_explicit_row_and_inference(dtype, shape):
+    if not torch.cuda.is_available():
+        pytest.skip("A CUDA or ROCm GPU is required")
+    from rl_engine.kernels.ops.triton.loss import (
+        SoftcappedLogprobStrategy,
+        TritonSoftcappedSelectedLogprobOp,
+    )
+
+    generator = torch.Generator().manual_seed(428)
+    logits = (torch.randn(shape, generator=generator) * 30).to(device="cuda", dtype=dtype)
+    ids = torch.arange(shape[0], device="cuda", dtype=torch.int64) * 1025 % shape[1]
+    upstream = torch.randn(shape[0], generator=generator).to(device="cuda")
+    op = TritonSoftcappedSelectedLogprobOp(forward_impl=None)
+    reference = _evaluate_triton_with_statistics(
+        TritonSoftcappedSelectedLogprobOp(forward_impl=SoftcappedLogprobStrategy.ROW),
+        logits,
+        ids,
+        upstream,
+    )
+    actual = _evaluate_triton_with_statistics(op, logits, ids, upstream)
+    for result, expected in zip(actual, reference, strict=True):
+        _assert_bitwise(result, expected)
+    with torch.no_grad():
+        _assert_bitwise(op(logits, ids), reference[0])
+    with torch.inference_mode():
+        _assert_bitwise(op(logits, ids), reference[0])
+
+
+@pytest.mark.parametrize("dtype", _DTYPES)
+def test_triton_auto_batch_split_switches_strategy_without_changing_bits(dtype):
+    if not torch.cuda.is_available():
+        pytest.skip("A CUDA or ROCm GPU is required")
+    from rl_engine.kernels.ops.triton.loss.softcapped_selected_logprob import (
+        SoftcappedLogprobStrategy,
+        TritonSoftcappedSelectedLogprobOp,
+        select_softcapped_logprob_strategy,
+        softcapped_logprob_device_key,
+    )
+
+    generator = torch.Generator().manual_seed(429)
+    logits = (torch.randn((4, 262144), generator=generator) * 30).to(device="cuda", dtype=dtype)
+    ids = torch.tensor([0, 1023, 262143, 1024], device="cuda")
+    upstream = torch.tensor([0.25, -2.0, 0.0, 1.5], device="cuda")
+    key = softcapped_logprob_device_key(logits.device)
+    assert (
+        select_softcapped_logprob_strategy(key, dtype, 4, 262144)
+        is SoftcappedLogprobStrategy.PARALLEL
+    )
+    assert (
+        select_softcapped_logprob_strategy(key, dtype, 2, 262144) is SoftcappedLogprobStrategy.ROW
+    )
+    op = TritonSoftcappedSelectedLogprobOp()
+    together = _evaluate_triton_with_statistics(op, logits, ids, upstream)
+    halves = [
+        _evaluate_triton_with_statistics(op, logits[i : i + 2], ids[i : i + 2], upstream[i : i + 2])
+        for i in (0, 2)
+    ]
+    for expected, *parts in zip(together, *halves, strict=True):
+        _assert_bitwise(torch.cat(parts), expected)
+    permutation = torch.tensor([3, 1, 0, 2], device="cuda")
+    reordered = _evaluate_triton_with_statistics(
+        op, logits[permutation], ids[permutation], upstream[permutation]
+    )
+    for result, expected in zip(reordered, together, strict=True):
+        _assert_bitwise(result, expected[permutation])
+    storage = torch.zeros((4, 524288), device="cuda", dtype=dtype)
+    view = storage[:, ::2]
+    view.copy_(logits)
+    for result, expected in zip(
+        _evaluate_triton_with_statistics(op, view, ids, upstream), together, strict=True
+    ):
+        _assert_bitwise(result, expected)
+
+
+def test_triton_explicit_strategy_bypasses_device_lookup_and_auto_validates_first(monkeypatch):
+    if not torch.cuda.is_available():
+        pytest.skip("A CUDA or ROCm GPU is required")
+    from rl_engine.kernels.ops.triton.loss import softcapped_selected_logprob as module
+
+    def unexpected_lookup(device):
+        pytest.fail("Explicit strategies and invalid inputs must not query hardware")
+
+    monkeypatch.setattr(module, "softcapped_logprob_device_key", unexpected_lookup)
+    logits = torch.zeros((1, 1025), device="cuda")
+    ids = torch.tensor([1024], device="cuda")
+    outputs = [
+        module.TritonSoftcappedSelectedLogprobOp(forward_impl=choice)(logits, ids)
+        for choice in module.SoftcappedLogprobStrategy
+    ]
+    for output in outputs[1:]:
+        _assert_bitwise(output, outputs[0])
+    with pytest.raises(ValueError, match="shape"):
+        module.TritonSoftcappedSelectedLogprobOp()(logits[0], ids)
+    with pytest.raises(TypeError, match="int64"):
+        module.TritonSoftcappedSelectedLogprobOp()(logits, ids.float())
 
 
 @pytest.mark.parametrize("dtype", _DTYPES)

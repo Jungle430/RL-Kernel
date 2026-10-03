@@ -450,6 +450,7 @@ def run_benchmark(args):
 
     from rl_engine.kernels.ops.triton.loss.softcapped_selected_logprob import (
         _BLOCK_V,
+        SoftcappedLogprobStrategy,
         TritonSoftcappedSelectedLogprobOp,
     )
 
@@ -458,8 +459,10 @@ def run_benchmark(args):
         ops = {
             "native": NativeSoftcappedSelectedLogprobOp(),
             "split_triton": _SplitTritonOp(),
-            "triton": TritonSoftcappedSelectedLogprobOp(),
-            "triton_parallel": TritonSoftcappedSelectedLogprobOp(forward_impl="parallel"),
+            "triton": TritonSoftcappedSelectedLogprobOp(forward_impl=SoftcappedLogprobStrategy.ROW),
+            "triton_parallel": TritonSoftcappedSelectedLogprobOp(
+                forward_impl=SoftcappedLogprobStrategy.PARALLEL
+            ),
         }
         env = _environment(device, args, triton.__version__, _BLOCK_V, profiler.gpu_info)
         env.update(
