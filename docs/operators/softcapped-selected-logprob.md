@@ -84,7 +84,7 @@ parallel_op = TritonSoftcappedSelectedLogprobOp(forward_impl=SoftcappedLogprobSt
 ```
 
 The static map and selector live in the
-[operator file](../../rl_engine/kernels/ops/triton/loss/softcapped_selected_logprob.py).
+[operator file](https://github.com/RL-Align/RL-Kernel/blob/2c1ec09fc7a3ce438da62549ea50c18c9b1a50cd/rl_engine/kernels/ops/triton/loss/softcapped_selected_logprob.py).
 `ForwardConfigKey` records device identity, dtype, inclusive minimum/maximum row
 counts and an **exact** vocabulary size. Lookup checks device-specific entries,
 then `default`, then falls back to ROW. Unlisted widths or row counts outside
@@ -163,3 +163,11 @@ divided by Triton latency, so values below 1 expose a slowdown. When run from th
 repository root, reports default to the directory
 `reports/softcapped-selected-logprob/`. Attach performance evidence to the PR
 rather than committing generated reports.
+
+### Reports and validation evidence
+
+See [PR #463](https://github.com/RL-Align/RL-Kernel/pull/463) for H100
+training/inference consistency results, strategy-tuning evidence and performance
+comparisons with eager PyTorch. The PR links the Markdown reports and JSON
+measurements, and records the tested source commit and hardware/software
+environment. ROCm validation remains pending.
