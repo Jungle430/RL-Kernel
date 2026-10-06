@@ -233,7 +233,9 @@ def build_arg_parser():
     parser.add_argument(
         "--list-cases", action="store_true", help="Print the plan without a GPU run"
     )
-    parser.add_argument("--output-dir", type=Path, default=Path("../softcapped-logprob-results"))
+    parser.add_argument(
+        "--output-dir", type=Path, default=Path("reports/softcapped-selected-logprob")
+    )
     return parser
 
 

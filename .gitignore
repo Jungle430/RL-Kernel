@@ -211,6 +211,9 @@ __marimo__/
 # Cross-configuration alignment local run artifacts
 /runs/
 
+# Local softcapped selected logprob benchmark reports
+/reports/softcapped-selected-logprob/
+
 # Local dev notes (not for upstream)
 _dev_notes/
 

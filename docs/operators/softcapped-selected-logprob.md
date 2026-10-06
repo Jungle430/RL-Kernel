@@ -128,11 +128,11 @@ uv run --no-sync python benchmarks/benchmark_softcapped_selected_logprob.py --li
 # Small GPU smoke run, covering all three timing modes.
 uv run --no-sync python benchmarks/benchmark_softcapped_selected_logprob.py \
   --dtypes bf16 --shapes 3x1025 --warmup 1 --repeat 2 \
-  --output-dir ../softcapped-logprob-results/smoke
+  --output-dir reports/softcapped-selected-logprob/smoke
 
 # Default comparison; --shapes, --dtypes and --modes can narrow or extend it.
 uv run --no-sync python benchmarks/benchmark_softcapped_selected_logprob.py \
-  --output-dir ../softcapped-logprob-results/benchmark
+  --output-dir reports/softcapped-selected-logprob
 ```
 
 Operator tests cover an independent FP64 reference, random upstream gradients,
@@ -159,5 +159,7 @@ extra peak allocation and the hardware/software environment. JSON also retains
 sample standard deviations and accuracy errors. Extra allocation excludes
 inputs and prebuilt graphs. Cases are saved outside timing as they finish;
 interrupted reports remain marked `complete: false`. Speedup is native latency
-divided by Triton latency, so values below 1 expose a slowdown. Keep generated
-reports outside the checkout and attach performance evidence to the PR.
+divided by Triton latency, so values below 1 expose a slowdown. When run from the
+repository root, reports default to the Git-ignored directory
+`reports/softcapped-selected-logprob/`. Attach performance evidence to the PR
+rather than committing generated reports.
