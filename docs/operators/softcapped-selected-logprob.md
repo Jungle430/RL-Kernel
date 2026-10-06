@@ -160,6 +160,6 @@ sample standard deviations and accuracy errors. Extra allocation excludes
 inputs and prebuilt graphs. Cases are saved outside timing as they finish;
 interrupted reports remain marked `complete: false`. Speedup is native latency
 divided by Triton latency, so values below 1 expose a slowdown. When run from the
-repository root, reports default to the Git-ignored directory
+repository root, reports default to the directory
 `reports/softcapped-selected-logprob/`. Attach performance evidence to the PR
 rather than committing generated reports.
