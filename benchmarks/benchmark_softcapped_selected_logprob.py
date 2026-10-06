@@ -6,7 +6,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
+import platform
+import subprocess
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 import torch
@@ -15,19 +19,20 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-# Use the same timer, memory accounting and environment metadata as softcap.
-from benchmarks.benchmark_final_logit_softcap import (  # noqa: E402
-    DTYPES,
-    MODES,
-    _environment,
-    _measure,
-    _positive_int,
-)
-from benchmarks.profiler import PerformanceProfiler  # noqa: E402
+from benchmarks.profiler import GPUTargetInfo, PerformanceProfiler  # noqa: E402
 from rl_engine.kernels.gtest.tolerance import load_contract, resolve_tolerance  # noqa: E402
 from rl_engine.kernels.ops.pytorch.loss import NativeSoftcappedSelectedLogprobOp  # noqa: E402
 
+DTYPES = {"fp16": torch.float16, "bf16": torch.bfloat16, "fp32": torch.float32}
+MODES = ("forward", "backward", "forward_backward")
 DEFAULT_SHAPES = ("1x1025", "1x262144", "16x262144", "128x262144", "1024x262144")
+
+
+def _positive_int(value: str) -> int:
+    number = int(value)
+    if number < 1:
+        raise argparse.ArgumentTypeError("must be at least 1")
+    return number
 
 
 def _shape(value: str) -> tuple[int, int]:
@@ -108,6 +113,74 @@ def _case_plan(args):
     }
 
 
+def _measure(profiler, fn):
+    """Use the shared event timer, then measure allocation in a separate call."""
+    _, median_ms, std_ms = profiler._time_kernel(fn)
+    if not math.isfinite(median_ms) or median_ms <= 0:
+        raise RuntimeError(f"invalid accelerator-event latency: {median_ms}")
+    # Inputs and any retained backward graph are already part of the baseline.
+    # fn returns None, so outputs do not remain live between invocations.
+    profiler._sync()
+    baseline = torch.cuda.memory_allocated(profiler.device)
+    torch.cuda.reset_peak_memory_stats(profiler.device)
+    fn()
+    profiler._sync()
+    peak = torch.cuda.max_memory_allocated(profiler.device) - baseline
+    return {"median_ms": median_ms, "std_ms": std_ms, "peak_extra_mib": peak / 1024**2}
+
+
+def _command_output(command):
+    try:
+        return subprocess.check_output(
+            command, cwd=REPO_ROOT, text=True, stderr=subprocess.DEVNULL, timeout=10
+        ).strip()
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def _environment(device, args, triton_version, block_v, target: GPUTargetInfo):
+    """Record this benchmark's settings and the profiler's CUDA or ROCm target."""
+    props = torch.cuda.get_device_properties(device)
+    is_rocm = target.backend == "rocm"
+    return {
+        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+        "python": platform.python_version(),
+        "platform": platform.platform(),
+        "torch": torch.__version__,
+        "triton": triton_version,
+        "backend": target.backend,
+        "runtime": target.driver_version,
+        "gpu": props.name,
+        "architecture": target.architecture,
+        "compute_capability": None if is_rocm else list(torch.cuda.get_device_capability(device)),
+        "gpu_name_driver": _command_output(
+            ["rocm-smi", "--showproductname", "--showdriverversion"]
+            if is_rocm
+            else ["nvidia-smi", "--query-gpu=name,driver_version", "--format=csv,noheader"]
+        ),
+        "device": str(device),
+        "total_memory_gib": props.total_memory / 1024**3,
+        "multiprocessors": props.multi_processor_count,
+        "block_v": block_v,
+        "warmup": args.warmup,
+        "repeat": args.repeat,
+        "seed": args.seed,
+        "layout": "contiguous",
+        "timer": (
+            f"PerformanceProfiler {'HIP' if is_rocm else 'CUDA'} events; "
+            "median and sample standard deviation"
+        ),
+        "operator": "softcapped_selected_logprob",
+        "softcap": 30.0,
+        "baseline": "eager NativeSoftcappedSelectedLogprobOp on the same GPU; no torch.compile",
+        "candidate": "TritonSoftcappedSelectedLogprobOp with automatic forward selection",
+        "cache_policy": "reused contiguous inputs, warm selector cache, no explicit eviction",
+        "scope": "Public wrappers, including allocation and autograd dispatch; no graph capture",
+        "backward": "Random FP32 upstream gradient; prebuilt retained graph; no forward timing",
+        "memory": "Extra peak allocated MiB per call; excludes inputs and any prebuilt graph",
+    }
+
+
 def _markdown(report):
     env = report["environment"]
     lines = [
@@ -184,16 +257,6 @@ def run_benchmark(args):
         profiler = PerformanceProfiler(device=device, warmup=args.warmup, repeat=args.repeat)
         native, candidate = NativeSoftcappedSelectedLogprobOp(), TritonSoftcappedSelectedLogprobOp()
         env = _environment(device, args, triton.__version__, _BLOCK_V, profiler.gpu_info)
-        for key in ("git_commit", "git_tracked_changes", "tolerance_contract_sha256"):
-            env.pop(key, None)
-        env.update(
-            operator="softcapped_selected_logprob",
-            softcap=30.0,
-            baseline="eager NativeSoftcappedSelectedLogprobOp on the same GPU; no torch.compile",
-            candidate="TritonSoftcappedSelectedLogprobOp with automatic forward selection",
-            cache_policy="reused contiguous inputs, warm selector cache, no explicit eviction",
-        )
-        env["block_v"] = env.pop("block_size")
         report = {
             "environment": env,
             "case_plan": _case_plan(args),
