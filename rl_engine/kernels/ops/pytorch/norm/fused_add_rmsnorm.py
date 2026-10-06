@@ -6,7 +6,29 @@ Both outputs stay in FP32, and normalization uses the unrounded FP32 residual
 sum. The public dtype contract and any BF16 rounding point are not finalized.
 """
 
+import math
+
 import torch
+from torch import nn
+
+_SUPPORTED_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
+
+
+def _validate_inputs(
+    x: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor, eps: float
+) -> None:
+    if x.ndim == 0 or x.shape[-1] == 0:
+        raise ValueError("x must have shape [..., D] with D > 0.")
+    if residual.shape != x.shape:
+        raise ValueError("residual must have the same shape as x.")
+    if weight.shape != (x.shape[-1],):
+        raise ValueError("weight must have shape [D].")
+    if residual.device != x.device or weight.device != x.device:
+        raise ValueError("x, residual, and weight must be on the same device.")
+    if any(t.dtype not in _SUPPORTED_DTYPES for t in (x, residual, weight)):
+        raise TypeError(f"x, residual, and weight must have dtype in {_SUPPORTED_DTYPES}.")
+    if not math.isfinite(eps) or eps <= 0:
+        raise ValueError("eps must be finite and positive.")
 
 
 def fused_add_rmsnorm(
@@ -22,6 +44,7 @@ def fused_add_rmsnorm(
     and all three tensors are on the same device. D must be positive.
     Outputs: both tensors have the same shape as x and dtype torch.float32.
     """
+    _validate_inputs(x, residual, weight, eps)
     x_f = x.to(torch.float32)
     residual_f = residual.to(torch.float32)
     weight_f = weight.to(torch.float32)
@@ -113,3 +136,24 @@ def fused_add_rmsnorm_backward(
     grad_weight = grad_weight_f.to(weight.dtype)
 
     return grad_x, grad_residual, grad_weight
+
+
+class NativeFusedAddRMSNormOp(nn.Module):
+    """FP32-output prototype; PyTorch supplies gradients for both outputs.
+
+    Inputs may independently use FP16, BF16, or FP32 on the same device.
+    Normalization uses the unrounded FP32 residual sum. This is an explicit
+    prototype contract, pending alignment with Nemotron's residual cast points.
+    """
+
+    op_class = "norm"
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        residual: torch.Tensor,
+        weight: torch.Tensor,
+        *,
+        eps: float = 1e-5,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return fused_add_rmsnorm(x, residual, weight, eps=eps)
