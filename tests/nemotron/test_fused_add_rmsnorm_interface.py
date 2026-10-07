@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 RL-Kernel Contributors
-"""Public prototype interfaces: native CPU checks and Triton GPU checks."""
+"""Public interfaces: native CPU checks and Triton GPU checks."""
 
 import importlib
 
@@ -27,12 +27,13 @@ def triton_module():
     return importlib.import_module("rl_engine.kernels.ops.triton.norm.fused_add_rmsnorm")
 
 
-@pytest.fixture(params=["native", "triton"])
+@pytest.fixture(params=["native", "sequential", "tiled"])
 def implementation(request):
     if request.param == "native":
         return NativeFusedAddRMSNormOp(), "cpu"
     module = request.getfixturevalue("triton_module")
-    return module.TritonFusedAddRMSNormOp(), "cuda"
+    strategy = module.RMSNormWeightGradStrategy(request.param)
+    return module.TritonFusedAddRMSNormOp(weight_grad_strategy=strategy), "cuda"
 
 
 def _rand(shape, seed, *, device="cpu", dtype=torch.float32):
@@ -82,7 +83,7 @@ def _assert_close(actual, expected):
     torch.testing.assert_close(actual, expected.to(actual.dtype), atol=tolerance, rtol=tolerance)
 
 
-@pytest.mark.parametrize("shape", [(7,), (3, 7), (2, 3, 2688), (2, 0, 7)])
+@pytest.mark.parametrize("shape", [(7,), (3, 7), (33, 129), (2, 3, 2688), (2, 0, 7)])
 @pytest.mark.parametrize("dtypes", _DTYPES)
 @pytest.mark.parametrize("branch", ["both", "y_only", "residual_only"])
 def test_public_forward_backward_against_fp64(implementation, shape, dtypes, branch):
@@ -236,12 +237,16 @@ def test_modifying_saved_residual_output_is_detected(triton_module):
 
 
 @pytest.mark.parametrize("eps", [1e-5, 1e-3])
-def test_repeated_backward_preserves_saved_tensors(triton_module, eps):
-    inputs = _inputs((3, 7), _DTYPES[0], "cuda", noncontiguous=True)
-    outputs = triton_module.TritonFusedAddRMSNormOp()(*inputs, eps=eps)
+@pytest.mark.parametrize("strategy", ["sequential", "tiled"])
+def test_repeated_backward_preserves_saved_tensors(triton_module, eps, strategy):
+    inputs = _inputs((65, 129), _DTYPES[0], "cuda", noncontiguous=True)
+    op = triton_module.TritonFusedAddRMSNormOp(
+        weight_grad_strategy=triton_module.RMSNormWeightGradStrategy(strategy)
+    )
+    outputs = op(*inputs, eps=eps)
     saved = outputs[0].grad_fn.saved_tensors
     before = tuple(value.clone() for value in saved)
-    upstream = tuple(_rand((3, 7), seed, device="cuda") for seed in (130, 131))
+    upstream = tuple(_rand((65, 129), seed, device="cuda") for seed in (130, 131))
     first = _backward(outputs, inputs, upstream, "both", retain_graph=True)
     second = _backward(outputs, inputs, upstream, "both")
     for lhs, rhs in zip(first, second, strict=True):
@@ -251,8 +256,11 @@ def test_repeated_backward_preserves_saved_tensors(triton_module, eps):
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
-def test_train_inference_and_row_invariance(triton_module, dtype):
-    op = triton_module.TritonFusedAddRMSNormOp()
+@pytest.mark.parametrize("strategy", ["sequential", "tiled"])
+def test_train_inference_and_row_invariance(triton_module, dtype, strategy):
+    op = triton_module.TritonFusedAddRMSNormOp(
+        weight_grad_strategy=triton_module.RMSNormWeightGradStrategy(strategy)
+    )
     inputs = _inputs((7, 2688), (dtype, dtype, torch.float32), "cuda")
     outputs = op(*inputs)
     inverse_rms = outputs[0].grad_fn.saved_tensors[1]
@@ -304,7 +312,8 @@ def test_backward_rejects_invalid_upstream(triton_module, branch, invalid):
         )
 
 
-def test_launches_use_input_device_and_restore_current_device(triton_module):
+@pytest.mark.parametrize("strategy", ["sequential", "tiled"])
+def test_launches_use_input_device_and_restore_current_device(triton_module, strategy):
     if torch.cuda.device_count() < 2:
         pytest.skip("Two GPUs are required to check a noncurrent input device")
     with torch.cuda.device(0):
@@ -313,7 +322,10 @@ def test_launches_use_input_device_and_restore_current_device(triton_module):
         reference_inputs = tuple(value.detach().double().requires_grad_(True) for value in inputs)
         expected = _fp64_reference(*reference_inputs, 1e-5)
 
-        outputs = triton_module.TritonFusedAddRMSNormOp()(*inputs)
+        op = triton_module.TritonFusedAddRMSNormOp(
+            weight_grad_strategy=triton_module.RMSNormWeightGradStrategy(strategy)
+        )
+        outputs = op(*inputs)
         assert torch.cuda.current_device() == 0
         gradients = _backward(outputs, inputs, upstream, "both")
         assert torch.cuda.current_device() == 0
@@ -330,3 +342,92 @@ def test_launches_use_input_device_and_restore_current_device(triton_module):
 def test_triton_rejects_cpu_inputs(triton_module):
     with pytest.raises(ValueError, match="device"):
         triton_module.TritonFusedAddRMSNormOp()(*_inputs((3, 7), _DTYPES[0], "cpu"))
+
+
+@pytest.mark.parametrize("dtypes", _DTYPES)
+def test_weight_strategy_does_not_change_outputs_or_input_gradients(triton_module, dtypes):
+    inputs = _inputs((65, 129), dtypes, "cuda")
+    upstream = tuple(_rand((65, 129), seed, device="cuda") for seed in (160, 161))
+    results = []
+    for strategy in triton_module.RMSNormWeightGradStrategy:
+        op = triton_module.TritonFusedAddRMSNormOp(weight_grad_strategy=strategy)
+        outputs = op(*inputs)
+        gradients = _backward(outputs, inputs, upstream, "both")
+        results.append(outputs + gradients[:2])
+    for sequential, tiled in zip(*results, strict=True):
+        assert torch.equal(sequential.view(torch.uint8), tiled.view(torch.uint8))
+
+
+@pytest.mark.parametrize("platform", ["cpu", "musa", "npu"])
+def test_registry_native_dispatch(platform, monkeypatch):
+    from rl_engine.kernels.registry import KernelRegistry
+
+    registry = KernelRegistry()
+    monkeypatch.setattr(registry, "_platform", lambda: platform)
+    op = registry.get_op("fused_add_rmsnorm")
+    assert isinstance(op, NativeFusedAddRMSNormOp)
+    inputs = _inputs((2, 7), _DTYPES[0], "cpu")
+    outputs = op(*inputs)
+    assert len(outputs) == 2
+    for actual, expected in zip(outputs, _fp64_reference(*inputs, 1e-5), strict=True):
+        _assert_close(actual, expected)
+
+
+@pytest.mark.parametrize("platform", ["cuda", "rocm"])
+def test_registry_fallback_when_triton_unavailable(platform, monkeypatch):
+    from rl_engine.kernels.registry import KernelRegistry, OpBackend
+
+    registry = KernelRegistry()
+    monkeypatch.setattr(registry, "_platform", lambda: platform)
+    load_backend = registry._load_backend
+    attempted = []
+
+    def without_triton(backend):
+        attempted.append(backend)
+        if backend == OpBackend.TRITON_FUSED_ADD_RMSNORM:
+            return None
+        return load_backend(backend)
+
+    monkeypatch.setattr(registry, "_load_backend", without_triton)
+    assert isinstance(registry.get_op("fused_add_rmsnorm"), NativeFusedAddRMSNormOp)
+    assert attempted == [
+        OpBackend.TRITON_FUSED_ADD_RMSNORM,
+        OpBackend.PYTORCH_NATIVE_FUSED_ADD_RMSNORM,
+    ]
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("backend", ["pytorch", "triton"])
+def test_shared_harness_checks_both_outputs_and_all_input_gradients(dtype, backend, request):
+    import argparse
+
+    from rl_engine.kernels.gtest.op_checks import run_operator_suite
+    from rl_engine.kernels.gtest.operator_specs import make_candidate, make_operator_case
+
+    if backend == "triton":
+        request.getfixturevalue("triton_module")
+    args = argparse.Namespace(
+        op="fused_add_rmsnorm",
+        candidate=backend,
+        arch_key=None,
+        batch=2,
+        seq=3,
+        normalized_dim=129,
+        eps=1e-5,
+        seed=434,
+        input_mode="random",
+    )
+    device = torch.device("cuda" if backend == "triton" else "cpu")
+    case = make_operator_case(args, dtype, device)
+    assert case.inputs["x"].shape == case.inputs["residual"].shape == (2, 3, 129)
+    assert case.inputs["weight"].shape == (129,)
+    assert case.inputs["weight"].dtype == torch.float32
+    assert case.grad_input_names == ("x", "residual", "weight")
+    report = run_operator_suite(
+        args.op,
+        candidates=[make_candidate(args)],
+        cases=[case],
+        check_grad=True,
+    )
+    assert report.passed
+    assert [len(check.outputs) for check in report.candidates[0].cases] == [5]

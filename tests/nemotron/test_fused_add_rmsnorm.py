@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 RL-Kernel Contributors
-"""Direct GPU checks for the unregistered fused-add/RMSNorm kernel prototype."""
+"""Direct GPU checks for fused add RMSNorm and both weight-gradient reductions."""
 
 import importlib
 
@@ -161,6 +161,39 @@ def test_weight_reduction_matches_ordered_fp32_sum(kernels, n_rows, n_cols):
     for row in rows:
         expected = expected + row
     assert torch.equal(actual, expected)
+
+
+@pytest.mark.parametrize("strategy", ["sequential", "tiled"])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize(
+    "n_rows,n_cols",
+    [(0, 129), (1, 1), (1, 7), (31, 127), (32, 128), (33, 129), (65, 2688), (257, 129)],
+)
+def test_weight_reduction_accuracy_tails_and_repeatability(
+    kernels, strategy, dtype, n_rows, n_cols
+):
+    triton, module = kernels
+    rows = _rand((n_rows, n_cols), 40)
+    before = rows.clone()
+    # An output guard catches stores beyond the final partial column block.
+    buffer = torch.full((n_cols + 8,), float("nan"), device="cuda", dtype=dtype)
+    actual = buffer[:n_cols]
+    kernel = module._WEIGHT_GRAD_KERNELS[module.RMSNormWeightGradStrategy(strategy)]
+
+    def launch():
+        kernel[(triton.cdiv(n_cols, 128),)](
+            rows, actual, n_rows, n_cols, BLOCK_SIZE=128, num_warps=4, enable_fp_fusion=False
+        )
+
+    launch()
+    expected = rows.double().sum(dim=0).to(dtype)
+    _assert_close(actual, expected)
+    first = actual.clone()
+    actual.fill_(float("nan"))
+    launch()
+    assert torch.equal(actual.view(torch.uint8), first.view(torch.uint8))
+    assert torch.isnan(buffer[n_cols:]).all()
+    assert torch.equal(rows, before)
 
 
 def test_row_results_are_batch_invariant(kernels):
