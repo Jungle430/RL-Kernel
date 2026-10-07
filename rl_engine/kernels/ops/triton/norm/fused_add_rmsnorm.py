@@ -29,7 +29,6 @@ from enum import Enum
 import torch
 import triton
 import triton.language as tl
-from torch.autograd.function import once_differentiable
 
 # ROCm PyTorch also exposes its devices through the CUDA namespace.
 _SUPPORTED_DEVICES = ("cuda",)
@@ -385,7 +384,6 @@ class _FusedAddRMSNormTritonFunction(torch.autograd.Function):
         return y, updated_residual
 
     @staticmethod
-    @once_differentiable
     def backward(ctx, grad_y, grad_updated_residual_output):
         if grad_y is None and grad_updated_residual_output is None:
             return None, None, None, None, None

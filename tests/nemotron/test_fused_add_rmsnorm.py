@@ -7,7 +7,7 @@ import importlib
 import pytest
 import torch
 
-from rl_engine.kernels.ops.pytorch.norm.fused_add_rmsnorm import fused_add_rmsnorm
+from rl_engine.kernels.ops.pytorch.norm import NativeFusedAddRMSNormOp
 
 _EPS = 1e-5
 
@@ -119,7 +119,7 @@ def test_kernels_match_native_autograd(
     elif branch == "residual_only":
         grad_y.zero_()
 
-    expected_y, expected_updated_residual = fused_add_rmsnorm(x, residual, weight, eps=_EPS)
+    expected_y, expected_updated_residual = NativeFusedAddRMSNormOp()(x, residual, weight, eps=_EPS)
     expected_gradients = torch.autograd.grad(
         (expected_y, expected_updated_residual),
         (x, residual, weight),
