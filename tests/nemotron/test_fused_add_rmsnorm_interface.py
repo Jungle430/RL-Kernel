@@ -185,6 +185,56 @@ def test_native_rejects_mismatched_devices():
         NativeFusedAddRMSNormOp()(x, torch.empty_like(x, device="meta"), torch.ones(7))
 
 
+@pytest.mark.parametrize("dtypes", _DTYPES)
+def test_forward_reuses_fp32_residual_output_and_saves_row_statistics(triton_module, dtypes):
+    inputs = _inputs((2, 3, 2688), dtypes, "cuda", noncontiguous=True)
+    outputs = triton_module.TritonFusedAddRMSNormOp()(*inputs)
+    saved_residual, inverse_rms, saved_weight = outputs[0].grad_fn.saved_tensors
+
+    # Save the FP32 output itself, without retaining or copying the two inputs.
+    assert saved_residual.data_ptr() == outputs[1].data_ptr()
+    assert saved_residual.shape == inputs[0].shape
+    assert saved_residual.dtype == torch.float32
+    assert torch.equal(saved_residual, inputs[0].float() + inputs[1].float())
+    assert inverse_rms.shape == (6,)
+    assert inverse_rms.dtype == torch.float32
+    assert inverse_rms.device == inputs[0].device
+    assert torch.equal(saved_weight, inputs[2])
+
+    # Independent FP64 statistics check also covers non-power-of-two row widths.
+    updated_fp64 = inputs[0].double() + inputs[1].double()
+    expected = (updated_fp64.square().mean(dim=-1) + 1e-5).rsqrt().reshape(-1)
+    torch.testing.assert_close(inverse_rms.double(), expected, rtol=2e-6, atol=1e-7)
+
+
+def test_saved_residual_preserves_low_precision_addition_bits(triton_module):
+    # 1 + 1/256 is exactly representable in FP32, but rounds to 1 in BF16.
+    x = torch.tensor([[1.0, 2.0]], device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    residual = torch.tensor([[1 / 256, 0.0]], device="cuda", dtype=torch.bfloat16)
+    weight = torch.ones(2, device="cuda")
+    outputs = triton_module.TritonFusedAddRMSNormOp()(x, residual, weight)
+    saved_residual = outputs[0].grad_fn.saved_tensors[0]
+    expected = torch.tensor([[1 + 1 / 256, 2.0]], device="cuda")
+    assert torch.equal(saved_residual, expected)
+    assert not torch.equal(saved_residual, expected.bfloat16().float())
+
+    reference_x = x.detach().double().requires_grad_(True)
+    reference_y, _ = _fp64_reference(reference_x, residual.double(), weight.double(), 1e-5)
+    upstream = torch.tensor([[0.7, -0.4]], device="cuda")
+    actual_gradient = torch.autograd.grad(outputs[0], x, upstream)[0]
+    expected_gradient = torch.autograd.grad(reference_y, reference_x, upstream.double())[0]
+    _assert_close(actual_gradient, expected_gradient)
+
+
+def test_modifying_saved_residual_output_is_detected(triton_module):
+    inputs = _inputs((3, 7), _DTYPES[0], "cuda")
+    y, updated_residual = triton_module.TritonFusedAddRMSNormOp()(*inputs)
+    with torch.no_grad():
+        updated_residual.add_(1.0)
+    with pytest.raises(RuntimeError, match="modified by an inplace operation"):
+        y.sum().backward()
+
+
 @pytest.mark.parametrize("eps", [1e-5, 1e-3])
 def test_repeated_backward_preserves_saved_tensors(triton_module, eps):
     inputs = _inputs((3, 7), _DTYPES[0], "cuda", noncontiguous=True)
@@ -205,6 +255,7 @@ def test_train_inference_and_row_invariance(triton_module, dtype):
     op = triton_module.TritonFusedAddRMSNormOp()
     inputs = _inputs((7, 2688), (dtype, dtype, torch.float32), "cuda")
     outputs = op(*inputs)
+    inverse_rms = outputs[0].grad_fn.saved_tensors[1]
     for context in (torch.no_grad(), torch.inference_mode()):
         with context:
             inference_outputs = op(*inputs)
@@ -218,6 +269,8 @@ def test_train_inference_and_row_invariance(triton_module, dtype):
     subset_inputs = tuple(value[order].detach().requires_grad_(True) for value in inputs[:2])
     subset_inputs += (inputs[2].detach().requires_grad_(True),)
     subset_outputs = op(*subset_inputs)
+    subset_inverse_rms = subset_outputs[0].grad_fn.saved_tensors[1]
+    assert torch.equal(inverse_rms[order].view(torch.uint8), subset_inverse_rms.view(torch.uint8))
     subset_gradients = _backward(
         subset_outputs, subset_inputs, tuple(value[order] for value in upstream), "both"
     )
@@ -232,6 +285,7 @@ def test_train_inference_and_row_invariance(triton_module, dtype):
 @pytest.mark.parametrize("invalid", ["shape", "dtype", "device"])
 def test_backward_rejects_invalid_upstream(triton_module, branch, invalid):
     inputs = _inputs((3, 7), _DTYPES[0], "cuda")
+    _, updated_residual, inverse_rms = triton_module._launch_fused_add_rmsnorm_fwd(*inputs)
     bad = {
         "shape": torch.zeros(7, device="cuda"),
         "dtype": torch.zeros(3, 7, device="cuda", dtype=torch.int32),
@@ -240,7 +294,37 @@ def test_backward_rejects_invalid_upstream(triton_module, branch, invalid):
     upstream = {"grad_y": None, "grad_updated_residual_output": None, branch: bad}
     error = TypeError if invalid == "dtype" else ValueError
     with pytest.raises(error, match=branch):
-        triton_module._launch_fused_add_rmsnorm_bwd(*inputs, **upstream)
+        triton_module._launch_fused_add_rmsnorm_bwd(
+            updated_residual,
+            inverse_rms,
+            inputs[2],
+            **upstream,
+            x_dtype=inputs[0].dtype,
+            residual_dtype=inputs[1].dtype,
+        )
+
+
+def test_launches_use_input_device_and_restore_current_device(triton_module):
+    if torch.cuda.device_count() < 2:
+        pytest.skip("Two GPUs are required to check a noncurrent input device")
+    with torch.cuda.device(0):
+        inputs = _inputs((3, 2688), _DTYPES[2], "cuda:1")
+        upstream = tuple(_rand((3, 2688), seed, device="cuda:1") for seed in (150, 151))
+        reference_inputs = tuple(value.detach().double().requires_grad_(True) for value in inputs)
+        expected = _fp64_reference(*reference_inputs, 1e-5)
+
+        outputs = triton_module.TritonFusedAddRMSNormOp()(*inputs)
+        assert torch.cuda.current_device() == 0
+        gradients = _backward(outputs, inputs, upstream, "both")
+        assert torch.cuda.current_device() == 0
+        expected_gradients = _backward(
+            expected, reference_inputs, tuple(value.double() for value in upstream), "both"
+        )
+        for actual, reference in zip(
+            outputs + gradients, expected + expected_gradients, strict=True
+        ):
+            assert actual.device == torch.device("cuda:1")
+            _assert_close(actual, reference)
 
 
 def test_triton_rejects_cpu_inputs(triton_module):

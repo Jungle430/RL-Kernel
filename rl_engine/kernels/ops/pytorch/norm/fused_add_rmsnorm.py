@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 RL-Kernel Contributors
-"""Readable PyTorch counterpart to the Triton FP32 arithmetic prototype.
+"""Readable PyTorch counterpart to the Triton FP32 fused add RMSNorm.
 
 Both outputs stay in FP32, and normalization uses the unrounded FP32 residual
-sum. The public dtype contract and any BF16 rounding point are not finalized.
+sum. Backward arithmetic uses FP32; each input gradient returns in that input's
+dtype. Model integration must preserve these declared cast points.
 """
 
 import math
@@ -82,8 +83,8 @@ def fused_add_rmsnorm_backward(
     """Manually compute (grad_x, grad_residual, grad_weight) step by step.
 
     This is a standalone learning/reference helper, not a registered autograd
-    backward. It receives the forward inputs explicitly to recompute the
-    intermediates; a future autograd wrapper can provide saved values via ctx.
+    backward. It recomputes intermediates from the inputs for readability;
+    the optimized Triton backward instead reuses FP32 values saved by forward.
 
     Both upstream gradients have the same shape as x. Pass zeros for an unused
     output branch. Arithmetic uses FP32, and each returned gradient is cast to
@@ -139,11 +140,11 @@ def fused_add_rmsnorm_backward(
 
 
 class NativeFusedAddRMSNormOp(nn.Module):
-    """FP32-output prototype; PyTorch supplies gradients for both outputs.
+    """FP32-output fused add RMSNorm; PyTorch supplies both output branches' gradients.
 
     Inputs may independently use FP16, BF16, or FP32 on the same device.
-    Normalization uses the unrounded FP32 residual sum. This is an explicit
-    prototype contract, pending alignment with Nemotron's residual cast points.
+    Normalization uses the unrounded FP32 residual sum. Both outputs are FP32;
+    each input gradient returns in that input's dtype.
     """
 
     op_class = "norm"

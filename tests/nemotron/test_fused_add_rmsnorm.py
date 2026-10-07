@@ -37,6 +37,7 @@ def _run_kernels(kernels, x, residual, weight, grad_y, grad_updated_residual_out
 
     y = torch.full_like(x, float("nan"), dtype=torch.float32)
     updated_residual = torch.full_like(x, float("nan"), dtype=torch.float32)
+    inverse_rms = torch.full((n_rows,), float("nan"), device=x.device, dtype=torch.float32)
     grad_x = torch.full_like(x, float("nan"))
     grad_residual = torch.full_like(residual, float("nan"))
     grad_weight = torch.full_like(weight, float("nan"))
@@ -51,6 +52,7 @@ def _run_kernels(kernels, x, residual, weight, grad_y, grad_updated_residual_out
             weight,
             y,
             updated_residual,
+            inverse_rms,
             n_cols,
             _EPS,
             BLOCK_SIZE=block_size,
@@ -58,8 +60,8 @@ def _run_kernels(kernels, x, residual, weight, grad_y, grad_updated_residual_out
             enable_fp_fusion=False,
         )
         module._fused_add_rmsnorm_bwd_kernel[(n_rows,)](
-            x,
-            residual,
+            updated_residual,
+            inverse_rms,
             weight,
             grad_y,
             grad_updated_residual_output,
@@ -67,7 +69,6 @@ def _run_kernels(kernels, x, residual, weight, grad_y, grad_updated_residual_out
             grad_residual,
             grad_weight_per_row,
             n_cols,
-            _EPS,
             BLOCK_SIZE=block_size,
             num_warps=4,
             enable_fp_fusion=False,
@@ -81,7 +82,7 @@ def _run_kernels(kernels, x, residual, weight, grad_y, grad_updated_residual_out
         num_warps=4,
         enable_fp_fusion=False,
     )
-    return y, updated_residual, grad_x, grad_residual, grad_weight, grad_weight_per_row
+    return y, updated_residual, grad_x, grad_residual, grad_weight, grad_weight_per_row, inverse_rms
 
 
 def _assert_close(actual, expected):
@@ -124,7 +125,7 @@ def test_kernels_match_native_autograd(
         (x, residual, weight),
         grad_outputs=(grad_y, grad_updated_residual_output),
     )
-    y, updated_residual, grad_x, grad_residual, grad_weight, _ = _run_kernels(
+    y, updated_residual, grad_x, grad_residual, grad_weight, _, _ = _run_kernels(
         kernels, x, residual, weight, grad_y, grad_updated_residual_output
     )
 
@@ -179,9 +180,9 @@ def test_row_results_are_batch_invariant(kernels):
         grad_y[2:5],
         grad_updated_residual_output[2:5],
     )
-    # Compare both outputs, both input gradients, and per-row weight contributions.
+    # Compare outputs, input gradients, per-row weight contributions, and saved stats.
     # The final weight gradient sums different sets of rows and is not compared.
-    for index in (0, 1, 2, 3, 5):
+    for index in (0, 1, 2, 3, 5, 6):
         assert torch.equal(subset[index], full[index][2:5])
 
 
@@ -193,7 +194,7 @@ def test_zero_residual_sum_has_finite_gradients(kernels):
     grad_y = _rand(shape, 32)
     grad_updated_residual_output = _rand(shape, 33)
 
-    y, updated_residual, grad_x, grad_residual, grad_weight, _ = _run_kernels(
+    y, updated_residual, grad_x, grad_residual, grad_weight, _, _ = _run_kernels(
         kernels, x, residual, weight, grad_y, grad_updated_residual_output
     )
     expected_input_gradient = (
