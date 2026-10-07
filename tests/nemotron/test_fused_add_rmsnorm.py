@@ -172,17 +172,20 @@ def test_weight_reduction_matches_ordered_fp32_sum(kernels, n_rows, n_cols):
 def test_weight_reduction_accuracy_tails_and_repeatability(
     kernels, strategy, dtype, n_rows, n_cols
 ):
-    triton, module = kernels
+    _, module = kernels
     rows = _rand((n_rows, n_cols), 40)
     before = rows.clone()
     # An output guard catches stores beyond the final partial column block.
     buffer = torch.full((n_cols + 8,), float("nan"), device="cuda", dtype=dtype)
     actual = buffer[:n_cols]
-    kernel = module._WEIGHT_GRAD_KERNELS[module.RMSNormWeightGradStrategy(strategy)]
+    launch_weight_grad = module._WEIGHT_GRAD_LAUNCHERS[module.RMSNormWeightGradStrategy(strategy)]
 
     def launch():
-        kernel[(triton.cdiv(n_cols, 128),)](
-            rows, actual, n_rows, n_cols, BLOCK_SIZE=128, num_warps=4, enable_fp_fusion=False
+        launch_weight_grad(
+            grad_weight_per_row=rows,
+            grad_weight=actual,
+            n_rows=n_rows,
+            n_cols=n_cols,
         )
 
     launch()

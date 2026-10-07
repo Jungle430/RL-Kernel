@@ -24,14 +24,16 @@ This operator is not yet registered as the model's strict implementation.
 """
 
 import math
+from contextlib import nullcontext
 from enum import Enum
+from typing import Protocol
 
 import torch
 import triton
 import triton.language as tl
 
 # ROCm PyTorch also exposes its devices through the CUDA namespace.
-_SUPPORTED_DEVICES = ("cuda",)
+_SUPPORTED_DEVICES = ("cuda", "hip", "xpu", "musa")
 _SUPPORTED_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 _NUM_WARPS = 4
 _WEIGHT_BLOCK_SIZE = 128
@@ -43,6 +45,28 @@ class RMSNormWeightGradStrategy(Enum):
 
     SEQUENTIAL = "sequential"
     TILED = "tiled"
+
+
+class _WeightGradLauncher(Protocol):
+    """Reduce row contributions on the caller's current device and stream."""
+
+    def __call__(
+        self,
+        *,
+        grad_weight_per_row: torch.Tensor,
+        grad_weight: torch.Tensor,
+        n_rows: int,
+        n_cols: int,
+    ) -> None:
+        """Write the reduction into a preallocated output.
+
+        Args:
+            grad_weight_per_row: Contiguous FP32 input with shape [n_rows, n_cols].
+            grad_weight: Output buffer with shape [n_cols] and the weight dtype.
+            n_rows: Number of input rows whose contributions are accumulated.
+            n_cols: Number of features, equal to the number of weight elements.
+        """
+        ...
 
 
 @triton.jit
@@ -133,8 +157,12 @@ def _fused_add_rmsnorm_bwd_kernel(
     grad_x = grad_updated_residual_total
     grad_residual = grad_updated_residual_total
 
-    tl.store(grad_x_ptr + offsets, grad_x, mask=mask)
-    tl.store(grad_residual_ptr + offsets, grad_residual, mask=mask)
+    tl.store(grad_x_ptr + offsets, grad_x.to(grad_x_ptr.dtype.element_ty), mask=mask)
+    tl.store(
+        grad_residual_ptr + offsets,
+        grad_residual.to(grad_residual_ptr.dtype.element_ty),
+        mask=mask,
+    )
     tl.store(grad_weight_per_row_ptr + offsets, grad_weight_per_row, mask=mask)
 
 
@@ -156,15 +184,14 @@ def _fused_add_rmsnorm_bwd_weight_kernel(
     mask = cols < n_cols
 
     grad_weight = tl.full((BLOCK_SIZE,), 0.0, tl.float32)
-    offsets = cols
-    for _ in range(n_rows):
+    for row in range(n_rows):
+        offsets = row.to(tl.int64) * n_cols + cols
         contribution = tl.load(grad_weight_per_row_ptr + offsets, mask=mask, other=0.0).to(
             tl.float32
         )
         grad_weight = grad_weight + contribution
-        offsets = offsets + n_cols
 
-    tl.store(grad_weight_ptr + cols, grad_weight, mask=mask)
+    tl.store(grad_weight_ptr + cols, grad_weight.to(grad_weight_ptr.dtype.element_ty), mask=mask)
 
 
 @triton.jit
@@ -174,7 +201,7 @@ def _fused_add_rmsnorm_bwd_weight_tiled_kernel(
     n_rows,
     n_cols: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
-    BLOCK_ROWS: tl.constexpr = _WEIGHT_BLOCK_ROWS,
+    BLOCK_ROWS: tl.constexpr,
 ):
     """Experiment: accumulate row tiles, then reduce the row lanes once.
 
@@ -198,12 +225,57 @@ def _fused_add_rmsnorm_bwd_weight_tiled_kernel(
         grad_weight = grad_weight + contribution
 
     grad_weight_sum = tl.sum(grad_weight, axis=0)
-    tl.store(grad_weight_ptr + cols, grad_weight_sum, mask=cols < n_cols)
+    tl.store(
+        grad_weight_ptr + cols,
+        grad_weight_sum.to(grad_weight_ptr.dtype.element_ty),
+        mask=cols < n_cols,
+    )
 
 
-_WEIGHT_GRAD_KERNELS = {
-    RMSNormWeightGradStrategy.SEQUENTIAL: _fused_add_rmsnorm_bwd_weight_kernel,
-    RMSNormWeightGradStrategy.TILED: _fused_add_rmsnorm_bwd_weight_tiled_kernel,
+def _launch_fused_add_rmsnorm_bwd_weight_sequential(
+    *,
+    grad_weight_per_row: torch.Tensor,
+    grad_weight: torch.Tensor,
+    n_rows: int,
+    n_cols: int,
+) -> None:
+    """Write weight gradients with the sequential kernel's launch configuration."""
+    grid = (triton.cdiv(n_cols, _WEIGHT_BLOCK_SIZE),)
+    _fused_add_rmsnorm_bwd_weight_kernel[grid](
+        grad_weight_per_row,
+        grad_weight,
+        n_rows,
+        n_cols,
+        BLOCK_SIZE=_WEIGHT_BLOCK_SIZE,
+        num_warps=_NUM_WARPS,
+        enable_fp_fusion=False,
+    )
+
+
+def _launch_fused_add_rmsnorm_bwd_weight_tiled(
+    *,
+    grad_weight_per_row: torch.Tensor,
+    grad_weight: torch.Tensor,
+    n_rows: int,
+    n_cols: int,
+) -> None:
+    """Write weight gradients with the tiled kernel's launch configuration."""
+    grid = (triton.cdiv(n_cols, _WEIGHT_BLOCK_SIZE),)
+    _fused_add_rmsnorm_bwd_weight_tiled_kernel[grid](
+        grad_weight_per_row,
+        grad_weight,
+        n_rows,
+        n_cols,
+        BLOCK_SIZE=_WEIGHT_BLOCK_SIZE,
+        BLOCK_ROWS=_WEIGHT_BLOCK_ROWS,
+        num_warps=_NUM_WARPS,
+        enable_fp_fusion=False,
+    )
+
+
+_WEIGHT_GRAD_LAUNCHERS: dict[RMSNormWeightGradStrategy, _WeightGradLauncher] = {
+    RMSNormWeightGradStrategy.SEQUENTIAL: _launch_fused_add_rmsnorm_bwd_weight_sequential,
+    RMSNormWeightGradStrategy.TILED: _launch_fused_add_rmsnorm_bwd_weight_tiled,
 }
 
 
@@ -230,15 +302,11 @@ def _validate_backward_inputs(
     updated_residual: torch.Tensor,
     inverse_rms: torch.Tensor,
     weight: torch.Tensor,
-    grad_y: torch.Tensor | None,
-    grad_updated_residual_output: torch.Tensor | None,
 ) -> None:
     if updated_residual.ndim == 0 or updated_residual.shape[-1] == 0:
         raise ValueError("updated_residual must have shape [..., D] with D > 0.")
     if updated_residual.device.type not in _SUPPORTED_DEVICES:
         raise ValueError(f"Triton fused add RMSNorm requires a device in {_SUPPORTED_DEVICES}.")
-    if updated_residual.dtype != torch.float32 or inverse_rms.dtype != torch.float32:
-        raise TypeError("updated_residual and inverse_rms must have dtype float32.")
     n_cols = updated_residual.shape[-1]
     if inverse_rms.shape != (updated_residual.numel() // n_cols,):
         raise ValueError("inverse_rms must have one value per flattened input row.")
@@ -246,18 +314,6 @@ def _validate_backward_inputs(
         raise ValueError("weight must have shape [D] and a supported floating dtype.")
     if inverse_rms.device != updated_residual.device or weight.device != updated_residual.device:
         raise ValueError("saved tensors must be on the same device.")
-    for name, gradient in (
-        ("grad_y", grad_y),
-        ("grad_updated_residual_output", grad_updated_residual_output),
-    ):
-        if gradient is None:
-            continue
-        if gradient.shape != updated_residual.shape:
-            raise ValueError(f"{name} must have the same shape as updated_residual.")
-        if gradient.device != updated_residual.device:
-            raise ValueError(f"{name} must be on the updated_residual device.")
-        if gradient.dtype not in _SUPPORTED_DTYPES:
-            raise TypeError(f"{name} must have dtype in {_SUPPORTED_DTYPES}.")
 
 
 def _launch_fused_add_rmsnorm_fwd(
@@ -277,7 +333,7 @@ def _launch_fused_add_rmsnorm_fwd(
     if n_rows == 0:
         return y, updated_residual, inverse_rms
 
-    with torch.cuda.device(x.device):
+    with torch.cuda.device(x.device) if x.device.type == "cuda" else nullcontext():
         _fused_add_rmsnorm_fwd_kernel[(n_rows,)](
             x.contiguous(),
             residual.contiguous(),
@@ -312,9 +368,7 @@ def _launch_fused_add_rmsnorm_bwd(
     opts into another summation order. Neither strategy guarantees that adding
     separately reduced microbatch gradients reproduces a single call bitwise.
     """
-    _validate_backward_inputs(
-        updated_residual, inverse_rms, weight, grad_y, grad_updated_residual_output
-    )
+    _validate_backward_inputs(updated_residual, inverse_rms, weight)
     n_cols = updated_residual.shape[-1]
     n_rows = updated_residual.numel() // n_cols
     grad_x = torch.empty(updated_residual.shape, device=updated_residual.device, dtype=x_dtype)
@@ -334,7 +388,11 @@ def _launch_fused_add_rmsnorm_bwd(
     grad_weight_per_row = torch.empty(
         (n_rows, n_cols), device=updated_residual.device, dtype=torch.float32
     )
-    with torch.cuda.device(updated_residual.device):
+    with (
+        torch.cuda.device(updated_residual.device)
+        if updated_residual.device.type == "cuda"
+        else nullcontext()
+    ):
         _fused_add_rmsnorm_bwd_kernel[(n_rows,)](
             updated_residual.contiguous(),
             inverse_rms.contiguous(),
@@ -350,15 +408,12 @@ def _launch_fused_add_rmsnorm_bwd(
             enable_fp_fusion=False,
         )
         # Launch on the same stream: the merge observes completed row contributions.
-        weight_kernel = _WEIGHT_GRAD_KERNELS[weight_grad_strategy]
-        weight_kernel[(triton.cdiv(n_cols, _WEIGHT_BLOCK_SIZE),)](
-            grad_weight_per_row,
-            grad_weight,
-            n_rows,
-            n_cols,
-            BLOCK_SIZE=_WEIGHT_BLOCK_SIZE,
-            num_warps=_NUM_WARPS,
-            enable_fp_fusion=False,
+        launch_weight_grad = _WEIGHT_GRAD_LAUNCHERS[weight_grad_strategy]
+        launch_weight_grad(
+            grad_weight_per_row=grad_weight_per_row,
+            grad_weight=grad_weight,
+            n_rows=n_rows,
+            n_cols=n_cols,
         )
     return grad_x, grad_residual, grad_weight
 
@@ -368,14 +423,11 @@ class _FusedAddRMSNormTritonFunction(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, x, residual, weight, eps, weight_grad_strategy):
-        x_c = x.contiguous()
-        residual_c = residual.contiguous()
-        weight_c = weight.contiguous()
         y, updated_residual, inverse_rms = _launch_fused_add_rmsnorm_fwd(
-            x_c, residual_c, weight_c, eps=eps
+            x, residual, weight, eps=eps
         )
         # Keep the existing FP32 output, not copies of x/residual or a rounded sum.
-        ctx.save_for_backward(updated_residual, inverse_rms, weight_c)
+        ctx.save_for_backward(updated_residual, inverse_rms, weight)
         ctx.x_dtype = x.dtype
         ctx.residual_dtype = residual.dtype
         ctx.weight_grad_strategy = weight_grad_strategy
@@ -406,7 +458,7 @@ class _FusedAddRMSNormTritonFunction(torch.autograd.Function):
 
 
 class TritonFusedAddRMSNormOp:
-    """FP32-output fused add RMSNorm with first-order autograd on CUDA/ROCm devices.
+    """FP32-output fused add RMSNorm with first-order autograd on accepted GPUs.
 
     x/residual have identical shape [..., D], and weight has shape [D]. All
     inputs share a device and may independently use FP16, BF16, or FP32.
@@ -444,7 +496,6 @@ class TritonFusedAddRMSNormOp:
         *,
         eps: float = 1e-5,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        _validate_inputs(x, residual, weight, eps)
         return _FusedAddRMSNormTritonFunction.apply(
             x, residual, weight, eps, self.weight_grad_strategy
         )

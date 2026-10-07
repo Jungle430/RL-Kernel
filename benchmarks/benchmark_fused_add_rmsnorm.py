@@ -64,7 +64,7 @@ def _check(actual, expected, *, atol=None):
     return (actual.double() - expected.double()).abs().max().item()
 
 
-def _run_case(args, module, triton, n_rows, n_cols, dtype_name):
+def _run_case(args, module, n_rows, n_cols, dtype_name):
     from rl_engine.kernels.ops.pytorch.norm.fused_add_rmsnorm import NativeFusedAddRMSNormOp
 
     # Reset the seed per case so comparing a subset with a full sweep reuses its data.
@@ -141,19 +141,15 @@ def _run_case(args, module, triton, n_rows, n_cols, dtype_name):
     # outputs. No operator wrapper, allocation or autograd is included in this scope.
     expected_weight = per_row.double().sum(dim=0)
     reduced = torch.empty_like(weight)
-    grid = (triton.cdiv(n_cols, module._WEIGHT_BLOCK_SIZE),)
     reducers = {"native": lambda: torch.sum(per_row, dim=0, out=reduced)}
-    for strategy, kernel in module._WEIGHT_GRAD_KERNELS.items():
+    for strategy, launch_weight_grad in module._WEIGHT_GRAD_LAUNCHERS.items():
 
-        def reduce_weight(kernel=kernel):
-            kernel[grid](
-                per_row,
-                reduced,
-                n_rows,
-                n_cols,
-                BLOCK_SIZE=module._WEIGHT_BLOCK_SIZE,
-                num_warps=module._NUM_WARPS,
-                enable_fp_fusion=False,
+        def reduce_weight(launch_weight_grad=launch_weight_grad):
+            launch_weight_grad(
+                grad_weight_per_row=per_row,
+                grad_weight=reduced,
+                n_rows=n_rows,
+                n_cols=n_cols,
             )
 
         reducers[strategy.value] = reduce_weight
@@ -277,7 +273,7 @@ def main(argv=None):
         for n_rows in args.rows:
             for n_cols in args.cols:
                 print(f"Checking and timing {dtype} [{n_rows}, {n_cols}]...", flush=True)
-                payload["results"].extend(_run_case(args, module, triton, n_rows, n_cols, dtype))
+                payload["results"].extend(_run_case(args, module, n_rows, n_cols, dtype))
                 _save(payload, args.output_dir)
     payload["complete"] = True
     _save(payload, args.output_dir)

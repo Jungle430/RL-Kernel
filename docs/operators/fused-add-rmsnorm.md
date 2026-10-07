@@ -87,14 +87,19 @@ silently retry through PyTorch if its input validation or kernel launch fails.
 Both implementations are exported from their respective `norm` packages and
 own their validation and dtype constants independently.
 
+Direct Triton calls accept `cuda`, `hip`, `xpu`, and `musa` device types, following
+the existing operators. Execution requires a compatible Triton backend; XPU/MUSA
+validation remains pending. Standard ROCm PyTorch uses the `cuda` device type.
+
 ## Kernel design and consistency
 
 - Forward uses one program per row and `next_power_of_2(D)` lanes, masking the
   padding to zero. D = 2688 uses a 4096-element tile. The row statistic is saved
   in FP32; the existing residual output is reused by backward.
 - Backward reuses those saved values, computes input gradients and FP32 per-row
-  weight contributions, then launches a separate weight reduction. Kernel
-  launches use the input GPU's device context and current stream.
+  weight contributions, then launches a separate weight reduction. CUDA/ROCm
+  launches use the input GPU's device context and current stream; other accepted
+  device types do not enter the CUDA context.
 - Four warps and `enable_fp_fusion=False` fix each row's arithmetic independently
   of batch size. Grad-enabled, `no_grad`, and `inference_mode` forward use the
   same kernel. Tests compare raw bytes, including reordered/subset rows, for

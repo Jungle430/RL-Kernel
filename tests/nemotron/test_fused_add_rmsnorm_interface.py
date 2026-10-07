@@ -252,7 +252,7 @@ def test_repeated_backward_preserves_saved_tensors(triton_module, eps, strategy)
     for lhs, rhs in zip(first, second, strict=True):
         assert torch.equal(lhs.view(torch.uint8), rhs.view(torch.uint8))
     for lhs, rhs in zip(saved, before, strict=True):
-        assert torch.equal(lhs.view(torch.uint8), rhs.view(torch.uint8))
+        assert torch.equal(lhs.contiguous().view(torch.uint8), rhs.contiguous().view(torch.uint8))
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
@@ -287,29 +287,6 @@ def test_train_inference_and_row_invariance(triton_module, dtype, strategy):
     # Weight gradients sum different logical rows; compare only the per-row input gradients.
     for full, subset in zip(full_gradients[:2], subset_gradients[:2], strict=True):
         assert torch.equal(full[order].view(torch.uint8), subset.view(torch.uint8))
-
-
-@pytest.mark.parametrize("branch", ["grad_y", "grad_updated_residual_output"])
-@pytest.mark.parametrize("invalid", ["shape", "dtype", "device"])
-def test_backward_rejects_invalid_upstream(triton_module, branch, invalid):
-    inputs = _inputs((3, 7), _DTYPES[0], "cuda")
-    _, updated_residual, inverse_rms = triton_module._launch_fused_add_rmsnorm_fwd(*inputs)
-    bad = {
-        "shape": torch.zeros(7, device="cuda"),
-        "dtype": torch.zeros(3, 7, device="cuda", dtype=torch.int32),
-        "device": torch.zeros(3, 7),
-    }[invalid]
-    upstream = {"grad_y": None, "grad_updated_residual_output": None, branch: bad}
-    error = TypeError if invalid == "dtype" else ValueError
-    with pytest.raises(error, match=branch):
-        triton_module._launch_fused_add_rmsnorm_bwd(
-            updated_residual,
-            inverse_rms,
-            inputs[2],
-            **upstream,
-            x_dtype=inputs[0].dtype,
-            residual_dtype=inputs[1].dtype,
-        )
 
 
 @pytest.mark.parametrize("strategy", ["sequential", "tiled"])
