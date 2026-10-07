@@ -20,6 +20,7 @@ inputs and these statistics. The registry exposes this as softcapped_selected_lo
 """
 
 from collections.abc import Callable
+from contextlib import nullcontext
 from dataclasses import dataclass
 from enum import Enum
 from functools import lru_cache, partial
@@ -478,18 +479,20 @@ def _launch_softcapped_selected_logprob_fwd(
     if n_rows == 0:
         return output, log_sum_exp
 
-    _softcapped_selected_logprob_fwd_kernel[(n_rows,)](
-        logits_c,
-        token_ids_c,
-        output,
-        log_sum_exp,
-        vocab_size,
-        BLOCK_V=_BLOCK_V,
-        ACCUMULATE_BEFORE_REDUCE=accumulate_before_reduce,
-        PIPELINE_STAGES=pipeline_stages,
-        num_warps=4,
-        enable_fp_fusion=False,
-    )
+    # ROCm tensors also use torch.cuda; do not enter CUDA for other backends.
+    with torch.cuda.device(logits.device) if logits.device.type == "cuda" else nullcontext():
+        _softcapped_selected_logprob_fwd_kernel[(n_rows,)](
+            logits_c,
+            token_ids_c,
+            output,
+            log_sum_exp,
+            vocab_size,
+            BLOCK_V=_BLOCK_V,
+            ACCUMULATE_BEFORE_REDUCE=accumulate_before_reduce,
+            PIPELINE_STAGES=pipeline_stages,
+            num_warps=4,
+            enable_fp_fusion=False,
+        )
     return output, log_sum_exp
 
 
@@ -514,29 +517,30 @@ def _launch_softcapped_selected_logprob_fwd_parallel(
 
     n_tiles = triton.cdiv(vocab_size, _BLOCK_V)
     partial_sum_exp = torch.empty((n_rows, n_tiles), device=logits.device, dtype=torch.float32)
-    _softcapped_selected_logprob_fwd_partial_kernel[(n_rows, n_tiles)](
-        logits_c,
-        partial_sum_exp,
-        vocab_size,
-        n_tiles,
-        BLOCK_V=_BLOCK_V,
-        num_warps=4,
-        enable_fp_fusion=False,
-    )
-    # Both kernels launch on the current stream, so the merge reads completed
-    # partial sums without an explicit host synchronization.
-    _softcapped_selected_logprob_fwd_merge_kernel[(n_rows,)](
-        logits_c,
-        token_ids_c,
-        partial_sum_exp,
-        output,
-        log_sum_exp,
-        vocab_size,
-        n_tiles,
-        MERGE_UNROLL=merge_unroll,
-        num_warps=4,
-        enable_fp_fusion=False,
-    )
+    with torch.cuda.device(logits.device) if logits.device.type == "cuda" else nullcontext():
+        _softcapped_selected_logprob_fwd_partial_kernel[(n_rows, n_tiles)](
+            logits_c,
+            partial_sum_exp,
+            vocab_size,
+            n_tiles,
+            BLOCK_V=_BLOCK_V,
+            num_warps=4,
+            enable_fp_fusion=False,
+        )
+        # Both kernels use the input device's current stream, so the merge reads
+        # completed partial sums without an explicit host synchronization.
+        _softcapped_selected_logprob_fwd_merge_kernel[(n_rows,)](
+            logits_c,
+            token_ids_c,
+            partial_sum_exp,
+            output,
+            log_sum_exp,
+            vocab_size,
+            n_tiles,
+            MERGE_UNROLL=merge_unroll,
+            num_warps=4,
+            enable_fp_fusion=False,
+        )
     return output, log_sum_exp
 
 
@@ -569,17 +573,18 @@ def _launch_softcapped_selected_logprob_bwd(
         return grad_logits
 
     grid = (n_rows, triton.cdiv(vocab_size, block_v))
-    _softcapped_selected_logprob_bwd_kernel[grid](
-        logits_c,
-        token_ids_c,
-        grad_selected_logprob_c,
-        log_sum_exp_c,
-        grad_logits,
-        vocab_size,
-        BLOCK_V=block_v,
-        num_warps=num_warps,
-        enable_fp_fusion=False,
-    )
+    with torch.cuda.device(logits.device) if logits.device.type == "cuda" else nullcontext():
+        _softcapped_selected_logprob_bwd_kernel[grid](
+            logits_c,
+            token_ids_c,
+            grad_selected_logprob_c,
+            log_sum_exp_c,
+            grad_logits,
+            vocab_size,
+            BLOCK_V=block_v,
+            num_warps=num_warps,
+            enable_fp_fusion=False,
+        )
     return grad_logits
 
 

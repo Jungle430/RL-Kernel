@@ -366,6 +366,61 @@ def test_operator_autograd_and_inference(operator_impl, dtype, layout):
 
 
 @pytest.mark.parametrize("dtype", _DTYPES)
+@pytest.mark.parametrize("vocab", (1025, 262144))
+@pytest.mark.parametrize(
+    "forward_impl", (None, "row", "parallel", "row_accumulate", "row_pipelined")
+)
+def test_triton_noncurrent_device_forward_backward(dtype, vocab, forward_impl):
+    if torch.cuda.device_count() < 2:
+        pytest.skip("Two CUDA or ROCm GPUs are required for the noncurrent-device regression")
+    from rl_engine.kernels.ops.triton.loss.softcapped_selected_logprob import (
+        SoftcappedLogprobStrategy,
+        TritonSoftcappedSelectedLogprobOp,
+        _launch_softcapped_selected_logprob_bwd,
+    )
+
+    device = torch.device("cuda:1")
+    generator = torch.Generator().manual_seed(435)
+    # Include copies of strided input tensors while cuda:0 is current.
+    storage = (torch.randn((3, 2 * vocab), generator=generator) * 15).to(device=device, dtype=dtype)
+    logits = storage[:, ::2].detach().requires_grad_(True)
+    token_ids = torch.tensor([0, 0, vocab // 2, 0, vocab - 1, 0], device=device)[::2]
+    upstream = torch.tensor([0.25, 0, -2.0, 0, 1.5, 0], device=device)[::2]
+    strategy = None if forward_impl is None else SoftcappedLogprobStrategy(forward_impl)
+    op = TritonSoftcappedSelectedLogprobOp(forward_impl=strategy)
+
+    with torch.cuda.device(0):
+        output = op(logits, token_ids)
+        assert torch.cuda.current_device() == 0
+        assert output.device == device and output.dtype == torch.float32
+        saved_logits, saved_ids, log_sum_exp = output.grad_fn.saved_tensors
+        assert all(value.device == device for value in (saved_logits, saved_ids, log_sum_exp))
+
+        # Call backward directly too: autograd may itself select the forward
+        # device, which could otherwise hide a missing guard in the launcher.
+        direct_gradient = _launch_softcapped_selected_logprob_bwd(
+            logits, token_ids, upstream, log_sum_exp
+        )
+        assert torch.cuda.current_device() == 0
+        (gradient,) = torch.autograd.grad(output, logits, grad_outputs=upstream)
+        assert torch.cuda.current_device() == 0
+        assert gradient.device == direct_gradient.device == device
+        assert gradient.dtype == direct_gradient.dtype == dtype
+        _assert_bitwise(gradient, direct_gradient)
+        _assert_contract(output, _fp64_reference(logits, token_ids), "forward_accuracy")
+        _assert_contract(
+            gradient, _native_backward(logits, token_ids, upstream), "gradient_accuracy"
+        )
+
+        for context in (torch.no_grad(), torch.inference_mode()):
+            with context:
+                inference_output = op(logits, token_ids)
+            assert torch.cuda.current_device() == 0
+            assert inference_output.device == device
+            _assert_bitwise(inference_output, output.detach())
+
+
+@pytest.mark.parametrize("dtype", _DTYPES)
 @pytest.mark.parametrize("shape", ((0, 7), (3, 1025), (2, 262144)))
 @pytest.mark.parametrize("forward_impl", ("row", "parallel", "row_accumulate", "row_pipelined"))
 def test_triton_saved_log_sum_exp_and_repeated_backward(dtype, shape, forward_impl):
