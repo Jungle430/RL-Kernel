@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 RL-Kernel Contributors
-"""Direct GPU checks for fused add RMSNorm and both weight-gradient reductions."""
+"""Direct GPU checks for fused add RMSNorm and weight-gradient reductions."""
 
 import importlib
 
@@ -163,7 +163,7 @@ def test_weight_reduction_matches_ordered_fp32_sum(kernels, n_rows, n_cols):
     assert torch.equal(actual, expected)
 
 
-@pytest.mark.parametrize("strategy", ["sequential", "tiled"])
+@pytest.mark.parametrize("strategy", ["sequential", "tiled", "parallel"])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
 @pytest.mark.parametrize(
     "n_rows,n_cols",
@@ -242,3 +242,66 @@ def test_zero_residual_sum_has_finite_gradients(kernels):
     assert torch.equal(grad_weight, torch.zeros_like(weight))
     _assert_close(grad_x, expected_input_gradient)
     _assert_close(grad_residual, expected_input_gradient)
+
+
+@pytest.mark.parametrize(
+    "strategy,block_rows,block_cols,num_warps",
+    [
+        ("sequential", 1, 32, 4),
+        ("sequential", 1, 256, 8),
+        ("tiled", 16, 64, 4),
+        ("tiled", 64, 128, 8),
+        ("parallel", 64, 64, 4),
+        ("parallel", 256, 128, 8),
+        ("parallel", 512, 128, 4),
+    ],
+)
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+def test_configured_reduction_overwrites_workspace_and_replays_in_graph(
+    kernels, strategy, block_rows, block_cols, num_warps, dtype
+):
+    _, module = kernels
+    # >32 row tiles exercises the parallel merge loop; odd width masks both stages.
+    n_rows, n_cols = 33 * block_rows + 1, 129
+    rows = _rand((n_rows, n_cols), 170)
+    before = rows.clone()
+    buffer = torch.full((n_cols + 8,), float("nan"), device="cuda", dtype=dtype)
+    actual = buffer[:n_cols]
+    config = module.RMSNormWeightGradConfig(
+        block_rows=block_rows, block_cols=block_cols, num_warps=num_warps
+    )
+    kwargs = dict(
+        grad_weight_per_row=rows, grad_weight=actual, n_rows=n_rows, n_cols=n_cols, config=config
+    )
+    partials = None
+    if strategy == "parallel":
+        partials = torch.full((34, n_cols), float("nan"), device="cuda")
+        kwargs["partials"] = partials
+    launcher = module._WEIGHT_GRAD_LAUNCHERS[module.RMSNormWeightGradStrategy(strategy)]
+    launcher(**kwargs)
+    expected = rows.double().sum(dim=0)
+    tolerance = {torch.float16: 3e-3, torch.bfloat16: 2e-2, torch.float32: 2e-5}[dtype]
+    torch.testing.assert_close(
+        actual, expected.to(dtype), rtol=tolerance, atol=max(tolerance, 2e-5 * n_rows**0.5)
+    )
+    first = actual.clone()
+    actual.fill_(float("nan"))
+    if partials is not None:
+        partials.fill_(float("nan"))
+    launcher(**kwargs)
+    assert torch.equal(first.view(torch.uint8), actual.view(torch.uint8))
+    if partials is not None:
+        assert torch.isfinite(partials).all()
+
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        launcher(**kwargs)
+    for _ in range(2):
+        actual.fill_(float("nan"))
+        if partials is not None:
+            partials.fill_(float("nan"))
+        graph.replay()
+        assert torch.equal(first.view(torch.uint8), actual.view(torch.uint8))
+    assert torch.isnan(buffer[n_cols:]).all()
+    assert torch.equal(rows, before)

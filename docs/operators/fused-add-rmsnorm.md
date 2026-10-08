@@ -77,7 +77,7 @@ y, updated_residual = op(x, residual, weight, eps=1e-5)
 
 | Backend | Implementation | Dispatch |
 | --- | --- | --- |
-| CUDA | `TritonFusedAddRMSNormOp` | preferred; GPU validation pending |
+| CUDA | `TritonFusedAddRMSNormOp` | preferred; initial H100 run passed; new PARALLEL/configuration validation pending |
 | ROCm | same Triton implementation via `torch.cuda` | preferred; ROCm validation pending |
 | PyTorch | `NativeFusedAddRMSNormOp` | CPU reference and fallback when the Triton backend cannot load |
 
@@ -108,17 +108,42 @@ validation remains pending. Standard ROCm PyTorch uses the `cuda` device type.
   features and folds row contributions in ascending order, without atomics.
 - `RMSNormWeightGradStrategy.TILED` is experimental: each program accumulates
   32 row lanes by 128 features, then reduces the row lanes once. It changes the
-  FP32 addition order. Benchmark results are needed before changing defaults.
+  FP32 addition order.
+- `RMSNormWeightGradStrategy.PARALLEL` is experimental: independent programs
+  reduce fixed blocks of 256 rows by 128 features, write FP32 partials, and a
+  second kernel merges them using the existing fixed 32-row-lane reduction.
+  There are no floating-point atomics or locks. All launches use the same stream;
+  no host synchronization is inserted. The partition depends on the explicit
+  tile configuration, not the GPU's SM count or runtime scheduling.
+- `RMSNormWeightGradConfig` exposes `block_rows`, `block_cols` and `num_warps` for
+  experiments. Settings are saved per autograd call; changing a reusable Op
+  afterwards does not change a graph's backward. Forward and per-row backward
+  keep their original tile and four-warps configuration.
+
+At M = 8192, D = 2688, the original reductions launch only 21 programs, each
+processing all 8192 rows. Default PARALLEL launches 672 partial programs followed
+by 21 merge programs. Its additional partial buffer is only 32 x 2688 FP32 values
+(0.328 MiB), on top of the existing 84 MiB per-row contributions. This addresses
+limited parallelism, at the cost of an additional launch and workspace. Small
+inputs may favor SEQUENTIAL or TILED; no new default or automatic dispatch rule
+is inferred before measurement.
 
 Opt into the experiment explicitly:
 
 ```python
-from rl_engine.kernels.ops.triton.norm import RMSNormWeightGradStrategy, TritonFusedAddRMSNormOp
+from rl_engine.kernels.ops.triton.norm import (
+    RMSNormWeightGradConfig,
+    RMSNormWeightGradStrategy,
+    TritonFusedAddRMSNormOp,
+)
 
-op = TritonFusedAddRMSNormOp(weight_grad_strategy=RMSNormWeightGradStrategy.TILED)
+op = TritonFusedAddRMSNormOp(
+    weight_grad_strategy=RMSNormWeightGradStrategy.PARALLEL,
+    weight_grad_config=RMSNormWeightGradConfig(block_rows=256, block_cols=128, num_warps=4),
+)
 ```
 
-The two strategies share forward and per-row backward arithmetic. Weight gradients
+All three strategies share forward and per-row backward arithmetic. Weight gradients
 sum across rows and are checked numerically plus repeatably for an identical call;
 they are not promised to match bitwise across strategies, row reorderings, or
 separately reduced microbatches. Full-model, distributed, and CUDA-to-ROCm parity
@@ -129,7 +154,9 @@ require separate validation. FP32 intermediates alone do not prove these propert
 The operator tests use an independent FP64 autograd reference, random upstreams
 for both outputs, single-output losses, mixed dtypes, empty/strided inputs, unused
 input gradients, repeated backward, saved-tensor immutability, masked tails, and
-noncurrent-device launches on two GPUs. Default elementwise `(atol, rtol)` checks
+noncurrent-device launches on two GPUs. These checks include all three default
+strategies. Configuration checks also cover partial/merge boundaries, poisoned
+workspaces, guard regions, CUDA Graph replay and per-forward configuration retention. Default elementwise `(atol, rtol)` checks
 are `(2e-5, 2e-5)` for FP32, `(3e-3, 3e-3)` for FP16, and `(2e-2, 2e-2)` for BF16.
 The general harness additionally uses the shared `reduction` tolerance contract.
 
@@ -143,35 +170,122 @@ uv run --no-sync python scripts/check_operator.py \
 A CPU run validates the native API, registry, general harness integration and
 benchmark reporting. GPU skips are not evidence of Triton correctness or performance.
 
+## Initial H100 findings and optimization rationale
+
+The supplied initial H100 80GB HBM3 run (PyTorch 2.13.0+cu130, Triton 3.7.1)
+completed 373 tests; two noncurrent-device tests were skipped because it used one
+GPU. The 432 original benchmark measurements completed their accuracy checks.
+Those results cover SEQUENTIAL and TILED, not the new PARALLEL implementation.
+
+For BF16 inputs [8192, 2688], the original eager medians were:
+
+| Scope | PyTorch | SEQUENTIAL | TILED |
+| --- | ---: | ---: | ---: |
+| Weight reduction only | 0.04790 ms | 0.92304 ms | 0.54120 ms |
+| Forward + backward | 1.42910 ms | 1.17184 ms | 0.79021 ms |
+
+Thus the fused TILED call was about 1.81x faster overall even though its final
+weight reduction was about 11.3x slower than `torch.sum`. Fusion saves other
+launches/intermediates; it does not automatically make each reduction efficient.
+
+The code explains a likely bottleneck: both original reductions launch only
+`ceil(D / 128)` programs. TILED reduces serial loop iterations but still leaves
+most of a large GPU unable to participate when D = 2688. PyTorch already uses
+optimized compiled CUDA kernels: its [CUDA reduction implementation](https://github.com/pytorch/pytorch/blob/main/aten/src/ATen/native/cuda/Reduce.cuh)
+can split the reduction across threads and multiple blocks, with vectorized
+loads and staged partial results. The exact path used by this PyTorch build
+has not been profiled; low program count is a code-based diagnosis, not a
+hardware-counter measurement.
+
+[Triton's LayerNorm tutorial](https://triton-lang.org/main/getting-started/tutorials/05-layer-norm.html)
+also separates partial weight gradients and final merging. Its lock-based
+partial accumulation is not copied here: this experiment assigns fixed row
+ranges and unique partial-buffer slots to avoid schedule-dependent additions.
+
+The initial small-case timings also require care: BF16 [1, 2688] forward
+measured 0.06205 ms versus 0.23485 ms under the two strategies even though they
+use the same forward code. Such differences do not demonstrate a kernel
+advantage. The revised benchmark uses multiple paired rounds and separate
+CUDA Graph diagnostics before deriving a dispatch policy.
+
 ## Benchmark
 
 ```bash
 uv run --no-sync python benchmarks/benchmark_fused_add_rmsnorm.py --dry-run
-uv run --no-sync python benchmarks/benchmark_fused_add_rmsnorm.py
+uv run --no-sync python benchmarks/benchmark_fused_add_rmsnorm.py --preset smoke
+uv run --no-sync python benchmarks/benchmark_fused_add_rmsnorm.py --preset model --sweep-configs
+uv run --no-sync python benchmarks/benchmark_fused_add_rmsnorm.py --preset tuning --sweep-configs --dry-run
 ```
 
-Default coverage is 36 inputs: FP16/BF16/FP32, rows 1/32/33/128/1024/8192, and
-widths 129/2688, with FP32 weights and upstreams. The benchmark compares eager
-PyTorch with both Triton strategies for forward, backward, forward+backward,
-and the isolated weight reduction (432 measurements). The 129-wide cases
-exercise masked tails; width 2688 comes from the target model.
+Use distinct `--output-dir` values for separate runs. Presets cover:
 
-Outputs and random-upstream gradients are checked before each provider's timing.
-For large row sums the benchmark records a weight-gradient absolute tolerance
-of `2e-5 * sqrt(rows)` with relative tolerance `2e-5`, together with actual errors.
-This diagnostic tolerance does not replace the model's strict acceptance gate.
+| Preset | M (rows) | D (features) |
+| --- | --- | --- |
+| smoke | 1, 33 | 129, 2688 |
+| model (default) | 1, 32, 33, 128, 1024, 8192 | 129, 2688 |
+| tuning | 1, 16, 31, 32, 33, 128, 512, 1024, 2048, 8192, 32768 | 128, 129, 2688, 4096 |
 
-Timing uses accelerator events, 10 warmups and 50 repetitions by default. There
-is no `torch.compile`, CUDA Graph capture or explicit cache eviction. Compilation
-and correctness checks are excluded. Public timings include allocation and
-dispatch; small cases can include host dispatch gaps. Forward uses `no_grad`;
-backward reuses a prebuilt graph; forward+backward builds a fresh graph each call.
-The reduction microbenchmark reuses identical FP32 contributions and preallocated
-outputs, comparing against `torch.sum`. Extra peak allocation excludes inputs and
-prebuilt graphs. JSON includes samples, standard deviations, errors and memory;
-Markdown reports latency and speedups relative to eager PyTorch.
+Every preset uses FP16/BF16/FP32 inputs, FP32 weights/upstreams, and eps = 1e-5.
+Width 2688 comes from the model; other widths and 31/32/33 rows exercise tile
+boundaries. `--rows`, `--cols`, and `--dtypes` can narrow or extend coverage.
 
-Reports default to `reports/fused-add-rmsnorm/{report.md,results.json}`; use
-`--output-dir` for each new run and attach reports to the PR instead of committing
-them. No performance result has been established yet. Qualification against the
-model's native production norm path and final cast contract remains pending.
+Without a sweep, the benchmark compares PyTorch and the three default strategy
+configurations. `--sweep-configs` tests 36 unique reduction configurations:
+
+| Strategy | Row block | Column block | num_warps |
+| --- | --- | --- | --- |
+| SEQUENTIAL | unused | 32, 64, 128, 256 | 4, 8 |
+| TILED | 16, 32, 64 | 64, 128 | 4, 8 |
+| PARALLEL | 64, 128, 256, 512 | 64, 128 | 4, 8 |
+
+The measurement scopes are deliberately separate:
+
+1. **Weight reduction:** `torch.sum` and each reduction configuration receive
+   identical independently computed FP32 contributions and preallocated outputs.
+   PARALLEL's partial workspace is also preallocated. Eager and CUDA Graph
+   timings are both recorded, along with configuration, workspace size and
+   launch program counts. Every candidate must pass an FP64-reference check,
+   repeated-call byte equality, and a post-capture correctness check.
+2. **Public eager operator:** PyTorch and all default strategies are compared
+   for forward, backward and forward+backward. A sweep also takes the fastest
+   reduction-graph candidate per strategy and measures it as `*_tuned` through
+   the public API. These candidates must pass output/gradient accuracy,
+   training/inference byte equality, and row-subset/permutation checks. Public
+   timings include allocation and dispatch, including PARALLEL workspace
+   allocation. The per-case shortlist is not a production dispatch map.
+3. **Common forward diagnostic:** PyTorch and the common Triton forward are
+   timed under CUDA Graph replay. All eager Triton forward timings are also
+   compared as a control: a spread over 15% is flagged for rechecking before
+   making strategy decisions. This flag is a heuristic, not a significance test.
+
+Default timing uses 4 rounds, 10 warmups and 50 measured repetitions per provider
+per round. Provider order reverses in pairs and rotates between pairs. Python
+GC is disabled during measurement and restored afterwards. The reported median
+is the median of round medians; raw samples, sample standard deviation, round
+spread/order and wall time per instrumented call remain in JSON. There is no
+`torch.compile` or explicit cache eviction. Compilation and correctness checks
+are outside timing; small eager cases may include host dispatch gaps.
+
+Graph diagnostics capture 16 calls per replay by default (`--graph-unroll`) and
+divide the event time accordingly. Compare like timing modes and scopes only;
+graph kernel timings are not public eager end-to-end speedups. This follows the
+same host-overhead motivation as [Triton's CUDA Graph benchmark helper](https://triton-lang.org/main/python-api/generated/triton.testing.do_bench_cudagraph.html).
+
+Forward uses `no_grad`; backward reuses a prebuilt graph; forward+backward builds
+a fresh graph per call. Public extra peak allocation excludes inputs and prebuilt
+graphs. For large row sums, reduction and weight-gradient absolute tolerance is
+`2e-5 * sqrt(rows)`, with actual errors recorded. FP32 weight relative tolerance
+is `2e-5`. This diagnostic tolerance does not replace the model's strict gate,
+and repeatability within one configuration does not imply bitwise equality
+between reduction configurations or separately reduced microbatches.
+
+The default model run has 36 cases / 792 measurements. Model plus configuration
+sweep has 3492 measurements; the full tuning sweep has 132 cases / 12804
+measurements and is substantially longer. `--dry-run` prints the planned counts
+without requiring a GPU. Reports are checkpointed after each completed case;
+`complete` becomes true only after the whole plan finishes.
+
+Reports default to `reports/fused-add-rmsnorm/{report.md,results.json}`. Attach
+results to the PR instead of committing them. New PARALLEL/configuration
+performance and GPU correctness remain pending. Model cast-point alignment,
+ROCm and full-model/distributed validation also remain separate work.
