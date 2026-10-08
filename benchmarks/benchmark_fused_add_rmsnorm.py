@@ -6,6 +6,8 @@ Public eager timings include Python dispatch, allocation, and autograd. Separate
 CUDA Graph measurements amortize host launches and are never mixed with eager
 speedups. --sweep-configs sweeps reduction kernels, then checks the best measured
 configuration of each strategy through the public operator on the same input.
+--shortlist-configs checks a smaller, fixed H100 candidate set through every
+scope. --public-graph also captures complete backward and forward+backward calls.
 This is an experiment, not an automatic production dispatch policy.
 """
 
@@ -31,7 +33,49 @@ _PRESETS = {
     "smoke": ([1, 33], [129, 2688]),
     "model": ([1, 32, 33, 128, 1024, 8192], [129, 2688]),
     "tuning": ([1, 16, 31, 32, 33, 128, 512, 1024, 2048, 8192, 32768], [128, 129, 2688, 4096]),
+    "boundary": (
+        [
+            1,
+            2,
+            4,
+            8,
+            15,
+            16,
+            17,
+            31,
+            32,
+            33,
+            64,
+            128,
+            129,
+            192,
+            255,
+            256,
+            257,
+            384,
+            511,
+            512,
+            513,
+            1024,
+            2048,
+            8192,
+            32768,
+        ],
+        [2688],
+    ),
 }
+# First H100 sweep: narrow to useful row partitions and 64-column tiles. Keep
+# all defaults as controls, and measure every candidate through the public API;
+# a fast isolated sum is not sufficient evidence for an end-to-end choice.
+_SHORTLIST_CONFIGS = (
+    ("tiled", 32, 64, 4),
+    ("tiled", 64, 64, 4),
+    ("tiled", 64, 64, 8),
+    ("parallel", 64, 64, 4),
+    ("parallel", 128, 64, 4),
+    ("parallel", 256, 64, 4),
+    ("parallel", 512, 64, 4),
+)
 
 
 def _positive_int(value):
@@ -41,7 +85,7 @@ def _positive_int(value):
     return result
 
 
-def _variants(sweep):
+def _variants(sweep, shortlist=False):
     variants = []
     seen = set()
 
@@ -57,6 +101,9 @@ def _variants(sweep):
 
     for strategy, config in _DEFAULT_CONFIGS.items():
         add(strategy, strategy, *config)
+    if shortlist:
+        for strategy, rows, cols, warps in _SHORTLIST_CONFIGS:
+            add(f"{strategy}-r{rows}-c{cols}-w{warps}", strategy, rows, cols, warps)
     if sweep:
         for strategy, rows, cols, warps in itertools.chain(
             (("sequential", 1, c, w) for c, w in itertools.product((32, 64, 128, 256), (4, 8))),
@@ -109,10 +156,10 @@ def _measure_block(fn, repeat, divisor):
     return dict(samples_ms=samples, median_ms=statistics.median(samples), wall_ms_per_call=wall_ms)
 
 
-def _capture(fn, unroll):
+def _capture(fn, unroll, *, stream=None):
     # Compile/warm first, capture on a side stream, then replay many GPU calls
     # per host launch. Inputs and captured buffers remain alive through timing.
-    stream = torch.cuda.Stream()
+    stream = torch.cuda.Stream() if stream is None else stream
     stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream):
         for _ in range(3):
@@ -121,23 +168,49 @@ def _capture(fn, unroll):
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph, stream=stream):
         for _ in range(unroll):
-            fn()
+            # Release the preceding return before the next call, just as in
+            # eager timing. Keep only the final return for replay validation.
+            outputs = None
+            outputs = fn()
     torch.cuda.current_stream().wait_stream(stream)
     graph.replay()
     torch.cuda.synchronize()
-    return graph
+    return graph, outputs
 
 
-def _measure_group(functions, args, *, timing):
+def _assert_same_outputs(actual, expected):
+    for value, reference in zip(actual, expected, strict=True):
+        if value.shape != reference.shape or value.dtype != reference.dtype:
+            raise AssertionError("CUDA Graph changed an output's shape or dtype")
+        if not torch.equal(
+            value.contiguous().view(torch.uint8), reference.contiguous().view(torch.uint8)
+        ):
+            raise AssertionError("CUDA Graph output does not match eager output bitwise")
+
+
+def _measure_group(functions, args, *, timing, check_result=None, capture_stream=None):
     for fn in functions.values():
         for _ in range(args.warmup):
             fn()
     torch.cuda.synchronize()
-    graphs = (
-        {name: _capture(fn, args.graph_unroll) for name, fn in functions.items()}
-        if timing == "graph"
-        else {}
-    )
+    graphs, graph_outputs, graph_checks = {}, {}, {}
+    if timing == "graph":
+        for name, fn in functions.items():
+            # One independent eager return at a time bounds validation memory.
+            expected = fn() if check_result is not None else None
+            graphs[name], graph_outputs[name] = _capture(
+                fn, args.graph_unroll, stream=capture_stream
+            )
+            if check_result is not None:
+                check_result(graph_outputs[name])
+                _assert_same_outputs(graph_outputs[name], expected)
+                graphs[name].replay()
+                torch.cuda.synchronize()
+                _assert_same_outputs(graph_outputs[name], expected)
+                graph_checks[name] = dict(
+                    graph_matches_eager_bitwise=True, graph_repeat_bitwise=True
+                )
+            del expected
     calls = {name: graph.replay for name, graph in graphs.items()} if graphs else functions
     divisor = args.graph_unroll if graphs else 1
     rounds = {name: [] for name in calls}
@@ -156,7 +229,15 @@ def _measure_group(functions, args, *, timing):
     finally:
         if gc_enabled:
             gc.enable()
-    return {name: _summarize(records) for name, records in rounds.items()}, orders
+    # Many replays must still produce the reference gradients, not just the
+    # first replay. This check is outside timing and fails the case on mismatch.
+    if check_result is not None and graphs:
+        for name, outputs in graph_outputs.items():
+            graph_checks[name]["graph_max_abs_errors_vs_native"] = check_result(outputs)
+    return {
+        name: {**_summarize(records), **graph_checks.get(name, {})}
+        for name, records in rounds.items()
+    }, orders
 
 
 def _extra_peak(fn):
@@ -248,9 +329,11 @@ def _run_case(args, module, n_rows, n_cols, dtype_name):
     )
     records, order_records = [], []
 
-    def measure(functions, mode, timing, extra):
+    def measure(functions, mode, timing, extra, check_result=None, capture_stream=None):
         print(f"  {mode}/{timing}: {len(functions)} providers, {args.rounds} rounds", flush=True)
-        measured, orders = _measure_group(functions, args, timing=timing)
+        measured, orders = _measure_group(
+            functions, args, timing=timing, check_result=check_result, capture_stream=capture_stream
+        )
         order_records.append(dict(mode=mode, timing=timing, orders=orders))
         for name, stats in measured.items():
             records.append(
@@ -271,7 +354,7 @@ def _run_case(args, module, n_rows, n_cols, dtype_name):
         inverse_rms = torch.rsqrt(updated.square().mean(dim=-1, keepdim=True) + 1e-5)
         per_row = upstream[0] * (updated * inverse_rms)
         expected_weight = per_row.double().sum(dim=0)
-    specs = _variants(args.sweep_configs)
+    specs = _variants(args.sweep_configs, args.shortlist_configs)
     reducers, reduced, reducer_meta = _prepare_reducers(module, specs, per_row, weight)
     for name, fn in reducers.items():
         fn()
@@ -289,7 +372,7 @@ def _run_case(args, module, n_rows, n_cols, dtype_name):
     for name in reducers:
         _check(reduced[name], expected_weight, atol=weight_atol)
 
-    public_specs = [dict(s) for s in specs[:3]]
+    public_specs = [dict(s) for s in (specs if args.shortlist_configs else specs[:3])]
     selections = {}
     if args.sweep_configs:
         for strategy in _DEFAULT_CONFIGS:
@@ -363,10 +446,43 @@ def _run_case(args, module, n_rows, n_cols, dtype_name):
             for name, fn in calls.items()
         }
         measure(calls, mode, "eager", extra)
-    # Same mathematical forward for every strategy: a device-only baseline helps
-    # distinguish forward kernel cost from Python/allocation/dispatch gaps.
-    forward_graph = {name: functions["forward"][name] for name in ("native", "sequential")}
-    measure(forward_graph, "forward", "graph", {n: provider_meta[n] for n in forward_graph})
+    # Graph backward replays GPU work from a prebuilt autograd graph. Combined
+    # graphs contain both forward and backward GPU work; Python graph building
+    # and allocation decisions happen at capture time, not on every replay.
+    graph_modes = functions if args.public_graph else ("forward",)
+    for mode in graph_modes:
+        calls = functions[mode]
+        capture_stream = None
+        if not args.public_graph:
+            calls = {name: calls[name] for name in ("native", "sequential")}
+        if mode == "backward":
+            # Autograd backward inherits its forward's stream. Build this
+            # pre-existing graph on the capture stream, outside capture, so a
+            # backward-only measurement neither includes forward nor sends
+            # backward work to the default stream during side-stream capture.
+            capture_stream = torch.cuda.Stream()
+            capture_stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(capture_stream):
+                calls = {
+                    name: partial(
+                        torch.autograd.grad, op(*inputs), inputs, upstream, retain_graph=True
+                    )
+                    for name, op in providers.items()
+                }
+        if mode == "forward":
+            labels, expected = ("y", "updated_residual"), native_outputs
+        else:
+            labels, expected = ("grad_x", "grad_residual", "grad_weight"), reference
+
+        def check_result(actual, labels=labels, expected=expected):
+            return {
+                label: _check(value, ref, atol=weight_atol if label == "grad_weight" else None)
+                for label, value, ref in zip(labels, actual, expected, strict=True)
+            }
+
+        measure(
+            calls, mode, "graph", {n: provider_meta[n] for n in calls}, check_result, capture_stream
+        )
     forward_times = [
         r["median_ms"]
         for r in records
@@ -376,8 +492,18 @@ def _run_case(args, module, n_rows, n_cols, dtype_name):
     diagnostic = dict(
         **metadata,
         same_forward_spread=control_ratio,
-        timing_warning=control_ratio > 1.15,
+        timing_warning=control_ratio > 1.15 or any(r["round_spread"] > 1.15 for r in records),
         selections=selections,
+        unstable_measurements=[
+            dict(
+                mode=r["mode"],
+                timing=r["timing"],
+                provider=r["provider"],
+                round_spread=r["round_spread"],
+            )
+            for r in records
+            if r["round_spread"] > 1.15
+        ],
     )
     return records, dict(**metadata, measurements=order_records), diagnostic
 
@@ -399,6 +525,10 @@ def _report(payload):
         "and timing mode. No torch.compile. Forward uses no_grad, backward reuses a graph, "
         "forward+backward builds a fresh graph. Weight reduction uses torch.sum as its baseline, "
         "identical FP32 inputs, and preallocated outputs/parallel workspaces.",
+        "With --public-graph, all measured public configurations also run forward, backward and "
+        "forward+backward under CUDA Graph replay. Autograd traversal/allocation decisions happen "
+        "during capture; replay measures captured GPU work. Captured returns must match an "
+        "independent eager call bitwise, repeat bitwise, and pass reference checks after timing.",
         "",
         "Provider order alternates in paired reversed rounds. Python GC is disabled only during "
         "measurement and restored afterwards. The median is the median of per-round medians. "
@@ -410,11 +540,12 @@ def _report(payload):
         "calls passed output/gradient accuracy and training/inference byte checks before timing. "
         "Changing reduction configuration may change grad_weight bytes. These checks do not prove "
         "cross-strategy/microbatch/distributed equality. Tuned settings are per-case candidates, "
-        "not a production selection rule.",
+        "not a production selection rule. --shortlist-configs instead tests a fixed candidate set "
+        "in every scope; do not infer a dispatch boundary from isolated reduction timing alone.",
         "",
         "| Input | Shape | Scope | Timing | Provider | Median ms | Speedup | "
-        "Extra peak MiB | Partial workspace MiB |",
-        "| --- | --- | --- | --- | --- | ---: | ---: | ---: | ---: |",
+        "Extra peak MiB | Partial workspace MiB | Round max/min |",
+        "| --- | --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: |",
     ]
     native = {
         (r["input_dtype"], tuple(r["shape"]), r["mode"], r["timing"]): r["median_ms"]
@@ -426,18 +557,29 @@ def _report(payload):
         speedup = native.get(key, r["median_ms"]) / r["median_ms"]
         memory = f"{r['extra_peak_mib']:.2f}" if "extra_peak_mib" in r else "—"
         workspace = f"{r['workspace_mib']:.3f}" if "workspace_mib" in r else "—"
+        spread = f"{r['round_spread']:.2f}x" if "round_spread" in r else "—"
         lines.append(
             f"| {r['input_dtype']} | {r['shape'][0]}x{r['shape'][1]} | {r['mode']} | "
             f"{r['timing']} | {r['provider']} | {r['median_ms']:.6f} | {speedup:.2f}x | "
-            f"{memory} | {workspace} |"
+            f"{memory} | {workspace} | {spread} |"
         )
     lines.extend(["", "## Timing controls", ""])
     for d in payload.get("diagnostics", []):
-        status = "RECHECK before dispatch decisions" if d["timing_warning"] else "within 15%"
+        status = "RECHECK" if d["same_forward_spread"] > 1.15 else "within 15%"
         lines.append(
             f"- {d['input_dtype']} {d['shape']}: identical-forward timing spread "
             f"{d['same_forward_spread']:.2f}x — {status}."
         )
+        unstable = d.get("unstable_measurements", [])
+        for timing in ("eager", "graph"):
+            entries = [r for r in unstable if r["timing"] == timing]
+            if entries:
+                worst = max(entries, key=lambda r: r["round_spread"])
+                lines.append(
+                    f"  RECHECK {len(entries)} {timing} measurements with round spread > 15%; "
+                    f"worst: {worst['mode']}/{worst['provider']} "
+                    f"{worst['round_spread']:.2f}x. JSON lists every flagged measurement."
+                )
         if d["selections"]:
             choices = ", ".join(f"{k}: {v['name']}" for k, v in d["selections"].items())
             lines.append(
@@ -458,7 +600,18 @@ def _parse_args(argv=None):
     parser.add_argument("--rows", nargs="+", type=_positive_int)
     parser.add_argument("--cols", nargs="+", type=_positive_int)
     parser.add_argument("--dtypes", nargs="+", choices=_DTYPES, default=list(_DTYPES))
-    parser.add_argument("--sweep-configs", action="store_true")
+    configs = parser.add_mutually_exclusive_group()
+    configs.add_argument("--sweep-configs", action="store_true")
+    configs.add_argument(
+        "--shortlist-configs",
+        action="store_true",
+        help="Measure all 10 fixed H100 candidates through both the reduction and public API",
+    )
+    parser.add_argument(
+        "--public-graph",
+        action="store_true",
+        help="Also capture every public candidate's forward, backward and combined GPU work",
+    )
     parser.add_argument("--rounds", type=_positive_int, default=4)
     parser.add_argument("--warmup", type=_positive_int, default=10)
     parser.add_argument("--repeat", type=_positive_int, default=50)
@@ -476,12 +629,16 @@ def _parse_args(argv=None):
 
 def _case_plan(args):
     count = len(args.dtypes) * len(args.rows) * len(args.cols)
-    reduction_providers = len(_variants(args.sweep_configs)) + 1
-    public_providers = 7 if args.sweep_configs else 4
+    reduction_providers = len(_variants(args.sweep_configs, args.shortlist_configs)) + 1
+    public_providers = (
+        reduction_providers if args.shortlist_configs else (7 if args.sweep_configs else 4)
+    )
+    graph_measurements = public_providers * 3 if args.public_graph else 2
     return dict(
         case_count=count,
         reduction_config_count=reduction_providers - 1,
-        measurement_count=count * (reduction_providers * 2 + public_providers * 3 + 2),
+        measurement_count=count
+        * (reduction_providers * 2 + public_providers * 3 + graph_measurements),
     )
 
 
@@ -534,6 +691,8 @@ def main(argv=None):
                 _save(payload, args.output_dir)
                 print(
                     f"Same-forward spread: {diagnostic['same_forward_spread']:.2f}x; "
+                    f"measurements with round spread > 15%: "
+                    f"{len(diagnostic['unstable_measurements'])}; "
                     f"timing warning: {diagnostic['timing_warning']}",
                     flush=True,
                 )

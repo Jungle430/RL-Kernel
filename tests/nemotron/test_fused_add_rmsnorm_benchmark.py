@@ -3,6 +3,7 @@
 """Benchmark CLI/report checks; performance measurements stay in benchmarks/."""
 
 import gc
+import importlib
 import importlib.util
 import json
 from pathlib import Path
@@ -70,6 +71,83 @@ def test_tuning_grid_covers_each_strategy_and_keeps_defaults(benchmark):
         "reduction_config_count": 36,
         "measurement_count": 12804,
     }
+
+
+def test_boundary_plan_uses_fixed_shortlist_for_every_public_scope(benchmark):
+    args = benchmark._parse_args(["--preset", "boundary", "--shortlist-configs", "--public-graph"])
+    assert args.cols == [2688]
+    assert {1, 2, 4, 8, 15, 16, 17, 128, 129, 255, 256, 257, 511, 512, 513, 32768} <= set(args.rows)
+    specs = benchmark._variants(False, True)
+    assert specs[:3] == benchmark._variants(False)
+
+    def keys(variants):
+        return {(s["strategy"], s["block_rows"], s["block_cols"], s["num_warps"]) for s in variants}
+
+    assert len(keys(specs)) == len(specs) == 10
+    assert keys(specs) <= keys(benchmark._variants(True))
+    assert benchmark._case_plan(args) == {
+        "case_count": 75,
+        "reduction_config_count": 10,
+        "measurement_count": 6600,
+    }
+    with pytest.raises(SystemExit):
+        benchmark._parse_args(["--sweep-configs", "--shortlist-configs"])
+
+
+def test_captured_return_checks_bits_shape_and_dtype(benchmark):
+    benchmark._assert_same_outputs((torch.ones(3),), (torch.ones(3),))
+    for actual, expected in (
+        (torch.tensor([0.0]), torch.tensor([-0.0])),
+        (torch.ones(1, 3), torch.ones(3)),
+        (torch.ones(3, dtype=torch.float64), torch.ones(3)),
+    ):
+        with pytest.raises(AssertionError, match="CUDA Graph"):
+            benchmark._assert_same_outputs((actual,), (expected,))
+
+
+@pytest.mark.parametrize("corrupt_during_timing", [False, True])
+def test_graph_results_are_rechecked_after_timed_replays(
+    benchmark, monkeypatch, corrupt_during_timing
+):
+    # A capture can initially be correct but later overwrite its saved state.
+    # Exercise the result gate on CPU without substituting for real GPU coverage.
+    result = (torch.ones(3),)
+    reference = (torch.ones(3),)
+    checks = []
+    capture_stream = object()
+
+    class Graph:
+        def replay(self):
+            pass
+
+    def capture(fn, unroll, *, stream):
+        assert stream is capture_stream
+        return Graph(), result
+
+    def measure(fn, repeat, divisor):
+        fn()
+        if corrupt_during_timing:
+            result[0].fill_(float("nan"))
+        return dict(samples_ms=[1.0, 1.0], median_ms=1.0, wall_ms_per_call=1.0)
+
+    def check(values):
+        checks.append(True)
+        return {"grad_weight": benchmark._check(values[0], reference[0])}
+
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+    monkeypatch.setattr(benchmark, "_capture", capture)
+    monkeypatch.setattr(benchmark, "_measure_block", measure)
+    args = benchmark._parse_args(["--rounds", "1", "--warmup", "1", "--repeat", "2"])
+    kwargs = dict(timing="graph", check_result=check, capture_stream=capture_stream)
+    if corrupt_during_timing:
+        with pytest.raises(AssertionError):
+            benchmark._measure_group({"test": lambda: reference}, args, **kwargs)
+    else:
+        records, _ = benchmark._measure_group({"test": lambda: reference}, args, **kwargs)
+        assert records["test"]["graph_matches_eager_bitwise"]
+        assert records["test"]["graph_repeat_bitwise"]
+        assert records["test"]["graph_max_abs_errors_vs_native"] == {"grad_weight": 0.0}
+    assert len(checks) == 2
 
 
 def test_paired_round_orders_balance_positions(benchmark):
@@ -140,6 +218,9 @@ def test_report_does_not_mix_eager_graph_or_kernel_baselines(benchmark, tmp_path
         ("eager", "forward", (8.0, 4.0)),
         ("graph", "forward", (3.0, 1.0)),
         ("graph", "weight_reduction", (5.0, 1.0)),
+        ("eager", "backward", (6.0, 2.0)),
+        ("graph", "backward", (4.0, 1.0)),
+        ("graph", "forward_backward", (7.0, 1.0)),
     ):
         for provider, latency in zip(("native", "parallel"), latencies, strict=True):
             payload["results"].append(
@@ -151,16 +232,34 @@ def test_report_does_not_mix_eager_graph_or_kernel_baselines(benchmark, tmp_path
                     timing=timing,
                     median_ms=latency,
                     samples_ms=[latency, latency],
+                    round_spread=1.5,
                     max_abs_error_vs_fp64=1e-6,
                 )
             )
+    payload["diagnostics"] = [
+        dict(
+            input_dtype="bf16",
+            shape=[3, 129],
+            same_forward_spread=1.01,
+            timing_warning=True,
+            selections={},
+            unstable_measurements=[
+                dict(mode="backward", timing="eager", provider="parallel", round_spread=1.5),
+            ],
+        )
+    ]
     benchmark._save(payload, tmp_path)
     assert json.loads((tmp_path / "results.json").read_text()) == payload
     report = (tmp_path / "report.md").read_text()
-    assert "measurements: 6/22" in report
+    assert "measurements: 12/22" in report
     assert "| eager | parallel | 4.000000 | 2.00x |" in report
     assert "| graph | parallel | 1.000000 | 3.00x |" in report
     assert "| graph | parallel | 1.000000 | 5.00x |" in report
+    assert "| backward | graph | parallel | 1.000000 | 4.00x |" in report
+    assert "| forward_backward | graph | parallel | 1.000000 | 7.00x |" in report
+    assert "Round max/min" in report
+    assert "within 15%" in report
+    assert "RECHECK 1 eager measurements" in report
     assert "torch.sum" in report
     assert "not an end-to-end eager speedup" in report
 
@@ -168,3 +267,46 @@ def test_report_does_not_mix_eager_graph_or_kernel_baselines(benchmark, tmp_path
 def test_accuracy_check_catches_wrong_gradients(benchmark):
     with pytest.raises(AssertionError):
         benchmark._check(torch.zeros(3), torch.ones(3))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA or ROCm GPU required")
+def test_public_graph_shortlist_matches_eager_and_reference_after_replays(benchmark):
+    triton = pytest.importorskip("triton")
+    if not hasattr(triton, "jit"):
+        pytest.skip("A working Triton runtime is required")
+    module = importlib.import_module("rl_engine.kernels.ops.triton.norm.fused_add_rmsnorm")
+    args = benchmark._parse_args(
+        [
+            "--rows",
+            "257",
+            "--cols",
+            "129",
+            "--dtypes",
+            "bf16",
+            "--shortlist-configs",
+            "--public-graph",
+            "--rounds",
+            "1",
+            "--warmup",
+            "1",
+            "--repeat",
+            "2",
+            "--graph-unroll",
+            "2",
+        ]
+    )
+    records, _, _ = benchmark._run_case(args, module, 257, 129, "bf16")
+    assert len(records) == benchmark._case_plan(args)["measurement_count"] == 88
+    graph_results = [
+        r for r in records if r["timing"] == "graph" and r["mode"] != "weight_reduction"
+    ]
+    assert len(graph_results) == 33
+    for r in graph_results:
+        assert r["graph_matches_eager_bitwise"]
+        assert r["graph_repeat_bitwise"]
+        labels = (
+            {"y", "updated_residual"}
+            if r["mode"] == "forward"
+            else {"grad_x", "grad_residual", "grad_weight"}
+        )
+        assert set(r["graph_max_abs_errors_vs_native"]) == labels

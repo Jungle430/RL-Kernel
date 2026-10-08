@@ -77,7 +77,7 @@ y, updated_residual = op(x, residual, weight, eps=1e-5)
 
 | Backend | Implementation | Dispatch |
 | --- | --- | --- |
-| CUDA | `TritonFusedAddRMSNormOp` | preferred; initial H100 run passed; new PARALLEL/configuration validation pending |
+| CUDA | `TritonFusedAddRMSNormOp` | preferred; H100 correctness/configuration sweep passed; automatic strategy selection pending |
 | ROCm | same Triton implementation via `torch.cuda` | preferred; ROCm validation pending |
 | PyTorch | `NativeFusedAddRMSNormOp` | CPU reference and fallback when the Triton backend cannot load |
 
@@ -170,23 +170,31 @@ uv run --no-sync python scripts/check_operator.py \
 A CPU run validates the native API, registry, general harness integration and
 benchmark reporting. GPU skips are not evidence of Triton correctness or performance.
 
-## Initial H100 findings and optimization rationale
+## H100 findings and optimization rationale
 
-The supplied initial H100 80GB HBM3 run (PyTorch 2.13.0+cu130, Triton 3.7.1)
-completed 373 tests; two noncurrent-device tests were skipped because it used one
-GPU. The 432 original benchmark measurements completed their accuracy checks.
-Those results cover SEQUENTIAL and TILED, not the new PARALLEL implementation.
+The H100 80GB HBM3 configuration sweep (PyTorch 2.13.0+cu130, Triton 3.7.1)
+completed 520 tests; three noncurrent-device tests were skipped because it used
+one GPU. All 132 input cases / 12,804 measurements completed, covering 36 weight
+reduction configurations. Accuracy, fixed-call repeatability, training/inference
+byte equality, and corresponding row-subset outputs/input gradients passed the
+checks described above. These results do not establish full-model or ROCm parity.
 
-For BF16 inputs [8192, 2688], the original eager medians were:
+For BF16 inputs [8192, 2688], isolated weight-reduction CUDA Graph medians were:
 
-| Scope | PyTorch | SEQUENTIAL | TILED |
-| --- | ---: | ---: | ---: |
-| Weight reduction only | 0.04790 ms | 0.92304 ms | 0.54120 ms |
-| Forward + backward | 1.42910 ms | 1.17184 ms | 0.79021 ms |
+| Implementation | Time |
+| --- | ---: |
+| PyTorch `sum` | 0.04829 ms |
+| Default SEQUENTIAL | 0.96434 ms |
+| Default TILED | 0.56728 ms |
+| TILED, rows=64 / cols=64 / warps=8 | 0.12707 ms |
+| Default PARALLEL | 0.03664 ms |
+| PARALLEL, rows=512 / cols=64 / warps=4 | 0.03264 ms |
 
-Thus the fused TILED call was about 1.81x faster overall even though its final
-weight reduction was about 11.3x slower than `torch.sum`. Fusion saves other
-launches/intermediates; it does not automatically make each reduction efficient.
+The tuned parallel reduction was about 1.48x faster than PyTorch's sum. This is
+an isolated device-timing comparison, not a public eager speedup. Separately,
+BF16 [32768, 2688] public eager forward+backward measured 5.48097 ms for PyTorch
+versus 1.06158 ms for that parallel configuration (5.16x), with close agreement
+among four round medians. Raw reports remain external PR evidence.
 
 The code explains a likely bottleneck: both original reductions launch only
 `ceil(D / 128)` programs. TILED reduces serial loop iterations but still leaves
@@ -202,11 +210,12 @@ also separates partial weight gradients and final merging. Its lock-based
 partial accumulation is not copied here: this experiment assigns fixed row
 ranges and unique partial-buffer slots to avoid schedule-dependent additions.
 
-The initial small-case timings also require care: BF16 [1, 2688] forward
-measured 0.06205 ms versus 0.23485 ms under the two strategies even though they
-use the same forward code. Such differences do not demonstrate a kernel
-advantage. The revised benchmark uses multiple paired rounds and separate
-CUDA Graph diagnostics before deriving a dispatch policy.
+The isolated sweep favors SEQUENTIAL at M=1, TILED at sampled M=16..128, and
+PARALLEL at sampled M>=512 for D=2688. These are sampled points, not established
+dispatch intervals. Eager backward/combined timings still show substantial
+round-to-round variation even though identical-forward controls passed. The
+next boundary experiment checks a fixed shortlist through complete captured
+backward/combined calls as well as eager calls before deriving a dispatch policy.
 
 ## Benchmark
 
@@ -215,6 +224,8 @@ uv run --no-sync python benchmarks/benchmark_fused_add_rmsnorm.py --dry-run
 uv run --no-sync python benchmarks/benchmark_fused_add_rmsnorm.py --preset smoke
 uv run --no-sync python benchmarks/benchmark_fused_add_rmsnorm.py --preset model --sweep-configs
 uv run --no-sync python benchmarks/benchmark_fused_add_rmsnorm.py --preset tuning --sweep-configs --dry-run
+uv run --no-sync python benchmarks/benchmark_fused_add_rmsnorm.py \
+  --preset boundary --shortlist-configs --public-graph --dry-run
 ```
 
 Use distinct `--output-dir` values for separate runs. Presets cover:
@@ -224,6 +235,7 @@ Use distinct `--output-dir` values for separate runs. Presets cover:
 | smoke | 1, 33 | 129, 2688 |
 | model (default) | 1, 32, 33, 128, 1024, 8192 | 129, 2688 |
 | tuning | 1, 16, 31, 32, 33, 128, 512, 1024, 2048, 8192, 32768 | 128, 129, 2688, 4096 |
+| boundary | 1, 2, 4, 8, 15, 16, 17, 31, 32, 33, 64, 128, 129, 192, 255, 256, 257, 384, 511, 512, 513, 1024, 2048, 8192, 32768 | 2688 |
 
 Every preset uses FP16/BF16/FP32 inputs, FP32 weights/upstreams, and eps = 1e-5.
 Width 2688 comes from the model; other widths and 31/32/33 rows exercise tile
@@ -237,6 +249,14 @@ configurations. `--sweep-configs` tests 36 unique reduction configurations:
 | SEQUENTIAL | unused | 32, 64, 128, 256 | 4, 8 |
 | TILED | 16, 32, 64 | 64, 128 | 4, 8 |
 | PARALLEL | 64, 128, 256, 512 | 64, 128 | 4, 8 |
+
+`--shortlist-configs` is mutually exclusive with `--sweep-configs`. It keeps
+the three defaults plus seven candidates from the H100 sweep: TILED
+(rows=32/cols=64/warps=4, 64/64/4, 64/64/8) and PARALLEL
+(rows=64/128/256/512, cols=64, warps=4). All ten configurations are measured
+through the public operator; none is discarded based only on isolated timing.
+The boundary preset with this shortlist and `--public-graph` has 75 input cases
+and 6,600 measurements, versus 12,804 in the preceding broad sweep.
 
 The measurement scopes are deliberately separate:
 
@@ -252,11 +272,29 @@ The measurement scopes are deliberately separate:
    the public API. These candidates must pass output/gradient accuracy,
    training/inference byte equality, and row-subset/permutation checks. Public
    timings include allocation and dispatch, including PARALLEL workspace
-   allocation. The per-case shortlist is not a production dispatch map.
+   allocation. `--shortlist-configs` instead measures every fixed candidate.
+   Neither selection mechanism is a production dispatch map.
 3. **Common forward diagnostic:** PyTorch and the common Triton forward are
    timed under CUDA Graph replay. All eager Triton forward timings are also
    compared as a control: a spread over 15% is flagged for rechecking before
    making strategy decisions. This flag is a heuristic, not a significance test.
+4. **Complete public CUDA Graph diagnostic (`--public-graph`):** Every public
+   candidate and PyTorch are captured for forward, backward and forward+backward.
+   For backward-only capture, a prebuilt autograd graph is created on the capture
+   stream, since backward inherits its forward's stream. Combined capture records
+   both directions. Replay excludes Python autograd traversal and allocation
+   decisions, so these speedups are kept separate from eager speedups. Captured
+   returns must match an independent eager call bitwise, remain identical on
+   another replay, and pass reference accuracy checks again after timing. Only
+   the last unrolled return is retained; inputs/prebuilt graphs and graph outputs
+   stay alive throughout replay. The combined call returns gradients; outputs
+   are checked separately by the forward captures.
+
+Round max/min ratios are shown for every measurement. JSON lists all measurements
+whose round medians differ by more than 15%, separately for eager and graph timing.
+A passing identical-forward control alone no longer hides unstable backward
+measurements. The threshold identifies cases to revisit; it is not a statistical
+confidence interval and does not automatically select a production strategy.
 
 Default timing uses 4 rounds, 10 warmups and 50 measured repetitions per provider
 per round. Provider order reverses in pairs and rotates between pairs. Python
@@ -271,8 +309,8 @@ divide the event time accordingly. Compare like timing modes and scopes only;
 graph kernel timings are not public eager end-to-end speedups. This follows the
 same host-overhead motivation as [Triton's CUDA Graph benchmark helper](https://triton-lang.org/main/python-api/generated/triton.testing.do_bench_cudagraph.html).
 
-Forward uses `no_grad`; backward reuses a prebuilt graph; forward+backward builds
-a fresh graph per call. Public extra peak allocation excludes inputs and prebuilt
+In eager timing, forward uses `no_grad`; backward reuses a prebuilt graph;
+forward+backward builds a fresh graph per call. Public extra peak allocation excludes inputs and prebuilt
 graphs. For large row sums, reduction and weight-gradient absolute tolerance is
 `2e-5 * sqrt(rows)`, with actual errors recorded. FP32 weight relative tolerance
 is `2e-5`. This diagnostic tolerance does not replace the model's strict gate,
@@ -286,6 +324,7 @@ without requiring a GPU. Reports are checkpointed after each completed case;
 `complete` becomes true only after the whole plan finishes.
 
 Reports default to `reports/fused-add-rmsnorm/{report.md,results.json}`. Attach
-results to the PR instead of committing them. New PARALLEL/configuration
-performance and GPU correctness remain pending. Model cast-point alignment,
-ROCm and full-model/distributed validation also remain separate work.
+results to the PR instead of committing them. The new complete-graph/boundary
+experiment still needs GPU execution before automatic dispatch can be chosen.
+Model cast-point alignment, ROCm and full-model/distributed validation also
+remain separate work.
