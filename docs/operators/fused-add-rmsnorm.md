@@ -214,8 +214,22 @@ The isolated sweep favors SEQUENTIAL at M=1, TILED at sampled M=16..128, and
 PARALLEL at sampled M>=512 for D=2688. These are sampled points, not established
 dispatch intervals. Eager backward/combined timings still show substantial
 round-to-round variation even though identical-forward controls passed. The
-next boundary experiment checks a fixed shortlist through complete captured
-backward/combined calls as well as eager calls before deriving a dispatch policy.
+subsequent boundary experiment completed 527 tests (three two-GPU skips) and
+75 input cases / 6,600 measurements, covering all ten shortlisted configurations
+through both eager and complete captured calls. All 2,475 public graph records
+passed eager/captured byte equality and repeated-replay checks. Graph round
+max/min stayed below 1.04; eager backward/combined timings still included
+unstable measurements.
+
+In the complete graph measurements, sampled M=1/2/4/8 favored SEQUENTIAL,
+M=15..256 favored TILED, M=257 was close, and M>=384 favored PARALLEL. These
+boundaries cannot be copied directly into eager dispatch: the extra launch and
+allocation of PARALLEL can offset its GPU-time advantage in smaller eager calls.
+The fixed PARALLEL configuration rows=512 / cols=64 / warps=4 measured public
+eager forward+backward at [32768, 2688] in 1.07235 / 1.07321 / 1.30809 ms for
+FP16 / BF16 / FP32 respectively, versus PyTorch's 5.39576 / 5.40082 / 4.50619 ms
+(5.03x / 5.03x / 3.44x). Each of these measurements had round spread below 0.1%.
+Raw reports remain external evidence; automatic dispatch is still pending.
 
 ## Benchmark
 
@@ -226,6 +240,8 @@ uv run --no-sync python benchmarks/benchmark_fused_add_rmsnorm.py --preset model
 uv run --no-sync python benchmarks/benchmark_fused_add_rmsnorm.py --preset tuning --sweep-configs --dry-run
 uv run --no-sync python benchmarks/benchmark_fused_add_rmsnorm.py \
   --preset boundary --shortlist-configs --public-graph --dry-run
+uv run --no-sync python benchmarks/benchmark_fused_add_rmsnorm.py \
+  --preset dispatch --finalist-configs --public-graph --dry-run
 ```
 
 Use distinct `--output-dir` values for separate runs. Presets cover:
@@ -236,10 +252,27 @@ Use distinct `--output-dir` values for separate runs. Presets cover:
 | model (default) | 1, 32, 33, 128, 1024, 8192 | 129, 2688 |
 | tuning | 1, 16, 31, 32, 33, 128, 512, 1024, 2048, 8192, 32768 | 128, 129, 2688, 4096 |
 | boundary | 1, 2, 4, 8, 15, 16, 17, 31, 32, 33, 64, 128, 129, 192, 255, 256, 257, 384, 511, 512, 513, 1024, 2048, 8192, 32768 | 2688 |
+| dispatch | 35 model-width row cases, plus 15 sparse other-width cases; see below | 2688; sparse 129, 2687, 2689, 4096, 8193 |
 
 Every preset uses FP16/BF16/FP32 inputs, FP32 weights/upstreams, and eps = 1e-5.
 Width 2688 comes from the model; other widths and 31/32/33 rows exercise tile
 boundaries. `--rows`, `--cols`, and `--dtypes` can narrow or extend coverage.
+The explicit `config.shapes` list in JSON is authoritative for sparse plans.
+
+The dispatch plan fills the remaining eager crossover rather than repeating all
+36 configurations. For D=2688 it keeps small-row controls and densely samples
+M=2048..8192: 2048, 3072, 4096, 6144 and 8192 each include the immediately
+preceding/following row, with 1536, 2560, 3584, 5120 and 7168 as additional
+anchors. M=16384/32768/65536 check the large-row path beyond the previous maximum.
+For each synthetic width 129/2687/2689/4096/8193 it tests M=1/2048/8192 to probe
+column tails, model-width neighbors and widths beyond the previous sweep.
+Those are fallback-policy evidence, not a claim that every width is tuned.
+Empty inputs and invalid metadata remain correctness tests, not timing cases.
+
+Dispatch uses 50 explicit shapes, not their full Cartesian product. Supplying
+either `--rows` or `--cols` replaces this sparse plan with the specified grid
+(unspecified columns default to 2688; unspecified rows use the 35 model rows).
+`--reverse-cases` reverses the entire dtype/shape sequence without dropping cases.
 
 Without a sweep, the benchmark compares PyTorch and the three default strategy
 configurations. `--sweep-configs` tests 36 unique reduction configurations:
@@ -258,6 +291,35 @@ through the public operator; none is discarded based only on isolated timing.
 The boundary preset with this shortlist and `--public-graph` has 75 input cases
 and 6,600 measurements, versus 12,804 in the preceding broad sweep.
 
+`--finalist-configs` is mutually exclusive with both other configuration flags.
+It retains the three defaults as controls and adds TILED (32/64/4 and 64/64/8)
+and PARALLEL (512/64/4). All six are measured through every public scope;
+there is no per-case pruning based on isolated reduction speed. These fixed
+finalists avoid turning sub-percent differences between large-row PARALLEL
+configurations into a complicated policy. Dispatch plus finalists and
+`--public-graph` produces 150 input cases / 8,400 measurements.
+
+For the remaining selection experiment, use eight rounds and then a fresh
+process with reversed case order and a second seed for the key boundaries:
+
+```bash
+uv run --no-sync python benchmarks/benchmark_fused_add_rmsnorm.py \
+  --preset dispatch --finalist-configs --public-graph \
+  --rounds 8 --warmup 10 --repeat 50 --graph-unroll 16 \
+  --output-dir reports/fused-rmsnorm-dispatch/run1
+uv run --no-sync python benchmarks/benchmark_fused_add_rmsnorm.py \
+  --preset dispatch --finalist-configs --public-graph \
+  --rows 8 16 256 384 1536 2048 2049 2560 3072 3584 4096 5120 6144 7168 8192 8193 65536 \
+  --rounds 8 --warmup 10 --repeat 50 --graph-unroll 16 --seed 435 --reverse-cases \
+  --output-dir reports/fused-rmsnorm-dispatch/run2
+```
+
+Run 2 covers 51 cases / 2,856 measurements; both runs total 201 cases / 11,256
+measurements. The plan targets the H100 80 GB used for previous tuning. Each
+completed case prints its elapsed time and the cumulative duration, with counts
+and accuracy gates preserved in the checkpointed JSON. If a run fails, its
+partial report remains incomplete; do not infer success from file existence.
+
 The measurement scopes are deliberately separate:
 
 1. **Weight reduction:** `torch.sum` and each reduction configuration receive
@@ -272,7 +334,7 @@ The measurement scopes are deliberately separate:
    the public API. These candidates must pass output/gradient accuracy,
    training/inference byte equality, and row-subset/permutation checks. Public
    timings include allocation and dispatch, including PARALLEL workspace
-   allocation. `--shortlist-configs` instead measures every fixed candidate.
+   allocation. `--shortlist-configs`/`--finalist-configs` measure every fixed candidate.
    Neither selection mechanism is a production dispatch map.
 3. **Common forward diagnostic:** PyTorch and the common Triton forward are
    timed under CUDA Graph replay. All eager Triton forward timings are also
@@ -298,6 +360,17 @@ whose round medians differ by more than 15%, separately for eager and graph timi
 A passing identical-forward control alone no longer hides unstable backward
 measurements. The threshold identifies cases to revisit; it is not a statistical
 confidence interval and does not automatically select a production strategy.
+
+The report also compares SEQUENTIAL/TILED and TILED/PARALLEL separately for
+public backward/combined and eager/graph measurements. It compares the fastest
+measured configuration within each family, keeps same-round latency ratios,
+and labels the comparison `inconclusive` unless there are at least four rounds,
+a median advantage of at least 5%, all matching rounds favor the same family,
+both providers' round spreads are at most 15%, and instrumented wall time agrees
+on direction. Wall time includes event instrumentation. This is a conservative
+screening heuristic, not statistical significance or an automatic selector.
+An independent reversed-order run must support the proposed boundaries; a
+Graph candidate never substitutes for an inconclusive eager result.
 
 Default timing uses 4 rounds, 10 warmups and 50 measured repetitions per provider
 per round. Provider order reverses in pairs and rotates between pairs. Python
@@ -327,7 +400,8 @@ without requiring a GPU. Reports are checkpointed after each completed case;
 `complete` becomes true only after the whole plan finishes.
 
 Reports default to `reports/fused-add-rmsnorm/{report.md,results.json}`. Attach
-results to the PR instead of committing them. The new complete-graph/boundary
-experiment still needs GPU execution before automatic dispatch can be chosen.
+results to the PR instead of committing them. The complete-graph/boundary
+experiment passed on H100; the expanded dispatch experiment still needs GPU
+execution before automatic selection can be chosen.
 Model cast-point alignment, ROCm and full-model/distributed validation also
 remain separate work.

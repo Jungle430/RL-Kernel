@@ -6,6 +6,7 @@ import gc
 import importlib
 import importlib.util
 import json
+import statistics
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -35,7 +36,8 @@ def test_dry_run_requires_no_gpu_and_writes_no_reports(benchmark, monkeypatch, t
 
 
 @pytest.mark.parametrize(
-    "argument", ["--rows", "--cols", "--warmup", "--repeat", "--rounds", "--graph-unroll"]
+    "argument",
+    ["--rows", "--cols", "--warmup", "--repeat", "--rounds", "--graph-unroll"],
 )
 @pytest.mark.parametrize("value", ["0", "-1"])
 def test_cli_rejects_nonpositive_values(benchmark, argument, value):
@@ -93,6 +95,132 @@ def test_boundary_plan_uses_fixed_shortlist_for_every_public_scope(benchmark):
     }
     with pytest.raises(SystemExit):
         benchmark._parse_args(["--sweep-configs", "--shortlist-configs"])
+
+
+def test_dispatch_plan_covers_crossover_tails_and_outside_previous_domain(benchmark):
+    args = benchmark._parse_args(["--preset", "dispatch", "--finalist-configs", "--public-graph"])
+    shapes = {tuple(shape) for shape in args.shapes}
+    # Both sides of all remaining plausible eager cutoffs, not only round sizes.
+    for center in (2048, 3072, 4096, 6144, 8192):
+        assert {(center + delta, 2688) for delta in (-1, 0, 1)} <= shapes
+    assert {
+        (1, 2688),
+        (1536, 2688),
+        (2560, 2688),
+        (3584, 2688),
+        (5120, 2688),
+        (7168, 2688),
+        (16384, 2688),
+        (32768, 2688),
+        (65536, 2688),
+    } <= shapes
+    for rows in (1, 2048, 8192):
+        assert {(rows, width) for width in (129, 2687, 2689, 4096, 8193)} <= shapes
+    assert len(shapes) == len(args.shapes) == 50
+    assert (
+        65536,
+        8193,
+    ) not in shapes  # Sparse width checks, not an accidental full cross product.
+    specs = benchmark._variants(False, finalists=True)
+    assert specs[:3] == benchmark._variants(False)
+    assert len(specs) == 6
+
+    def keys(variants):
+        return {(s["strategy"], s["block_rows"], s["block_cols"], s["num_warps"]) for s in variants}
+
+    assert keys(specs) <= keys(benchmark._variants(False, True))
+    plan = benchmark._case_plan(args)
+    assert plan["case_count"] == 150
+    assert plan["reduction_config_count"] == 6
+    assert plan["measurement_count"] == 8400
+    assert plan["coverage"] == dict(
+        model_width=2688, model_shape_count=35, other_shape_count=15, shapes=args.shapes
+    )
+    cases = benchmark._cases(args)
+    assert len(set(cases)) == len(cases) == 150
+    assert {dtype for dtype, _, _ in cases} == {"fp16", "bf16", "fp32"}
+
+
+def test_dispatch_overrides_and_reverse_run_do_not_expand_or_drop_cases(benchmark):
+    options = [
+        "--preset",
+        "dispatch",
+        "--rows",
+        "2049",
+        "2049",
+        "3072",
+        "--finalist-configs",
+    ]
+    args = benchmark._parse_args(options)
+    assert args.shapes == [[2049, 2688], [3072, 2688]]
+    reverse = benchmark._parse_args(options + ["--reverse-cases"])
+    assert benchmark._cases(reverse) == benchmark._cases(args)[::-1]
+    explicit = benchmark._parse_args(options + ["--cols", "129", "129", "4097"])
+    assert explicit.shapes == [[2049, 129], [2049, 4097], [3072, 129], [3072, 4097]]
+    assert benchmark._case_plan(explicit)["case_count"] == 12
+    for incompatible in ("--sweep-configs", "--shortlist-configs"):
+        with pytest.raises(SystemExit):
+            benchmark._parse_args(["--finalist-configs", incompatible])
+
+
+def _comparison_record(strategy, medians, *, mode="forward_backward", timing="eager"):
+    return dict(
+        provider=strategy,
+        strategy=strategy,
+        mode=mode,
+        timing=timing,
+        median_ms=statistics.median(medians),
+        wall_ms_per_call=statistics.median(medians),
+        round_spread=max(medians) / min(medians),
+        rounds=[dict(index=i, median_ms=value) for i, value in enumerate(medians)],
+    )
+
+
+@pytest.mark.parametrize(
+    "left,right,expected",
+    [
+        ([2.0] * 4, [1.0] * 4, "parallel"),
+        ([1.0] * 4, [2.0] * 4, "tiled"),
+        ([1.02] * 4, [1.0] * 4, "inconclusive"),  # A tiny advantage is not a cutoff.
+        ([2.0] * 4, [0.5, 1.0, 1.0, 1.0], "inconclusive"),  # Unstable faster candidate.
+        ([0.98, 1.1, 1.1, 1.1], [1.0] * 4, "inconclusive"),  # One round contradicts.
+        ([2.0] * 2, [1.0] * 2, "inconclusive"),  # Smoke cannot establish a winner.
+    ],
+)
+def test_strategy_comparison_does_not_promote_noisy_or_tied_minima(
+    benchmark, left, right, expected
+):
+    records = [_comparison_record("tiled", left), _comparison_record("parallel", right)]
+    (comparison,) = benchmark._strategy_comparisons(records)
+    assert comparison["candidate"] == expected
+    assert comparison["round_left_over_right"] == [a / b for a, b in zip(left, right, strict=True)]
+    assert comparison["right_wins"] == sum(a > b for a, b in zip(left, right, strict=True))
+
+
+def test_strategy_comparison_separates_scopes_and_checks_wall_time_and_rounds(
+    benchmark,
+):
+    records = []
+    for mode in ("backward", "forward_backward"):
+        for timing in ("eager", "graph"):
+            faster, slower = ("tiled", "parallel") if timing == "eager" else ("parallel", "tiled")
+            records.extend(
+                [
+                    _comparison_record(faster, [1.0] * 4, mode=mode, timing=timing),
+                    _comparison_record(slower, [2.0] * 4, mode=mode, timing=timing),
+                ]
+            )
+    comparisons = benchmark._strategy_comparisons(records)
+    assert len(comparisons) == 4
+    for c in comparisons:
+        assert c["candidate"] == ("tiled" if c["timing"] == "eager" else "parallel")
+    # Event timing and instrumented wall time disagree: retain the evidence,
+    # but do not recommend a dispatch change based only on the event winner.
+    records[0]["wall_ms_per_call"] = 3.0
+    assert benchmark._strategy_comparisons(records)[0]["candidate"] == "inconclusive"
+    records[0]["rounds"][0]["index"] = 7
+    with pytest.raises(ValueError, match="matching round indices"):
+        benchmark._strategy_comparisons(records)
 
 
 def test_captured_return_checks_bits_shape_and_dtype(benchmark):
@@ -321,9 +449,50 @@ def test_accuracy_check_catches_wrong_gradients(benchmark):
         benchmark._check(torch.zeros(3), torch.ones(3))
 
 
+def test_report_keeps_strategy_comparison_timing_and_candidate_status(benchmark):
+    args = benchmark._parse_args(["--rows", "3072", "--cols", "2688", "--dtypes", "bf16"])
+    records = []
+    for timing, left, right in (("eager", 1.02, 1.0), ("graph", 2.0, 1.0)):
+        for strategy, value in (("tiled", left), ("parallel", right)):
+            records.append(
+                {
+                    **_comparison_record(strategy, [value] * 4, timing=timing),
+                    "input_dtype": "bf16",
+                    "shape": [3072, 2688],
+                }
+            )
+    comparisons = benchmark._strategy_comparisons(records)
+    payload = dict(
+        complete=False,
+        environment=dict(gpu="test", torch="test", triton="test"),
+        config=vars(args),
+        case_plan=benchmark._case_plan(args),
+        results=records,
+        diagnostics=[
+            dict(
+                input_dtype="bf16",
+                shape=[3072, 2688],
+                same_forward_spread=1.0,
+                selections={},
+                strategy_comparisons=comparisons,
+            )
+        ],
+    )
+    report = benchmark._report(payload)
+    assert "| eager | tiled | parallel | 1.020x | 1.020x | 4/4 | inconclusive |" in report
+    assert "| graph | tiled | parallel | 2.000x | 2.000x | 4/4 | parallel |" in report
+    assert "not confidence intervals" in report
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA or ROCm GPU required")
 @pytest.mark.filterwarnings("error:.*AccumulateGrad.*:UserWarning")
-def test_public_graph_shortlist_matches_eager_and_reference_after_replays(benchmark):
+@pytest.mark.parametrize(
+    "configs,expected_records,expected_graph",
+    [("--shortlist-configs", 88, 33), ("--finalist-configs", 56, 21)],
+)
+def test_public_graph_shortlist_matches_eager_and_reference_after_replays(
+    benchmark, configs, expected_records, expected_graph
+):
     triton = pytest.importorskip("triton")
     if not hasattr(triton, "jit"):
         pytest.skip("A working Triton runtime is required")
@@ -336,7 +505,7 @@ def test_public_graph_shortlist_matches_eager_and_reference_after_replays(benchm
             "129",
             "--dtypes",
             "bf16",
-            "--shortlist-configs",
+            configs,
             "--public-graph",
             "--rounds",
             "1",
@@ -349,11 +518,11 @@ def test_public_graph_shortlist_matches_eager_and_reference_after_replays(benchm
         ]
     )
     records, _, _ = benchmark._run_case(args, module, 257, 129, "bf16")
-    assert len(records) == benchmark._case_plan(args)["measurement_count"] == 88
+    assert len(records) == benchmark._case_plan(args)["measurement_count"] == expected_records
     graph_results = [
         r for r in records if r["timing"] == "graph" and r["mode"] != "weight_reduction"
     ]
-    assert len(graph_results) == 33
+    assert len(graph_results) == expected_graph
     for r in graph_results:
         assert r["graph_matches_eager_bitwise"]
         assert r["graph_repeat_bitwise"]
@@ -363,3 +532,6 @@ def test_public_graph_shortlist_matches_eager_and_reference_after_replays(benchm
             else {"grad_x", "grad_residual", "grad_weight"}
         )
         assert set(r["graph_max_abs_errors_vs_native"]) == labels
+    # The smoke's single round cannot establish a performance recommendation.
+    assert len(benchmark._strategy_comparisons(records)) == 8
+    assert all(c["candidate"] == "inconclusive" for c in benchmark._strategy_comparisons(records))

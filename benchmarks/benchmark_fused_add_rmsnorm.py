@@ -8,6 +8,8 @@ speedups. --sweep-configs sweeps reduction kernels, then checks the best measure
 configuration of each strategy through the public operator on the same input.
 --shortlist-configs checks a smaller, fixed H100 candidate set through every
 scope. --public-graph also captures complete backward and forward+backward calls.
+--preset dispatch fills the remaining row boundaries and samples other widths;
+--finalist-configs limits it to six fixed configurations from the H100 evidence.
 This is an experiment, not an automatic production dispatch policy.
 """
 
@@ -33,7 +35,10 @@ _DEFAULT_CONFIGS = {
 _PRESETS = {
     "smoke": ([1, 33], [129, 2688]),
     "model": ([1, 32, 33, 128, 1024, 8192], [129, 2688]),
-    "tuning": ([1, 16, 31, 32, 33, 128, 512, 1024, 2048, 8192, 32768], [128, 129, 2688, 4096]),
+    "tuning": (
+        [1, 16, 31, 32, 33, 128, 512, 1024, 2048, 8192, 32768],
+        [128, 129, 2688, 4096],
+    ),
     "boundary": (
         [
             1,
@@ -77,6 +82,54 @@ _SHORTLIST_CONFIGS = (
     ("parallel", 256, 64, 4),
     ("parallel", 512, 64, 4),
 )
+# Keep small/large controls, fill the eager crossover, and test either side of
+# prospective cutoffs. These are measurements to make, not dispatch rules.
+_DISPATCH_ROWS = (
+    1,
+    8,
+    9,
+    16,
+    32,
+    64,
+    128,
+    256,
+    257,
+    384,
+    512,
+    1024,
+    1536,
+    2047,
+    2048,
+    2049,
+    2560,
+    3071,
+    3072,
+    3073,
+    3584,
+    4095,
+    4096,
+    4097,
+    5120,
+    6143,
+    6144,
+    6145,
+    7168,
+    8191,
+    8192,
+    8193,
+    16384,
+    32768,
+    65536,
+)
+_DISPATCH_OTHER_WIDTHS = (129, 2687, 2689, 4096, 8193)
+# The defaults remain controls. The extra candidates favor one-launch TILED
+# for small/mid-sized eager calls and PARALLEL for large calls. Do not choose
+# a different winner for each dtype merely because of sub-percent timing noise.
+_FINALIST_CONFIGS = (
+    ("tiled", 32, 64, 4),
+    ("tiled", 64, 64, 8),
+    ("parallel", 512, 64, 4),
+)
 
 
 def _positive_int(value):
@@ -86,7 +139,7 @@ def _positive_int(value):
     return result
 
 
-def _variants(sweep, shortlist=False):
+def _variants(sweep, shortlist=False, finalists=False):
     variants = []
     seen = set()
 
@@ -96,7 +149,11 @@ def _variants(sweep, shortlist=False):
             seen.add(key)
             variants.append(
                 dict(
-                    name=name, strategy=strategy, block_rows=rows, block_cols=cols, num_warps=warps
+                    name=name,
+                    strategy=strategy,
+                    block_rows=rows,
+                    block_cols=cols,
+                    num_warps=warps,
                 )
             )
 
@@ -104,6 +161,9 @@ def _variants(sweep, shortlist=False):
         add(strategy, strategy, *config)
     if shortlist:
         for strategy, rows, cols, warps in _SHORTLIST_CONFIGS:
+            add(f"{strategy}-r{rows}-c{cols}-w{warps}", strategy, rows, cols, warps)
+    if finalists:
+        for strategy, rows, cols, warps in _FINALIST_CONFIGS:
             add(f"{strategy}-r{rows}-c{cols}-w{warps}", strategy, rows, cols, warps)
     if sweep:
         for strategy, rows, cols, warps in itertools.chain(
@@ -329,7 +389,9 @@ def _prepare_reducers(module, specs, per_row, weight):
 
 
 def _run_case(args, module, n_rows, n_cols, dtype_name):
-    from rl_engine.kernels.ops.pytorch.norm.fused_add_rmsnorm import NativeFusedAddRMSNormOp
+    from rl_engine.kernels.ops.pytorch.norm.fused_add_rmsnorm import (
+        NativeFusedAddRMSNormOp,
+    )
 
     torch.manual_seed(args.seed)
     shape = (n_rows, n_cols)
@@ -353,9 +415,16 @@ def _run_case(args, module, n_rows, n_cols, dtype_name):
     records, order_records = [], []
 
     def measure(functions, mode, timing, extra, check_result=None, capture_stream=None):
-        print(f"  {mode}/{timing}: {len(functions)} providers, {args.rounds} rounds", flush=True)
+        print(
+            f"  {mode}/{timing}: {len(functions)} providers, {args.rounds} rounds",
+            flush=True,
+        )
         measured, orders = _measure_group(
-            functions, args, timing=timing, check_result=check_result, capture_stream=capture_stream
+            functions,
+            args,
+            timing=timing,
+            check_result=check_result,
+            capture_stream=capture_stream,
         )
         order_records.append(dict(mode=mode, timing=timing, orders=orders))
         for name, stats in measured.items():
@@ -377,7 +446,7 @@ def _run_case(args, module, n_rows, n_cols, dtype_name):
         inverse_rms = torch.rsqrt(updated.square().mean(dim=-1, keepdim=True) + 1e-5)
         per_row = upstream[0] * (updated * inverse_rms)
         expected_weight = per_row.double().sum(dim=0)
-    specs = _variants(args.sweep_configs, args.shortlist_configs)
+    specs = _variants(args.sweep_configs, args.shortlist_configs, args.finalist_configs)
     reducers, reduced, reducer_meta = _prepare_reducers(module, specs, per_row, weight)
     for name, fn in reducers.items():
         fn()
@@ -395,7 +464,8 @@ def _run_case(args, module, n_rows, n_cols, dtype_name):
     for name in reducers:
         _check(reduced[name], expected_weight, atol=weight_atol)
 
-    public_specs = [dict(s) for s in (specs if args.shortlist_configs else specs[:3])]
+    fixed_candidates = args.shortlist_configs or args.finalist_configs
+    public_specs = [dict(s) for s in (specs if fixed_candidates else specs[:3])]
     selections = {}
     if args.sweep_configs:
         for strategy in _DEFAULT_CONFIGS:
@@ -443,7 +513,9 @@ def _run_case(args, module, n_rows, n_cols, dtype_name):
                 subset_outputs, subset_inputs, tuple(t[order] for t in upstream)
             )
             for full, subset in zip(
-                outputs + gradients[:2], subset_outputs + subset_gradients[:2], strict=True
+                outputs + gradients[:2],
+                subset_outputs + subset_gradients[:2],
+                strict=True,
             ):
                 if not torch.equal(full[order].view(torch.uint8), subset.view(torch.uint8)):
                     raise AssertionError(f"Row invariance mismatch: {name}")
@@ -502,7 +574,12 @@ def _run_case(args, module, n_rows, n_cols, dtype_name):
             }
 
         measure(
-            calls, mode, "graph", {n: provider_meta[n] for n in calls}, check_result, capture_stream
+            calls,
+            mode,
+            "graph",
+            {n: provider_meta[n] for n in calls},
+            check_result,
+            capture_stream,
         )
     forward_times = [
         r["median_ms"]
@@ -525,8 +602,68 @@ def _run_case(args, module, n_rows, n_cols, dtype_name):
             for r in records
             if r["round_spread"] > 1.15
         ],
+        strategy_comparisons=_strategy_comparisons(records),
     )
     return records, dict(**metadata, measurements=order_records), diagnostic
+
+
+def _strategy_comparisons(records):
+    """Compare public strategy families without turning noisy minima into rules.
+
+    Ratios compare matching scopes/timing modes and round indices. Even a stable
+    candidate is exploratory: configuration selection uses these same samples,
+    and adjacent provider measurements are not simultaneous paired experiments.
+    """
+    comparisons = []
+    for mode, timing in itertools.product(("backward", "forward_backward"), ("eager", "graph")):
+        group = [r for r in records if r["mode"] == mode and r["timing"] == timing]
+        best = {}
+        for strategy in _DEFAULT_CONFIGS:
+            candidates = [r for r in group if r.get("strategy") == strategy]
+            if candidates:
+                best[strategy] = min(candidates, key=lambda r: r["median_ms"])
+        for left_strategy, right_strategy in (
+            ("sequential", "tiled"),
+            ("tiled", "parallel"),
+        ):
+            if left_strategy not in best or right_strategy not in best:
+                continue
+            left, right = best[left_strategy], best[right_strategy]
+            left_rounds = {r["index"]: r for r in left["rounds"]}
+            right_rounds = {r["index"]: r for r in right["rounds"]}
+            if left_rounds.keys() != right_rounds.keys():
+                raise ValueError("Strategy comparison requires matching round indices")
+            ratios = [
+                left_rounds[i]["median_ms"] / right_rounds[i]["median_ms"]
+                for i in sorted(left_rounds)
+            ]
+            ratio = left["median_ms"] / right["median_ms"]
+            wall_ratio = left["wall_ms_per_call"] / right["wall_ms_per_call"]
+            stable = max(left["round_spread"], right["round_spread"]) <= 1.15
+            candidate = "inconclusive"
+            if len(ratios) >= 4 and stable:
+                if ratio >= 1.05 and min(ratios) > 1.0 and wall_ratio > 1.0:
+                    candidate = right_strategy
+                elif ratio <= 1 / 1.05 and max(ratios) < 1.0 and wall_ratio < 1.0:
+                    candidate = left_strategy
+            comparisons.append(
+                dict(
+                    mode=mode,
+                    timing=timing,
+                    left_strategy=left_strategy,
+                    right_strategy=right_strategy,
+                    left_provider=left["provider"],
+                    right_provider=right["provider"],
+                    left_over_right=ratio,
+                    wall_left_over_right=wall_ratio,
+                    round_left_over_right=ratios,
+                    right_wins=sum(value > 1.0 for value in ratios),
+                    round_count=len(ratios),
+                    stable=stable,
+                    candidate=candidate,
+                )
+            )
+    return comparisons
 
 
 def _report(payload):
@@ -561,7 +698,7 @@ def _report(payload):
         "calls passed output/gradient accuracy and training/inference byte checks before timing. "
         "Changing reduction configuration may change grad_weight bytes. These checks do not prove "
         "cross-strategy/microbatch/distributed equality. Tuned settings are per-case candidates, "
-        "not a production selection rule. --shortlist-configs instead tests a fixed candidate set "
+        "not a production selection rule. --shortlist-configs/--finalist-configs test fixed sets "
         "in every scope; do not infer a dispatch boundary from isolated reduction timing alone.",
         "",
         "| Input | Shape | Scope | Timing | Provider | Median ms | Speedup | "
@@ -584,6 +721,32 @@ def _report(payload):
             f"{r['timing']} | {r['provider']} | {r['median_ms']:.6f} | {speedup:.2f}x | "
             f"{memory} | {workspace} | {spread} |"
         )
+    lines.extend(
+        [
+            "",
+            "## Public strategy comparisons",
+            "",
+            "The fastest measured configuration within each family is compared separately for "
+            "backward/combined and eager/graph. Left/right > 1 means the right family was faster. "
+            "A candidate needs at least four rounds, >=5% median advantage, every matching round "
+            "in its favor, <=15% round spread for both providers, and agreeing instrumented wall "
+            "time. Otherwise it is inconclusive. These are heuristics, not confidence intervals "
+            "or automatic dispatch rules; confirm on an independent run with reversed case order. "
+            "Wall time includes event instrumentation. Raw samples and round ratios stay in JSON.",
+            "",
+            "| Input | Shape | Scope | Timing | Left provider | Right provider | Left/right | "
+            "Wall left/right | Right wins | Candidate |",
+            "| --- | --- | --- | --- | --- | --- | ---: | ---: | ---: | --- |",
+        ]
+    )
+    for d in payload.get("diagnostics", []):
+        for c in d.get("strategy_comparisons", []):
+            lines.append(
+                f"| {d['input_dtype']} | {d['shape'][0]}x{d['shape'][1]} | {c['mode']} | "
+                f"{c['timing']} | {c['left_provider']} | {c['right_provider']} | "
+                f"{c['left_over_right']:.3f}x | {c['wall_left_over_right']:.3f}x | "
+                f"{c['right_wins']}/{c['round_count']} | {c['candidate']} |"
+            )
     lines.extend(["", "## Timing controls", ""])
     for d in payload.get("diagnostics", []):
         status = "RECHECK" if d["same_forward_spread"] > 1.15 else "within 15%"
@@ -617,7 +780,7 @@ def _save(payload, folder):
 
 def _parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--preset", choices=_PRESETS, default="model")
+    parser.add_argument("--preset", choices=[*_PRESETS, "dispatch"], default="model")
     parser.add_argument("--rows", nargs="+", type=_positive_int)
     parser.add_argument("--cols", nargs="+", type=_positive_int)
     parser.add_argument("--dtypes", nargs="+", choices=_DTYPES, default=list(_DTYPES))
@@ -627,6 +790,11 @@ def _parse_args(argv=None):
         "--shortlist-configs",
         action="store_true",
         help="Measure all 10 fixed H100 candidates through both the reduction and public API",
+    )
+    configs.add_argument(
+        "--finalist-configs",
+        action="store_true",
+        help="Measure all 6 fixed H100 finalists through the reduction and public API",
     )
     parser.add_argument(
         "--public-graph",
@@ -638,29 +806,58 @@ def _parse_args(argv=None):
     parser.add_argument("--repeat", type=_positive_int, default=50)
     parser.add_argument("--graph-unroll", type=_positive_int, default=16)
     parser.add_argument("--seed", type=int, default=434)
+    parser.add_argument(
+        "--reverse-cases",
+        action="store_true",
+        help="Reverse the whole dtype/shape plan for an independent confirmation run",
+    )
     parser.add_argument("--output-dir", type=Path, default=Path("reports/fused-add-rmsnorm"))
     parser.add_argument("--dry-run", action="store_true", help="Print the case plan without a GPU")
     args = parser.parse_args(argv)
-    rows, cols = _PRESETS[args.preset]
+    rows, cols = (_DISPATCH_ROWS, [2688]) if args.preset == "dispatch" else _PRESETS[args.preset]
+    sparse_dispatch = args.preset == "dispatch" and args.rows is None and args.cols is None
     args.rows = list(dict.fromkeys(args.rows or rows))
     args.cols = list(dict.fromkeys(args.cols or cols))
     args.dtypes = list(dict.fromkeys(args.dtypes))
+    shapes = list(itertools.product(args.rows, args.cols))
+    if sparse_dispatch:
+        # Cross all three dtypes with these exact pairs, not a large Cartesian
+        # product of every row boundary with every synthetic feature width.
+        shapes.extend(itertools.product((1, 2048, 8192), _DISPATCH_OTHER_WIDTHS))
+    args.shapes = [list(shape) for shape in dict.fromkeys(shapes)]
     return args
 
 
+def _cases(args):
+    cases = [(dtype, rows, cols) for dtype in args.dtypes for rows, cols in args.shapes]
+    return cases[::-1] if args.reverse_cases else cases
+
+
 def _case_plan(args):
-    count = len(args.dtypes) * len(args.rows) * len(args.cols)
-    reduction_providers = len(_variants(args.sweep_configs, args.shortlist_configs)) + 1
+    count = len(_cases(args))
+    reduction_providers = (
+        len(_variants(args.sweep_configs, args.shortlist_configs, args.finalist_configs)) + 1
+    )
     public_providers = (
-        reduction_providers if args.shortlist_configs else (7 if args.sweep_configs else 4)
+        reduction_providers
+        if args.shortlist_configs or args.finalist_configs
+        else (7 if args.sweep_configs else 4)
     )
     graph_measurements = public_providers * 3 if args.public_graph else 2
-    return dict(
+    plan = dict(
         case_count=count,
         reduction_config_count=reduction_providers - 1,
         measurement_count=count
         * (reduction_providers * 2 + public_providers * 3 + graph_measurements),
     )
+    if args.preset == "dispatch":
+        plan["coverage"] = dict(
+            model_width=2688,
+            model_shape_count=sum(cols == 2688 for _, cols in args.shapes),
+            other_shape_count=sum(cols != 2688 for _, cols in args.shapes),
+            shapes=args.shapes,
+        )
+    return plan
 
 
 def main(argv=None):
@@ -676,6 +873,7 @@ def main(argv=None):
     from rl_engine.kernels.ops.triton.norm import fused_add_rmsnorm as module
 
     properties = torch.cuda.get_device_properties(torch.cuda.current_device())
+    started = time.perf_counter()
     payload = dict(
         complete=False,
         environment=dict(
@@ -693,30 +891,32 @@ def main(argv=None):
         results=[],
         round_orders=[],
         diagnostics=[],
+        elapsed_seconds=0.0,
     )
     _save(payload, args.output_dir)
-    case_index = 0
-    for dtype in args.dtypes:
-        for n_rows in args.rows:
-            for n_cols in args.cols:
-                case_index += 1
-                print(
-                    f"Case {case_index}/{plan['case_count']}: "
-                    f"checking and timing {dtype} [{n_rows}, {n_cols}]...",
-                    flush=True,
-                )
-                records, orders, diagnostic = _run_case(args, module, n_rows, n_cols, dtype)
-                payload["results"].extend(records)
-                payload["round_orders"].append(orders)
-                payload["diagnostics"].append(diagnostic)
-                _save(payload, args.output_dir)
-                print(
-                    f"Same-forward spread: {diagnostic['same_forward_spread']:.2f}x; "
-                    f"measurements with round spread > 15%: "
-                    f"{len(diagnostic['unstable_measurements'])}; "
-                    f"timing warning: {diagnostic['timing_warning']}",
-                    flush=True,
-                )
+    for case_index, (dtype, n_rows, n_cols) in enumerate(_cases(args), start=1):
+        case_started = time.perf_counter()
+        print(
+            f"Case {case_index}/{plan['case_count']}: "
+            f"checking and timing {dtype} [{n_rows}, {n_cols}]...",
+            flush=True,
+        )
+        records, orders, diagnostic = _run_case(args, module, n_rows, n_cols, dtype)
+        diagnostic["elapsed_seconds"] = time.perf_counter() - case_started
+        payload["results"].extend(records)
+        payload["round_orders"].append(orders)
+        payload["diagnostics"].append(diagnostic)
+        payload["elapsed_seconds"] = time.perf_counter() - started
+        _save(payload, args.output_dir)
+        print(
+            f"Same-forward spread: {diagnostic['same_forward_spread']:.2f}x; "
+            f"measurements with round spread > 15%: "
+            f"{len(diagnostic['unstable_measurements'])}; "
+            f"timing warning: {diagnostic['timing_warning']}; "
+            f"case {diagnostic['elapsed_seconds']:.1f}s; "
+            f"elapsed {payload['elapsed_seconds'] / 60:.1f} min",
+            flush=True,
+        )
     if len(payload["results"]) != plan["measurement_count"]:
         raise RuntimeError("Incomplete measurement plan")
     payload["complete"] = True
