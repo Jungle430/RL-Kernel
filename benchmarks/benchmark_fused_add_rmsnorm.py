@@ -18,6 +18,7 @@ import json
 import math
 import statistics
 import time
+from contextlib import nullcontext
 from functools import partial
 from pathlib import Path
 
@@ -188,29 +189,51 @@ def _assert_same_outputs(actual, expected):
             raise AssertionError("CUDA Graph output does not match eager output bitwise")
 
 
+def _graph_grad_call(op, inputs, upstream, mode):
+    # detach creates new autograd leaves, sharing the same immutable input data.
+    # Keeping an earlier eager graph alive must not reuse its AccumulateGrad
+    # nodes, whose stream metadata can still refer to the default stream.
+    # The caller constructs and warms this callable on its capture stream.
+    graph_inputs = tuple(value.detach().requires_grad_(value.requires_grad) for value in inputs)
+    if mode == "backward":
+        outputs = op(*graph_inputs)
+        return partial(torch.autograd.grad, outputs, graph_inputs, upstream, retain_graph=True)
+
+    def forward_backward():
+        return torch.autograd.grad(op(*graph_inputs), graph_inputs, upstream)
+
+    return forward_backward
+
+
 def _measure_group(functions, args, *, timing, check_result=None, capture_stream=None):
-    for fn in functions.values():
-        for _ in range(args.warmup):
-            fn()
-    torch.cuda.synchronize()
-    graphs, graph_outputs, graph_checks = {}, {}, {}
     if timing == "graph":
-        for name, fn in functions.items():
-            # One independent eager return at a time bounds validation memory.
-            expected = fn() if check_result is not None else None
-            graphs[name], graph_outputs[name] = _capture(
-                fn, args.graph_unroll, stream=capture_stream
-            )
-            if check_result is not None:
-                check_result(graph_outputs[name])
-                _assert_same_outputs(graph_outputs[name], expected)
-                graphs[name].replay()
-                torch.cuda.synchronize()
-                _assert_same_outputs(graph_outputs[name], expected)
-                graph_checks[name] = dict(
-                    graph_matches_eager_bitwise=True, graph_repeat_bitwise=True
+        capture_stream = torch.cuda.Stream() if capture_stream is None else capture_stream
+        capture_stream.wait_stream(torch.cuda.current_stream())
+    graphs, graph_outputs, graph_checks = {}, {}, {}
+    # Initial warmup and the eager comparison call also create autograd nodes.
+    # Keep them on the capture stream, not just the final capture warmup.
+    with torch.cuda.stream(capture_stream) if timing == "graph" else nullcontext():
+        for fn in functions.values():
+            for _ in range(args.warmup):
+                fn()
+        torch.cuda.synchronize()
+        if timing == "graph":
+            for name, fn in functions.items():
+                # One independent eager return at a time bounds validation memory.
+                expected = fn() if check_result is not None else None
+                graphs[name], graph_outputs[name] = _capture(
+                    fn, args.graph_unroll, stream=capture_stream
                 )
-            del expected
+                if check_result is not None:
+                    check_result(graph_outputs[name])
+                    _assert_same_outputs(graph_outputs[name], expected)
+                    graphs[name].replay()
+                    torch.cuda.synchronize()
+                    _assert_same_outputs(graph_outputs[name], expected)
+                    graph_checks[name] = dict(
+                        graph_matches_eager_bitwise=True, graph_repeat_bitwise=True
+                    )
+                del expected
     calls = {name: graph.replay for name, graph in graphs.items()} if graphs else functions
     divisor = args.graph_unroll if graphs else 1
     rounds = {name: [] for name in calls}
@@ -455,18 +478,16 @@ def _run_case(args, module, n_rows, n_cols, dtype_name):
         capture_stream = None
         if not args.public_graph:
             calls = {name: calls[name] for name in ("native", "sequential")}
-        if mode == "backward":
-            # Autograd backward inherits its forward's stream. Build this
-            # pre-existing graph on the capture stream, outside capture, so a
-            # backward-only measurement neither includes forward nor sends
-            # backward work to the default stream during side-stream capture.
+        if mode in ("backward", "forward_backward"):
+            # Autograd backward inherits its forward's stream. Build the
+            # gradient callables with fresh leaves on the capture stream. Old
+            # eager graphs stay alive for the other measurements, so reusing
+            # their leaves would also reuse stale AccumulateGrad stream state.
             capture_stream = torch.cuda.Stream()
             capture_stream.wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(capture_stream):
                 calls = {
-                    name: partial(
-                        torch.autograd.grad, op(*inputs), inputs, upstream, retain_graph=True
-                    )
+                    name: _graph_grad_call(op, inputs, upstream, mode)
                     for name, op in providers.items()
                 }
         if mode == "forward":

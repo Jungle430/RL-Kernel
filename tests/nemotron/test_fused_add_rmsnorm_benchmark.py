@@ -6,6 +6,7 @@ import gc
 import importlib
 import importlib.util
 import json
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -105,6 +106,33 @@ def test_captured_return_checks_bits_shape_and_dtype(benchmark):
             benchmark._assert_same_outputs((actual,), (expected,))
 
 
+@pytest.mark.parametrize("mode", ["backward", "forward_backward"])
+def test_graph_gradient_calls_use_fresh_leaves_while_eager_graph_stays_alive(benchmark, mode):
+    inputs = tuple(torch.randn(3, requires_grad=True) for _ in range(3))
+    upstream = (torch.randn(3), torch.randn(3))
+    observed = []
+
+    def op(x, residual, weight):
+        observed.append((x, residual, weight))
+        updated = x + residual
+        return updated * weight, updated
+
+    eager_outputs = op(*inputs)
+    expected = torch.autograd.grad(eager_outputs, inputs, upstream, retain_graph=True)
+    call = benchmark._graph_grad_call(op, inputs, upstream, mode)
+    for _ in range(2):
+        actual = call()
+        benchmark._assert_same_outputs(actual, expected)
+        for original, fresh in zip(inputs, observed[-1], strict=True):
+            assert fresh is not original
+            assert fresh.is_leaf and fresh.requires_grad
+            assert fresh.data_ptr() == original.data_ptr()
+            assert fresh.dtype == original.dtype and fresh.device == original.device
+            assert original.grad is None and fresh.grad is None
+    # Constructing the capture call must not consume or mutate the old graph.
+    benchmark._assert_same_outputs(torch.autograd.grad(eager_outputs, inputs, upstream), expected)
+
+
 @pytest.mark.parametrize("corrupt_during_timing", [False, True])
 def test_graph_results_are_rechecked_after_timed_replays(
     benchmark, monkeypatch, corrupt_during_timing
@@ -114,7 +142,27 @@ def test_graph_results_are_rechecked_after_timed_replays(
     result = (torch.ones(3),)
     reference = (torch.ones(3),)
     checks = []
-    capture_stream = object()
+    active_stream = None
+
+    class Stream:
+        def wait_stream(self, other):
+            pass
+
+    capture_stream = Stream()
+
+    @contextmanager
+    def use_stream(stream):
+        nonlocal active_stream
+        previous = active_stream
+        active_stream = stream
+        try:
+            yield
+        finally:
+            active_stream = previous
+
+    def eager_call():
+        assert active_stream is capture_stream
+        return reference
 
     class Graph:
         def replay(self):
@@ -122,6 +170,7 @@ def test_graph_results_are_rechecked_after_timed_replays(
 
     def capture(fn, unroll, *, stream):
         assert stream is capture_stream
+        assert active_stream is capture_stream
         return Graph(), result
 
     def measure(fn, repeat, divisor):
@@ -135,19 +184,22 @@ def test_graph_results_are_rechecked_after_timed_replays(
         return {"grad_weight": benchmark._check(values[0], reference[0])}
 
     monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: active_stream)
+    monkeypatch.setattr(torch.cuda, "stream", use_stream)
     monkeypatch.setattr(benchmark, "_capture", capture)
     monkeypatch.setattr(benchmark, "_measure_block", measure)
     args = benchmark._parse_args(["--rounds", "1", "--warmup", "1", "--repeat", "2"])
     kwargs = dict(timing="graph", check_result=check, capture_stream=capture_stream)
     if corrupt_during_timing:
         with pytest.raises(AssertionError):
-            benchmark._measure_group({"test": lambda: reference}, args, **kwargs)
+            benchmark._measure_group({"test": eager_call}, args, **kwargs)
     else:
-        records, _ = benchmark._measure_group({"test": lambda: reference}, args, **kwargs)
+        records, _ = benchmark._measure_group({"test": eager_call}, args, **kwargs)
         assert records["test"]["graph_matches_eager_bitwise"]
         assert records["test"]["graph_repeat_bitwise"]
         assert records["test"]["graph_max_abs_errors_vs_native"] == {"grad_weight": 0.0}
     assert len(checks) == 2
+    assert active_stream is None
 
 
 def test_paired_round_orders_balance_positions(benchmark):
@@ -270,6 +322,7 @@ def test_accuracy_check_catches_wrong_gradients(benchmark):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA or ROCm GPU required")
+@pytest.mark.filterwarnings("error:.*AccumulateGrad.*:UserWarning")
 def test_public_graph_shortlist_matches_eager_and_reference_after_replays(benchmark):
     triton = pytest.importorskip("triton")
     if not hasattr(triton, "jit"):

@@ -281,7 +281,10 @@ The measurement scopes are deliberately separate:
 4. **Complete public CUDA Graph diagnostic (`--public-graph`):** Every public
    candidate and PyTorch are captured for forward, backward and forward+backward.
    For backward-only capture, a prebuilt autograd graph is created on the capture
-   stream, since backward inherits its forward's stream. Combined capture records
+   stream, since backward inherits its forward's stream. Both gradient modes
+   use fresh detached input leaves sharing the original immutable data, so live
+   eager graphs cannot supply stale `AccumulateGrad` stream metadata. All warmup
+   and eager comparison calls use the capture stream too. Combined capture records
    both directions. Replay excludes Python autograd traversal and allocation
    decisions, so these speedups are kept separate from eager speedups. Captured
    returns must match an independent eager call bitwise, remain identical on
