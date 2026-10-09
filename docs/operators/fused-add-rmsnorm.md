@@ -77,7 +77,7 @@ y, updated_residual = op(x, residual, weight, eps=1e-5)
 
 | Backend | Implementation | Dispatch |
 | --- | --- | --- |
-| CUDA | `TritonFusedAddRMSNormOp` | preferred; H100 correctness/configuration sweep passed; automatic strategy selection pending |
+| CUDA | `TritonFusedAddRMSNormOp` | preferred; H100 kernel/configuration tests passed; conservative automatic weight-reduction selection |
 | ROCm | same Triton implementation via `torch.cuda` | preferred; ROCm validation pending |
 | PyTorch | `NativeFusedAddRMSNormOp` | CPU reference and fallback when the Triton backend cannot load |
 
@@ -104,31 +104,51 @@ validation remains pending. Standard ROCm PyTorch uses the `cuda` device type.
   of batch size. Grad-enabled, `no_grad`, and `inference_mode` forward use the
   same kernel. Tests compare raw bytes, including reordered/subset rows, for
   outputs, saved statistics, and corresponding input gradients.
-- `RMSNormWeightGradStrategy.SEQUENTIAL` is the default: each program owns 128
+- Explicit `RMSNormWeightGradStrategy.SEQUENTIAL`: each program owns 128
   features and folds row contributions in ascending order, without atomics.
-- `RMSNormWeightGradStrategy.TILED` is experimental: each program accumulates
+- Explicit `RMSNormWeightGradStrategy.TILED` without a config: each program accumulates
   32 row lanes by 128 features, then reduces the row lanes once. It changes the
   FP32 addition order.
-- `RMSNormWeightGradStrategy.PARALLEL` is experimental: independent programs
+- Explicit `RMSNormWeightGradStrategy.PARALLEL` without a config: independent programs
   reduce fixed blocks of 256 rows by 128 features, write FP32 partials, and a
   second kernel merges them using the existing fixed 32-row-lane reduction.
   There are no floating-point atomics or locks. All launches use the same stream;
   no host synchronization is inserted. The partition depends on the explicit
   tile configuration, not the GPU's SM count or runtime scheduling.
+- Experimental `RMSNormWeightGradStrategy.FUSED`: one program computes input
+  gradients for a fixed group of rows and accumulates its weight contribution
+  in registers. It writes only `[ceil(M / group_rows), D]` FP32 partials, followed
+  by a fixed 32-lane merge. The default group has 64 rows; only this merge uses
+  `block_cols` and `num_warps`. The input-gradient kernel keeps four warps and the
+  original row arithmetic. Forward is unchanged. There are no atomic additions.
+  This follows the grouped-accumulation idea in
+  [Mamba's backward](https://github.com/state-spaces/mamba/blob/main/mamba_ssm/ops/triton/layer_norm.py),
+  but groups use fixed row counts rather than the device's SM count, and the
+  operator's FP32 outputs/saved statistics/cast points are retained. Large widths
+  can increase register pressure; GPU correctness and performance validation are
+  pending. FUSED is explicit-only and is not selected by the automatic policy.
 - `RMSNormWeightGradConfig` exposes `block_rows`, `block_cols` and `num_warps` for
   experiments. Settings are saved per autograd call; changing a reusable Op
   afterwards does not change a graph's backward. Forward and per-row backward
   keep their original tile and four-warps configuration.
+
+FUSED removes the `[M, D]` contribution workspace. At `M=65536, D=2688`, that
+buffer is 672 MiB; fixed groups of 64 need 10.5 MiB of partials instead. These
+are calculated scratch sizes, not total peak allocation or measured speedups.
+Weight-gradient rounding can differ between grouping strategies. Repeated calls
+with a fixed configuration must reproduce all gradients bitwise; different
+groupings and separately reduced microbatches need not yield identical weight
+gradient bytes.
 
 At M = 8192, D = 2688, the original reductions launch only 21 programs, each
 processing all 8192 rows. Default PARALLEL launches 672 partial programs followed
 by 21 merge programs. Its additional partial buffer is only 32 x 2688 FP32 values
 (0.328 MiB), on top of the existing 84 MiB per-row contributions. This addresses
 limited parallelism, at the cost of an additional launch and workspace. Small
-inputs may favor SEQUENTIAL or TILED; no new default or automatic dispatch rule
-is inferred before measurement.
+inputs may favor SEQUENTIAL or TILED. Automatic calls use the measured configurations
+and conservative rules below, rather than these original explicit-strategy defaults.
 
-Opt into the experiment explicitly:
+Override selection explicitly:
 
 ```python
 from rl_engine.kernels.ops.triton.norm import (
@@ -143,19 +163,102 @@ op = TritonFusedAddRMSNormOp(
 )
 ```
 
-All three strategies share forward and per-row backward arithmetic. Weight gradients
-sum across rows and are checked numerically plus repeatably for an identical call;
+SEQUENTIAL, TILED, and PARALLEL share the same forward and per-row backward kernels.
+FUSED shares forward and preserves the per-row backward expressions in a grouped kernel.
+Weight gradients sum across rows and are checked numerically plus repeatably for an identical call;
 they are not promised to match bitwise across strategies, row reorderings, or
 separately reduced microbatches. Full-model, distributed, and CUDA-to-ROCm parity
 require separate validation. FP32 intermediates alone do not prove these properties.
+
+### Automatic weight reduction
+
+`TritonFusedAddRMSNormOp()` uses `weight_grad_strategy=None` to select a fixed
+strategy/configuration from input metadata. M is the product of the leading
+dimensions, not just the first dimension. Three supported input dtypes share
+the following conservative defaults:
+
+| Width D | Rows M (inclusive) | Strategy | block_rows | block_cols | num_warps |
+| --- | --- | --- | ---: | ---: | ---: |
+| any | 0..8 | SEQUENTIAL | 1 | 128 | 4 |
+| any | 9..32 | TILED | 32 | 64 | 4 |
+| 2688 | 33..16383 | TILED | 64 | 64 | 8 |
+| 2688 | 16384 and above | PARALLEL | 512 | 64 | 4 |
+| other widths | 33 and above | TILED | 64 | 64 | 8 |
+
+These are broad policy choices, not measured optimal crossover points. H100
+eager timings at small/medium M were too noisy to justify fine-grained rules.
+The larger D=2688 cases support PARALLEL; the transition at 16384 remains a
+conservative candidate for targeted regression. Other widths retain a one-launch
+TILED reduction: the D=8193 probes did not show a consistent PARALLEL advantage.
+Rows beyond the measured maximum 65536 follow the open-ended rules above; those
+are explicit extrapolations, not additional measured results. No D rounding
+or next-power-of-two bucketing broadens the D=2688 entry.
+
+The table lives in the operator file as `WEIGHT_GRAD_POLICY`. Device-specific
+entries take precedence over `"default"`; within a device tier, an exact input
+dtype precedes the shared dtype rule, and an exact width precedes the fallback.
+Ranges at the same device/dtype/width tier must not overlap. Until more devices
+are tuned, they share the H100-informed defaults without a claim of equal
+performance. Mixed input/weight dtypes remain supported, but the tuning workload
+used matching x/residual dtypes and FP32 weights.
+
+Selection caches up to 1024 metadata combinations. GPU names are separately
+cached by backend and resolved device index; selection uses the input device,
+not whichever GPU happens to be current. Device lookup errors propagate. There
+is no timing/autotuning, tensor-value scan, synchronization, or graph-capture
+dependent policy. Runtime edits to the static table require
+`select_rmsnorm_weight_grad_plan.cache_clear()`.
+
+Forward saves the resolved strategy/configuration on its own ctx. Changing an
+Op later cannot change an existing graph's reduction order. All strategies
+share the same forward; FUSED uses a grouped backward with the same per-row
+expressions and four-warps setting. Automatic
+selection may change weight-gradient addition order between different shapes;
+it does not promise cross-strategy or microbatch weight-gradient byte equality.
+
+An explicit strategy bypasses automatic selection and keeps its original default
+configuration, shown above in the kernel design. An explicit config overrides
+those settings. For backward compatibility, a config supplied without a strategy
+keeps SEQUENTIAL rather than attaching arbitrary settings to an automatic strategy.
+
+### Experimental grouped backward comparison
+
+FUSED is not part of automatic selection while its GPU gates and performance are
+unverified. Run correctness first, then compare complete public calls:
+
+```bash
+uv run --no-sync python -m pytest tests/nemotron/test_fused_add_rmsnorm*.py -q -rs -x && \
+uv run --no-sync python benchmarks/benchmark_fused_add_rmsnorm.py \
+  --preset fused --fused-configs --public-graph \
+  --output-dir reports/fused-rmsnorm-grouped
+```
+
+The sparse preset covers 12 shapes across three input dtypes (36 cases), with
+widths 129, 2688, 4096, 8192 and 8193 and model rows up to 65536. Eight providers
+compare PyTorch, the automatic policy, SEQUENTIAL, the measured TILED/PARALLEL
+controls, and FUSED groups of 16/64/256 rows. This produces 864 eager measurements,
+or 1728 including `--public-graph`. Override `--rows`/`--cols` for a smaller smoke;
+`--dry-run` prints counts without GPU execution. No standalone sum is measured
+for FUSED because its accumulation is integrated into input-gradient computation.
+
+Every candidate must pass reference output/gradient checks, training/inference
+byte equality, row permutation/subset invariance, and (for Triton) repeatable
+backward and byte equality of outputs/input gradients against the original row
+path before any timing starts for that case. Graph returns are checked again
+after timed replay. Reports record actual public peak allocation as well as
+calculated contribution/partial workspace sizes. The comparison also includes
+TILED/FUSED and PARALLEL/FUSED families; no measured winner is installed into
+the policy automatically. This is a new experiment, not covered by earlier H100
+results for the standalone reductions.
 
 ## Validation
 
 The operator tests use an independent FP64 autograd reference, random upstreams
 for both outputs, single-output losses, mixed dtypes, empty/strided inputs, unused
 input gradients, repeated backward, saved-tensor immutability, masked tails, and
-noncurrent-device launches on two GPUs. These checks include all three default
-strategies. Configuration checks also cover partial/merge boundaries, poisoned
+noncurrent-device launches on two GPUs. These checks cover the three original
+strategies, automatic selection, and the explicit experimental FUSED strategy.
+Configuration checks also cover partial/merge boundaries, poisoned
 workspaces, guard regions, CUDA Graph replay and per-forward configuration retention. Default elementwise `(atol, rtol)` checks
 are `(2e-5, 2e-5)` for FP32, `(3e-3, 3e-3)` for FP16, and `(2e-2, 2e-2)` for BF16.
 The general harness additionally uses the shared `reduction` tolerance contract.
@@ -229,9 +332,51 @@ The fixed PARALLEL configuration rows=512 / cols=64 / warps=4 measured public
 eager forward+backward at [32768, 2688] in 1.07235 / 1.07321 / 1.30809 ms for
 FP16 / BF16 / FP32 respectively, versus PyTorch's 5.39576 / 5.40082 / 4.50619 ms
 (5.03x / 5.03x / 3.44x). Each of these measurements had round spread below 0.1%.
-Raw reports remain external evidence; automatic dispatch is still pending.
+Raw reports remain external evidence.
+
+The expanded dispatch experiment completed 538 tests (three two-GPU skips),
+150 run-1 cases / 8400 measurements, and 51 reversed-order run-2 cases / 2856
+measurements. The separate smoke added 56 measurements. Training/inference,
+row invariance, reduction repeatability, and all public graph checks passed.
+All 357 common public forward+backward graph records changed by less than 5%
+between the two runs, while many small/medium eager records were unstable.
+Graph winners therefore do not define the eager policy's crossover points.
+
+For [65536, 2688], the mean of the two runs' eager forward+backward median times
+with a **fixed explicit PARALLEL (512/64/4)** configuration was:
+
+| Input | Eager PyTorch | Explicit PARALLEL | Speedup |
+| --- | ---: | ---: | ---: |
+| FP16 | 10.549 ms | 2.102 ms | 5.02x |
+| BF16 | 10.553 ms | 2.100 ms | 5.03x |
+| FP32 | 8.795 ms | 2.563 ms | 3.43x |
+
+This is configuration evidence, not a performance measurement of the newly
+connected automatic wrapper. Automatic boundary tests and a short public
+benchmark remain the next GPU regression gate; a full sweep need not be repeated.
 
 ## Benchmark
+
+For the short automatic-policy regression, compare only the public automatic Op
+and eager PyTorch. This command has 21 cases / 126 measurements, with no isolated
+reduction sweeps or CUDA Graph replay:
+
+```bash
+uv run --no-sync python benchmarks/benchmark_fused_add_rmsnorm.py \
+  --auto-only --rows 8 9 32 33 16383 16384 16385 --cols 2688 \
+  --rounds 4 --warmup 10 --repeat 50 \
+  --output-dir reports/fused-rmsnorm-auto
+```
+
+`--auto-only` records the actual strategy and tile/warp settings per case. It
+measures forward, backward, and forward+backward, including public dispatch and
+allocation with warmed policy/device caches. Add `--public-graph` only for the
+separate graph diagnostic (252 measurements for the same plan). A small fallback
+check can use `--rows 33 16384 --cols 2689 --dtypes bf16`. Correctness tests cover
+other widths, empty inputs, unknown devices, mixed dtypes and explicit overrides.
+`--auto-only` is mutually exclusive with all configuration-sweep flags below.
+
+The tuning experiments remain available for inspecting the selection evidence:
 
 ```bash
 uv run --no-sync python benchmarks/benchmark_fused_add_rmsnorm.py --dry-run
@@ -299,8 +444,8 @@ finalists avoid turning sub-percent differences between large-row PARALLEL
 configurations into a complicated policy. Dispatch plus finalists and
 `--public-graph` produces 150 input cases / 8,400 measurements.
 
-For the remaining selection experiment, use eight rounds and then a fresh
-process with reversed case order and a second seed for the key boundaries:
+The completed selection experiment used eight rounds and then a fresh process
+with reversed case order and a second seed for the key boundaries:
 
 ```bash
 uv run --no-sync python benchmarks/benchmark_fused_add_rmsnorm.py \
@@ -401,7 +546,7 @@ without requiring a GPU. Reports are checkpointed after each completed case;
 
 Reports default to `reports/fused-add-rmsnorm/{report.md,results.json}`. Attach
 results to the PR instead of committing them. The complete-graph/boundary
-experiment passed on H100; the expanded dispatch experiment still needs GPU
-execution before automatic selection can be chosen.
+experiment and expanded dispatch experiment passed on H100. The newly connected
+automatic policy needs its targeted GPU correctness/performance regression.
 Model cast-point alignment, ROCm and full-model/distributed validation also
 remain separate work.

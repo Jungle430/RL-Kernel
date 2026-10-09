@@ -27,12 +27,12 @@ def triton_module():
     return importlib.import_module("rl_engine.kernels.ops.triton.norm.fused_add_rmsnorm")
 
 
-@pytest.fixture(params=["native", "sequential", "tiled", "parallel"])
+@pytest.fixture(params=["native", "auto", "sequential", "tiled", "parallel", "fused"])
 def implementation(request):
     if request.param == "native":
         return NativeFusedAddRMSNormOp(), "cpu"
     module = request.getfixturevalue("triton_module")
-    strategy = module.RMSNormWeightGradStrategy(request.param)
+    strategy = None if request.param == "auto" else module.RMSNormWeightGradStrategy(request.param)
     return module.TritonFusedAddRMSNormOp(weight_grad_strategy=strategy), "cuda"
 
 
@@ -237,7 +237,7 @@ def test_modifying_saved_residual_output_is_detected(triton_module):
 
 
 @pytest.mark.parametrize("eps", [1e-5, 1e-3])
-@pytest.mark.parametrize("strategy", ["sequential", "tiled", "parallel"])
+@pytest.mark.parametrize("strategy", ["sequential", "tiled", "parallel", "fused"])
 def test_repeated_backward_preserves_saved_tensors(triton_module, eps, strategy):
     inputs = _inputs((65, 129), _DTYPES[0], "cuda", noncontiguous=True)
     op = triton_module.TritonFusedAddRMSNormOp(
@@ -256,7 +256,7 @@ def test_repeated_backward_preserves_saved_tensors(triton_module, eps, strategy)
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
-@pytest.mark.parametrize("strategy", ["sequential", "tiled", "parallel"])
+@pytest.mark.parametrize("strategy", ["sequential", "tiled", "parallel", "fused"])
 def test_train_inference_and_row_invariance(triton_module, dtype, strategy):
     op = triton_module.TritonFusedAddRMSNormOp(
         weight_grad_strategy=triton_module.RMSNormWeightGradStrategy(strategy)
@@ -289,7 +289,7 @@ def test_train_inference_and_row_invariance(triton_module, dtype, strategy):
         assert torch.equal(full[order].view(torch.uint8), subset.view(torch.uint8))
 
 
-@pytest.mark.parametrize("strategy", ["sequential", "tiled", "parallel"])
+@pytest.mark.parametrize("strategy", [None, "sequential", "tiled", "parallel", "fused"])
 def test_launches_use_input_device_and_restore_current_device(triton_module, strategy):
     if torch.cuda.device_count() < 2:
         pytest.skip("Two GPUs are required to check a noncurrent input device")
@@ -300,7 +300,9 @@ def test_launches_use_input_device_and_restore_current_device(triton_module, str
         expected = _fp64_reference(*reference_inputs, 1e-5)
 
         op = triton_module.TritonFusedAddRMSNormOp(
-            weight_grad_strategy=triton_module.RMSNormWeightGradStrategy(strategy)
+            weight_grad_strategy=(
+                triton_module.RMSNormWeightGradStrategy(strategy) if strategy is not None else None
+            )
         )
         outputs = op(*inputs)
         assert torch.cuda.current_device() == 0
@@ -321,6 +323,75 @@ def test_triton_rejects_cpu_inputs(triton_module):
         triton_module.TritonFusedAddRMSNormOp()(*_inputs((3, 7), _DTYPES[0], "cpu"))
 
 
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("rows", [8, 9, 32, 33, 16383, 16384, 16385])
+def test_auto_boundaries_match_explicit_plan_and_preserve_consistency(triton_module, dtype, rows):
+    module = triton_module
+    shape = (1, rows, 2688)  # Leading dimensions are flattened for dispatch.
+    inputs = _inputs(shape, (dtype, dtype, torch.float32), "cuda")
+    upstream = tuple(_rand(shape, seed, device="cuda") for seed in (190, 191))
+    if rows <= 8:
+        strategy, block_rows, block_cols, warps = "sequential", 1, 128, 4
+    elif rows <= 32:
+        strategy, block_rows, block_cols, warps = "tiled", 32, 64, 4
+    elif rows < 16384:
+        strategy, block_rows, block_cols, warps = "tiled", 64, 64, 8
+    else:
+        strategy, block_rows, block_cols, warps = "parallel", 512, 64, 4
+    selected_strategy = module.RMSNormWeightGradStrategy(strategy)
+    config = module.RMSNormWeightGradConfig(
+        block_rows=block_rows, block_cols=block_cols, num_warps=warps
+    )
+    op = module.TritonFusedAddRMSNormOp()
+    actual = op(*inputs)
+    assert actual[0].grad_fn.weight_grad_strategy == selected_strategy
+    assert actual[0].grad_fn.weight_grad_config == config
+    manual = module.TritonFusedAddRMSNormOp(
+        weight_grad_strategy=selected_strategy, weight_grad_config=config
+    )
+    explicit = manual(*inputs)
+    gradients = _backward(actual, inputs, upstream, "both", retain_graph=True)
+    explicit_gradients = _backward(explicit, inputs, upstream, "both")
+    direct_gradients = module._launch_fused_add_rmsnorm_bwd(
+        *actual[0].grad_fn.saved_tensors,
+        *upstream,
+        x_dtype=dtype,
+        residual_dtype=dtype,
+    )
+    for lhs, rhs in zip(actual + gradients, explicit + explicit_gradients, strict=True):
+        assert torch.equal(lhs.view(torch.uint8), rhs.view(torch.uint8))
+    for lhs, rhs in zip(gradients, direct_gradients, strict=True):
+        assert torch.equal(lhs.view(torch.uint8), rhs.view(torch.uint8))
+
+    expected = NativeFusedAddRMSNormOp()(*inputs)
+    expected_gradients = _backward(expected, inputs, upstream, "both")
+    for lhs, rhs in zip(actual + gradients[:2], expected + expected_gradients[:2], strict=True):
+        _assert_close(lhs, rhs)
+    torch.testing.assert_close(
+        gradients[2], expected_gradients[2], rtol=2e-5, atol=2e-5 * rows**0.5
+    )
+    for context in (torch.no_grad(), torch.inference_mode()):
+        with context:
+            inferred = op(*inputs)
+        for lhs, rhs in zip(actual, inferred, strict=True):
+            assert torch.equal(lhs.view(torch.uint8), rhs.view(torch.uint8))
+
+    # A smaller microbatch selects another reduction but preserves per-row arithmetic.
+    subset_inputs = tuple(t[:, :3].detach().requires_grad_(True) for t in inputs[:2]) + (inputs[2],)
+    subset = op(*subset_inputs)
+    subset_gradients = _backward(subset, subset_inputs, tuple(g[:, :3] for g in upstream), "both")
+    for full, part in zip(actual + gradients[:2], subset + subset_gradients[:2], strict=True):
+        assert torch.equal(full[:, :3].contiguous().view(torch.uint8), part.view(torch.uint8))
+
+    # Reusing/mutating the Op or clearing policy caches cannot change a saved graph's plan.
+    op.weight_grad_strategy = module.RMSNormWeightGradStrategy.SEQUENTIAL
+    op.weight_grad_config = module.RMSNormWeightGradConfig(block_rows=1, block_cols=256)
+    module.select_rmsnorm_weight_grad_plan.cache_clear()
+    repeated = _backward(actual, inputs, upstream, "both")
+    for lhs, rhs in zip(gradients, repeated, strict=True):
+        assert torch.equal(lhs.view(torch.uint8), rhs.view(torch.uint8))
+
+
 @pytest.mark.parametrize("dtypes", _DTYPES)
 def test_weight_strategy_does_not_change_outputs_or_input_gradients(triton_module, dtypes):
     inputs = _inputs((65, 129), dtypes, "cuda")
@@ -337,7 +408,7 @@ def test_weight_strategy_does_not_change_outputs_or_input_gradients(triton_modul
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
-@pytest.mark.parametrize("strategy", ["sequential", "tiled", "parallel"])
+@pytest.mark.parametrize("strategy", ["sequential", "tiled", "parallel", "fused"])
 def test_config_is_saved_per_forward_and_preserves_row_results(triton_module, dtype, strategy):
     inputs = _inputs((257, 129), (dtype, dtype, torch.float32), "cuda")
     upstream = tuple(_rand((257, 129), seed, device="cuda") for seed in (180, 181))

@@ -10,7 +10,10 @@ configuration of each strategy through the public operator on the same input.
 scope. --public-graph also captures complete backward and forward+backward calls.
 --preset dispatch fills the remaining row boundaries and samples other widths;
 --finalist-configs limits it to six fixed configurations from the H100 evidence.
-This is an experiment, not an automatic production dispatch policy.
+These sweeps collect tuning evidence. --auto-only instead compares the public
+automatic policy with PyTorch, skipping all isolated reduction experiments.
+--fused-configs compares grouped fused backward with the existing public paths;
+all correctness/bitwise gates finish before timing, and no isolated sum is timed.
 """
 
 import argparse
@@ -130,6 +133,43 @@ _FINALIST_CONFIGS = (
     ("tiled", 64, 64, 8),
     ("parallel", 512, 64, 4),
 )
+# Public calls only: FUSED has no standalone per-row contribution matrix.
+# Fix per-row arithmetic at four warps; only the group length varies.
+_FUSED_COMPARISON_CONFIGS = (
+    ("sequential", 1, 128, 4),
+    ("tiled", 64, 64, 8),
+    ("parallel", 512, 64, 4),
+    ("fused", 16, 64, 4),
+    ("fused", 64, 64, 4),
+    ("fused", 256, 64, 4),
+)
+_FUSED_SHAPES = (
+    (1, 2688),
+    (32, 2688),
+    (1024, 2688),
+    (8192, 2688),
+    (65536, 2688),
+    (33, 129),
+    (1024, 4096),
+    (8192, 4096),
+    (1024, 8192),
+    (8192, 8192),
+    (1024, 8193),
+    (8192, 8193),
+)
+
+
+def _fused_comparison_specs():
+    return [
+        dict(
+            name=f"{strategy}-r{rows}-c{cols}-w{warps}",
+            strategy=strategy,
+            block_rows=rows,
+            block_cols=cols,
+            num_warps=warps,
+        )
+        for strategy, rows, cols, warps in _FUSED_COMPARISON_CONFIGS
+    ]
 
 
 def _positive_int(value):
@@ -242,11 +282,11 @@ def _capture(fn, unroll, *, stream=None):
 def _assert_same_outputs(actual, expected):
     for value, reference in zip(actual, expected, strict=True):
         if value.shape != reference.shape or value.dtype != reference.dtype:
-            raise AssertionError("CUDA Graph changed an output's shape or dtype")
+            raise AssertionError("Comparison changed an output's shape or dtype")
         if not torch.equal(
             value.contiguous().view(torch.uint8), reference.contiguous().view(torch.uint8)
         ):
-            raise AssertionError("CUDA Graph output does not match eager output bitwise")
+            raise AssertionError("Output does not match the comparison result bitwise")
 
 
 def _graph_grad_call(op, inputs, upstream, mode):
@@ -440,43 +480,57 @@ def _run_case(args, module, n_rows, n_cols, dtype_name):
             )
         return measured
 
-    # Derive identical FP32 contributions independently of any Triton backward.
-    with torch.no_grad():
-        updated = x.float() + residual.float()
-        inverse_rms = torch.rsqrt(updated.square().mean(dim=-1, keepdim=True) + 1e-5)
-        per_row = upstream[0] * (updated * inverse_rms)
-        expected_weight = per_row.double().sum(dim=0)
-    specs = _variants(args.sweep_configs, args.shortlist_configs, args.finalist_configs)
-    reducers, reduced, reducer_meta = _prepare_reducers(module, specs, per_row, weight)
-    for name, fn in reducers.items():
-        fn()
-        error = _check(reduced[name], expected_weight, atol=weight_atol)
-        first = reduced[name].clone()
-        reduced[name].fill_(float("nan"))
-        fn()
-        repeat_equal = torch.equal(first.view(torch.uint8), reduced[name].view(torch.uint8))
-        if not repeat_equal:
-            raise AssertionError(f"Non-repeatable weight reduction: {name}")
-        reducer_meta[name].update(max_abs_error_vs_fp64=error, repeat_bitwise=True)
-    measure(reducers, "weight_reduction", "eager", reducer_meta)
-    kernel_times = measure(reducers, "weight_reduction", "graph", reducer_meta)
-    # Graph capture/replay must also leave the expected outputs in the buffers.
-    for name in reducers:
-        _check(reduced[name], expected_weight, atol=weight_atol)
-
-    fixed_candidates = args.shortlist_configs or args.finalist_configs
-    public_specs = [dict(s) for s in (specs if fixed_candidates else specs[:3])]
     selections = {}
-    if args.sweep_configs:
-        for strategy in _DEFAULT_CONFIGS:
-            candidates = [s for s in specs if s["strategy"] == strategy]
-            best = min(candidates, key=lambda s: kernel_times[s["name"]]["median_ms"])
-            selections[strategy] = dict(best)
-            public_specs.append({**best, "name": f"{strategy}_tuned"})
-    # Drop isolated workspaces before measuring public peak allocation.
-    del reducers, reduced, per_row, updated, inverse_rms, fn, first
+    public_specs = []
+    if not (args.auto_only or args.fused_configs):
+        # Derive identical FP32 contributions independently of any Triton backward.
+        with torch.no_grad():
+            updated = x.float() + residual.float()
+            inverse_rms = torch.rsqrt(updated.square().mean(dim=-1, keepdim=True) + 1e-5)
+            per_row = upstream[0] * (updated * inverse_rms)
+            expected_weight = per_row.double().sum(dim=0)
+        specs = _variants(args.sweep_configs, args.shortlist_configs, args.finalist_configs)
+        reducers, reduced, reducer_meta = _prepare_reducers(module, specs, per_row, weight)
+        for name, fn in reducers.items():
+            fn()
+            error = _check(reduced[name], expected_weight, atol=weight_atol)
+            first = reduced[name].clone()
+            reduced[name].fill_(float("nan"))
+            fn()
+            repeat_equal = torch.equal(first.view(torch.uint8), reduced[name].view(torch.uint8))
+            if not repeat_equal:
+                raise AssertionError(f"Non-repeatable weight reduction: {name}")
+            reducer_meta[name].update(max_abs_error_vs_fp64=error, repeat_bitwise=True)
+        measure(reducers, "weight_reduction", "eager", reducer_meta)
+        kernel_times = measure(reducers, "weight_reduction", "graph", reducer_meta)
+        # Graph capture/replay must also leave the expected outputs in the buffers.
+        for name in reducers:
+            _check(reduced[name], expected_weight, atol=weight_atol)
+
+        fixed_candidates = args.shortlist_configs or args.finalist_configs
+        public_specs = [dict(s) for s in (specs if fixed_candidates else specs[:3])]
+        if args.sweep_configs:
+            for strategy in _DEFAULT_CONFIGS:
+                candidates = [s for s in specs if s["strategy"] == strategy]
+                best = min(candidates, key=lambda s: kernel_times[s["name"]]["median_ms"])
+                selections[strategy] = dict(best)
+                public_specs.append({**best, "name": f"{strategy}_tuned"})
+        # Drop isolated workspaces before measuring public peak allocation.
+        del reducers, reduced, per_row, updated, inverse_rms, fn, first
+    if args.fused_configs:
+        public_specs = _fused_comparison_specs()
     providers = {"native": native}
     provider_meta = {"native": {}}
+    if args.auto_only or args.fused_configs:
+        plan = module._resolve_weight_grad_plan(x.device, x.dtype, n_rows, n_cols, None, None)
+        providers["auto"] = module.TritonFusedAddRMSNormOp()
+        provider_meta["auto"] = dict(
+            strategy=plan.strategy.value,
+            block_rows=plan.config.block_rows,
+            block_cols=plan.config.block_cols,
+            num_warps=plan.config.num_warps,
+        )
+        selections["auto"] = dict(provider_meta["auto"])
     for spec in public_specs:
         providers[spec["name"]] = module.TritonFusedAddRMSNormOp(
             weight_grad_strategy=module.RMSNormWeightGradStrategy(spec["strategy"]),
@@ -484,9 +538,37 @@ def _run_case(args, module, n_rows, n_cols, dtype_name):
         )
         provider_meta[spec["name"]] = dict(spec)
     functions = {mode: {} for mode in ("forward", "backward", "forward_backward")}
+    row_reference = None
     for name, op in providers.items():
         outputs = op(*inputs)
+        if name == "auto":
+            assert outputs[0].grad_fn.weight_grad_strategy == plan.strategy
+            assert outputs[0].grad_fn.weight_grad_config == plan.config
         gradients = torch.autograd.grad(outputs, inputs, upstream, retain_graph=True)
+        if args.fused_configs and name != "native":
+            # Fail before any provider is timed if grouping changes row results
+            # or if repeated backward changes any of the three gradients.
+            row_results = outputs + gradients[:2]
+            if row_reference is None:
+                row_reference = tuple(t.detach() for t in row_results)
+            _assert_same_outputs(row_results, row_reference)
+            repeated = torch.autograd.grad(outputs, inputs, upstream, retain_graph=True)
+            _assert_same_outputs(repeated, gradients)
+            provider_meta[name].update(
+                matches_row_path_bitwise=True,
+                backward_repeat_bitwise=True,
+            )
+            config = outputs[0].grad_fn.weight_grad_config
+            strategy = outputs[0].grad_fn.weight_grad_strategy
+            groups = (n_rows + config.block_rows - 1) // config.block_rows
+            fused = strategy == module.RMSNormWeightGradStrategy.FUSED
+            has_partials = fused or strategy == module.RMSNormWeightGradStrategy.PARALLEL
+            # Algorithmic scratch, not all allocations: actual peak is measured below.
+            provider_meta[name].update(
+                contribution_workspace_mib=0.0 if fused else n_rows * n_cols * 4 / 2**20,
+                workspace_mib=groups * n_cols * 4 / 2**20 if has_partials else 0.0,
+                input_gradient_num_warps=4,
+            )
         errors = {
             label: _check(actual, expected, atol=weight_atol if label == "grad_weight" else None)
             for label, actual, expected in zip(
@@ -535,6 +617,9 @@ def _run_case(args, module, n_rows, n_cols, dtype_name):
         functions["forward"][name] = forward
         functions["backward"][name] = backward
         functions["forward_backward"][name] = forward_backward
+    # Do not retain the correctness gate's extra gradient buffers during timing.
+    if args.fused_configs:
+        del row_reference, row_results, repeated
     for mode, calls in functions.items():
         extra = {
             name: {**provider_meta[name], "extra_peak_mib": _extra_peak(fn)}
@@ -544,7 +629,8 @@ def _run_case(args, module, n_rows, n_cols, dtype_name):
     # Graph backward replays GPU work from a prebuilt autograd graph. Combined
     # graphs contain both forward and backward GPU work; Python graph building
     # and allocation decisions happen at capture time, not on every replay.
-    graph_modes = functions if args.public_graph else ("forward",)
+    public_only = args.auto_only or args.fused_configs
+    graph_modes = functions if args.public_graph else (() if public_only else ("forward",))
     for mode in graph_modes:
         calls = functions[mode]
         capture_stream = None
@@ -618,13 +704,15 @@ def _strategy_comparisons(records):
     for mode, timing in itertools.product(("backward", "forward_backward"), ("eager", "graph")):
         group = [r for r in records if r["mode"] == mode and r["timing"] == timing]
         best = {}
-        for strategy in _DEFAULT_CONFIGS:
+        for strategy in (*_DEFAULT_CONFIGS, "fused"):
             candidates = [r for r in group if r.get("strategy") == strategy]
             if candidates:
                 best[strategy] = min(candidates, key=lambda r: r["median_ms"])
         for left_strategy, right_strategy in (
             ("sequential", "tiled"),
             ("tiled", "parallel"),
+            ("tiled", "fused"),
+            ("parallel", "fused"),
         ):
             if left_strategy not in best or right_strategy not in best:
                 continue
@@ -694,12 +782,21 @@ def _report(payload):
         "Graph samples are divided by the captured unroll count. Inputs remain cached; no explicit "
         "cache eviction. GPU graph time is not an end-to-end eager speedup.",
         "",
-        "Reported reductions passed FP64 accuracy and repeatability checks. Reported public "
+        "When measured, isolated reductions passed FP64 accuracy and repeatability checks. Public "
         "calls passed output/gradient accuracy and training/inference byte checks before timing. "
         "Changing reduction configuration may change grad_weight bytes. These checks do not prove "
         "cross-strategy/microbatch/distributed equality. Tuned settings are per-case candidates, "
         "not a production selection rule. --shortlist-configs/--finalist-configs test fixed sets "
         "in every scope; do not infer a dispatch boundary from isolated reduction timing alone.",
+        "With --auto-only, native and the public automatic Op are the only providers; no isolated "
+        "reduction or configuration sweep is run. Selected settings are recorded per case; "
+        "the policy/device caches are warm. Graph timings are included only with --public-graph.",
+        "With --fused-configs, compare native, automatic, existing sequential/tiled/parallel "
+        "controls and FUSED row groups of 16/64/256 through the public API. No isolated sums are "
+        "measured. Before timing, all Triton candidates must match the original row path's "
+        "outputs/input gradients bitwise and repeat all gradients bitwise. FUSED preserves "
+        "four-warps row arithmetic. JSON records contribution/partial scratch separately from "
+        "measured extra peak allocation. This experiment does not change automatic dispatch.",
         "",
         "| Input | Shape | Scope | Timing | Provider | Median ms | Speedup | "
         "Extra peak MiB | Partial workspace MiB | Round max/min |",
@@ -749,11 +846,24 @@ def _report(payload):
             )
     lines.extend(["", "## Timing controls", ""])
     for d in payload.get("diagnostics", []):
-        status = "RECHECK" if d["same_forward_spread"] > 1.15 else "within 15%"
-        lines.append(
-            f"- {d['input_dtype']} {d['shape']}: identical-forward timing spread "
-            f"{d['same_forward_spread']:.2f}x — {status}."
-        )
+        if "auto" in d["selections"]:
+            selected = d["selections"]["auto"]
+            lines.append(
+                f"- {d['input_dtype']} {d['shape']}: automatic {selected['strategy']}, "
+                f"rows={selected['block_rows']}, cols={selected['block_cols']}, "
+                f"warps={selected['num_warps']}. "
+                + (
+                    f"Identical-forward timing spread {d['same_forward_spread']:.2f}x."
+                    if payload["config"].get("fused_configs")
+                    else "One Triton provider; no across-strategy identical-forward control."
+                )
+            )
+        else:
+            status = "RECHECK" if d["same_forward_spread"] > 1.15 else "within 15%"
+            lines.append(
+                f"- {d['input_dtype']} {d['shape']}: identical-forward timing spread "
+                f"{d['same_forward_spread']:.2f}x — {status}."
+            )
         unstable = d.get("unstable_measurements", [])
         for timing in ("eager", "graph"):
             entries = [r for r in unstable if r["timing"] == timing]
@@ -764,7 +874,7 @@ def _report(payload):
                     f"worst: {worst['mode']}/{worst['provider']} "
                     f"{worst['round_spread']:.2f}x. JSON lists every flagged measurement."
                 )
-        if d["selections"]:
+        if d["selections"] and "auto" not in d["selections"]:
             choices = ", ".join(f"{k}: {v['name']}" for k, v in d["selections"].items())
             lines.append(
                 f"  Reduction-graph shortlist, also timed as public `*_tuned` calls: {choices}."
@@ -780,12 +890,22 @@ def _save(payload, folder):
 
 def _parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--preset", choices=[*_PRESETS, "dispatch"], default="model")
+    parser.add_argument("--preset", choices=[*_PRESETS, "dispatch", "fused"], default="model")
     parser.add_argument("--rows", nargs="+", type=_positive_int)
     parser.add_argument("--cols", nargs="+", type=_positive_int)
     parser.add_argument("--dtypes", nargs="+", choices=_DTYPES, default=list(_DTYPES))
     configs = parser.add_mutually_exclusive_group()
     configs.add_argument("--sweep-configs", action="store_true")
+    configs.add_argument(
+        "--fused-configs",
+        action="store_true",
+        help="Compare fused grouped backward, existing controls and auto; public calls only",
+    )
+    configs.add_argument(
+        "--auto-only",
+        action="store_true",
+        help="Compare only the public automatic Op and eager PyTorch; skip reduction sweeps",
+    )
     configs.add_argument(
         "--shortlist-configs",
         action="store_true",
@@ -814,12 +934,20 @@ def _parse_args(argv=None):
     parser.add_argument("--output-dir", type=Path, default=Path("reports/fused-add-rmsnorm"))
     parser.add_argument("--dry-run", action="store_true", help="Print the case plan without a GPU")
     args = parser.parse_args(argv)
-    rows, cols = (_DISPATCH_ROWS, [2688]) if args.preset == "dispatch" else _PRESETS[args.preset]
+    if args.preset == "dispatch":
+        rows, cols = _DISPATCH_ROWS, [2688]
+    elif args.preset == "fused":
+        rows, cols = [1, 32, 1024, 8192, 65536], [2688]
+    else:
+        rows, cols = _PRESETS[args.preset]
     sparse_dispatch = args.preset == "dispatch" and args.rows is None and args.cols is None
+    sparse_fused = args.preset == "fused" and args.rows is None and args.cols is None
     args.rows = list(dict.fromkeys(args.rows or rows))
     args.cols = list(dict.fromkeys(args.cols or cols))
     args.dtypes = list(dict.fromkeys(args.dtypes))
     shapes = list(itertools.product(args.rows, args.cols))
+    if sparse_fused:
+        shapes = list(_FUSED_SHAPES)
     if sparse_dispatch:
         # Cross all three dtypes with these exact pairs, not a large Cartesian
         # product of every row boundary with every synthetic feature width.
@@ -835,6 +963,19 @@ def _cases(args):
 
 def _case_plan(args):
     count = len(_cases(args))
+    if args.fused_configs:
+        public_providers = len(_fused_comparison_specs()) + 2  # Native and automatic controls.
+        return dict(
+            case_count=count,
+            reduction_config_count=0,
+            measurement_count=count * public_providers * (6 if args.public_graph else 3),
+        )
+    if args.auto_only:
+        return dict(
+            case_count=count,
+            reduction_config_count=0,
+            measurement_count=count * (12 if args.public_graph else 6),
+        )
     reduction_providers = (
         len(_variants(args.sweep_configs, args.shortlist_configs, args.finalist_configs)) + 1
     )

@@ -10,9 +10,12 @@ fixed num_warps, and enable_fp_fusion=False.
 
 Backward launches one program per row, reusing updated_residual and inverse_rms.
 It writes input gradients and FP32 weight-gradient contributions [rows, n_cols].
-A second kernel defaults to a left-fold in ascending row order. TILED uses row
-lanes within each program. PARALLEL partitions rows across programs and merges
-FP32 partials in a second launch. Both change addition order and are opt-in.
+A metadata policy chooses the weight reduction. SEQUENTIAL left-folds in row
+order. TILED uses row lanes within each program. PARALLEL partitions rows and merges
+FP32 partials in a second launch. The strategies have different addition orders.
+Experimental FUSED instead accumulates weight contributions while computing
+input gradients for a fixed group of rows, then merges [groups, n_cols] partials.
+It never allocates the full [rows, n_cols] contribution matrix.
 Both upstream gradient buffers are required; supply zeros for an unused output branch.
 Gradient output buffers select the final storage dtypes. Use the same stream
 for all backward launches, and disable FP fusion for all kernels.
@@ -27,6 +30,7 @@ import math
 from contextlib import nullcontext
 from dataclasses import dataclass
 from enum import Enum
+from functools import lru_cache
 from typing import Protocol
 
 import torch
@@ -41,20 +45,21 @@ _WEIGHT_BLOCK_ROWS = 32
 
 
 class RMSNormWeightGradStrategy(Enum):
-    """Select how FP32 per-row weight-gradient contributions are combined."""
+    """Select how backward computes and combines FP32 weight contributions."""
 
     SEQUENTIAL = "sequential"
     TILED = "tiled"
     PARALLEL = "parallel"
+    FUSED = "fused"
 
 
 @dataclass(frozen=True)
 class RMSNormWeightGradConfig:
-    """Explicit experimental configuration; no timing-based dispatch."""
+    """Fixed tile/warp configuration; never timed or autotuned during execution."""
 
-    block_cols: int = 128  # Features owned by one program (power of two).
-    block_rows: int = 32  # TILED row lanes / PARALLEL rows per partial; unused by SEQUENTIAL.
-    num_warps: int = 4  # Warps per weight-reduction program, including the parallel merge.
+    block_cols: int = 128  # Features per reduction program; FUSED uses this only for its merge.
+    block_rows: int = 32  # TILED lanes / PARALLEL or FUSED rows per partial; unused by SEQUENTIAL.
+    num_warps: int = 4  # Reduction warps; FUSED's input-gradient kernel always uses _NUM_WARPS.
 
     def __post_init__(self):
         for value in (self.block_cols, self.block_rows):
@@ -68,7 +73,111 @@ _WEIGHT_GRAD_CONFIGS = {
     RMSNormWeightGradStrategy.SEQUENTIAL: RMSNormWeightGradConfig(block_rows=1),
     RMSNormWeightGradStrategy.TILED: RMSNormWeightGradConfig(),
     RMSNormWeightGradStrategy.PARALLEL: RMSNormWeightGradConfig(block_rows=256),
+    RMSNormWeightGradStrategy.FUSED: RMSNormWeightGradConfig(block_rows=64, block_cols=64),
 }
+
+
+@dataclass(frozen=True)
+class RMSNormWeightGradPlan:
+    """The strategy and its launch settings, saved together for one backward."""
+
+    strategy: RMSNormWeightGradStrategy
+    config: RMSNormWeightGradConfig
+
+
+@dataclass(frozen=True)
+class RMSNormWeightGradKey:
+    """Metadata range for a static weight-reduction policy entry."""
+
+    device_key: tuple[str, str] | str  # (backend, GPU name), or "default" for any device.
+    dtype: torch.dtype | None  # x dtype; None shares a rule across supported input dtypes.
+    n_cols: int | None  # Exact feature width D; None is the fallback for other widths.
+    min_rows: int  # Inclusive lower bound on flattened rows M = x.numel() // D.
+    max_rows: int | None  # Inclusive upper bound; None also covers larger unseen M.
+
+
+# Conservative defaults informed by H100 80 GB measurements, shared by other
+# devices until they acquire explicit entries. They are not proven optima for
+# every shape/device. The wide fallback stays TILED: D=8193 did not consistently
+# benefit from PARALLEL. D=2688 large-row extrapolation keeps PARALLEL beyond the
+# measured M=65536. All reductions read FP32 contributions, so dtype rules share
+# settings for now. No graph/eager detection changes the reduction order.
+WEIGHT_GRAD_POLICY: dict[RMSNormWeightGradKey, RMSNormWeightGradPlan] = {
+    RMSNormWeightGradKey("default", None, None, 0, 8): RMSNormWeightGradPlan(
+        RMSNormWeightGradStrategy.SEQUENTIAL,
+        _WEIGHT_GRAD_CONFIGS[RMSNormWeightGradStrategy.SEQUENTIAL],
+    ),
+    RMSNormWeightGradKey("default", None, None, 9, 32): RMSNormWeightGradPlan(
+        RMSNormWeightGradStrategy.TILED,
+        RMSNormWeightGradConfig(block_rows=32, block_cols=64, num_warps=4),
+    ),
+    RMSNormWeightGradKey("default", None, 2688, 16384, None): RMSNormWeightGradPlan(
+        RMSNormWeightGradStrategy.PARALLEL,
+        RMSNormWeightGradConfig(block_rows=512, block_cols=64, num_warps=4),
+    ),
+    RMSNormWeightGradKey("default", None, None, 33, None): RMSNormWeightGradPlan(
+        RMSNormWeightGradStrategy.TILED,
+        RMSNormWeightGradConfig(block_rows=64, block_cols=64, num_warps=8),
+    ),
+}
+
+
+@lru_cache(maxsize=1024)
+def select_rmsnorm_weight_grad_plan(
+    device_key: tuple[str, str], dtype: torch.dtype, n_rows: int, n_cols: int
+) -> RMSNormWeightGradPlan:
+    """Prefer device, dtype, then width-specific ranges before shared defaults.
+
+    Only immutable metadata is cached. The static table must not contain
+    overlapping row ranges for identical device/dtype/width keys. If editing
+    the table in a running process, clear this function's cache afterwards.
+    """
+    for device in (device_key, "default"):
+        for input_dtype in (dtype, None):
+            for width in (n_cols, None):
+                for key, plan in WEIGHT_GRAD_POLICY.items():
+                    if (
+                        key.device_key == device
+                        and key.dtype == input_dtype
+                        and key.n_cols == width
+                        and n_rows >= key.min_rows
+                        and (key.max_rows is None or n_rows <= key.max_rows)
+                    ):
+                        return plan
+    return RMSNormWeightGradPlan(
+        RMSNormWeightGradStrategy.SEQUENTIAL,
+        _WEIGHT_GRAD_CONFIGS[RMSNormWeightGradStrategy.SEQUENTIAL],
+    )
+
+
+@lru_cache(maxsize=None)
+def _cuda_device_key(backend: str, index: int) -> tuple[str, str]:
+    return backend, torch.cuda.get_device_name(index)
+
+
+def rmsnorm_device_key(device: torch.device) -> tuple[str, str]:
+    """Identify the input GPU, including ROCm's torch.cuda device namespace."""
+    if device.type == "cuda":
+        backend = "rocm" if torch.version.hip is not None else "cuda"
+        index = device.index if device.index is not None else torch.cuda.current_device()
+        return _cuda_device_key(backend, index)
+    return device.type, ""
+
+
+def _resolve_weight_grad_plan(
+    device: torch.device,
+    dtype: torch.dtype,
+    n_rows: int,
+    n_cols: int,
+    strategy: RMSNormWeightGradStrategy | None,
+    config: RMSNormWeightGradConfig | None,
+) -> RMSNormWeightGradPlan:
+    # An explicit config without a strategy retains the previous SEQUENTIAL
+    # behavior. Explicit strategies retain their original default configurations.
+    if strategy is not None or config is not None or n_rows == 0:
+        strategy = strategy or RMSNormWeightGradStrategy.SEQUENTIAL
+        return RMSNormWeightGradPlan(strategy, config or _WEIGHT_GRAD_CONFIGS[strategy])
+    return select_rmsnorm_weight_grad_plan(rmsnorm_device_key(device), dtype, n_rows, n_cols)
 
 
 class _WeightGradLauncher(Protocol):
@@ -190,6 +299,70 @@ def _fused_add_rmsnorm_bwd_kernel(
         mask=mask,
     )
     tl.store(grad_weight_per_row_ptr + offsets, grad_weight_per_row, mask=mask)
+
+
+@triton.jit
+def _fused_add_rmsnorm_bwd_grouped_kernel(
+    updated_residual_ptr,
+    inverse_rms_ptr,
+    weight_ptr,
+    grad_y_ptr,
+    grad_updated_residual_output_ptr,
+    grad_x_ptr,
+    grad_residual_ptr,
+    grad_weight_partials_ptr,
+    n_rows,
+    n_cols: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    ROWS_PER_GROUP: tl.constexpr,
+):
+    """Compute input gradients and fold weight contributions within a row group.
+
+    Each program retains one FP32 vector of weight partials in registers. Only
+    that vector is written after the loop. Groups are fixed by ROWS_PER_GROUP,
+    independent of SM count, scheduling, or the current batch's number of rows.
+    Keep each row's arithmetic and four-warps layout identical to the row kernel.
+    """
+    group = tl.program_id(0).to(tl.int64)
+    cols = tl.arange(0, BLOCK_SIZE)
+    mask = cols < n_cols
+    weight = tl.load(weight_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+    grad_weight_partial = tl.full((BLOCK_SIZE,), 0.0, tl.float32)
+    row_start = group * ROWS_PER_GROUP
+    row_end = tl.minimum(row_start + ROWS_PER_GROUP, n_rows)
+
+    for row in range(row_start, row_end):
+        offsets = row * n_cols + cols
+        updated_residual = tl.load(updated_residual_ptr + offsets, mask=mask, other=0.0).to(
+            tl.float32
+        )
+        inverse_rms = tl.load(inverse_rms_ptr + row).to(tl.float32)
+        grad_y = tl.load(grad_y_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
+        grad_updated_residual_output = tl.load(
+            grad_updated_residual_output_ptr + offsets, mask=mask, other=0.0
+        ).to(tl.float32)
+
+        # Preserve the original per-row expressions, including FP32 rounding.
+        normalized = updated_residual * inverse_rms
+        grad_normalized = grad_y * weight
+        grad_weight_per_row = grad_y * normalized
+        correction_sum = tl.sum(grad_normalized * normalized, axis=0)
+        correction = tl.div_rn(correction_sum, n_cols)
+        grad_updated_residual_from_y = inverse_rms * (grad_normalized - normalized * correction)
+        grad_updated_residual_total = grad_updated_residual_from_y + grad_updated_residual_output
+        tl.store(
+            grad_x_ptr + offsets,
+            grad_updated_residual_total.to(grad_x_ptr.dtype.element_ty),
+            mask=mask,
+        )
+        tl.store(
+            grad_residual_ptr + offsets,
+            grad_updated_residual_total.to(grad_residual_ptr.dtype.element_ty),
+            mask=mask,
+        )
+        grad_weight_partial = grad_weight_partial + grad_weight_per_row
+
+    tl.store(grad_weight_partials_ptr + group * n_cols + cols, grad_weight_partial, mask=mask)
 
 
 @triton.jit
@@ -377,6 +550,125 @@ _WEIGHT_GRAD_LAUNCHERS: dict[RMSNormWeightGradStrategy, _WeightGradLauncher] = {
 }
 
 
+class _BackwardLauncher(Protocol):
+    """Write all three gradients from contiguous saved tensors and upstreams."""
+
+    def __call__(
+        self,
+        *,
+        updated_residual: torch.Tensor,
+        inverse_rms: torch.Tensor,
+        weight: torch.Tensor,
+        grad_y: torch.Tensor,
+        grad_updated_residual_output: torch.Tensor,
+        grad_x: torch.Tensor,
+        grad_residual: torch.Tensor,
+        grad_weight: torch.Tensor,
+        n_rows: int,
+        n_cols: int,
+        plan: RMSNormWeightGradPlan,
+    ) -> None:
+        """Own workspace allocation; use the caller's input-device stream."""
+        ...
+
+
+def _launch_backward_with_row_contributions(
+    *,
+    updated_residual: torch.Tensor,
+    inverse_rms: torch.Tensor,
+    weight: torch.Tensor,
+    grad_y: torch.Tensor,
+    grad_updated_residual_output: torch.Tensor,
+    grad_x: torch.Tensor,
+    grad_residual: torch.Tensor,
+    grad_weight: torch.Tensor,
+    n_rows: int,
+    n_cols: int,
+    plan: RMSNormWeightGradPlan,
+) -> None:
+    """Original row kernel followed by the selected standalone weight reduction."""
+    grad_weight_per_row = torch.empty(
+        (n_rows, n_cols), device=updated_residual.device, dtype=torch.float32
+    )
+    _fused_add_rmsnorm_bwd_kernel[(n_rows,)](
+        updated_residual,
+        inverse_rms,
+        weight,
+        grad_y,
+        grad_updated_residual_output,
+        grad_x,
+        grad_residual,
+        grad_weight_per_row,
+        n_cols,
+        BLOCK_SIZE=triton.next_power_of_2(n_cols),
+        num_warps=_NUM_WARPS,
+        enable_fp_fusion=False,
+    )
+    launch_weight_grad = _WEIGHT_GRAD_LAUNCHERS[plan.strategy]
+    launch_weight_grad(
+        grad_weight_per_row=grad_weight_per_row,
+        grad_weight=grad_weight,
+        n_rows=n_rows,
+        n_cols=n_cols,
+        config=plan.config,
+    )
+
+
+def _launch_backward_with_grouped_contributions(
+    *,
+    updated_residual: torch.Tensor,
+    inverse_rms: torch.Tensor,
+    weight: torch.Tensor,
+    grad_y: torch.Tensor,
+    grad_updated_residual_output: torch.Tensor,
+    grad_x: torch.Tensor,
+    grad_residual: torch.Tensor,
+    grad_weight: torch.Tensor,
+    n_rows: int,
+    n_cols: int,
+    plan: RMSNormWeightGradPlan,
+) -> None:
+    """Experimental fused backward with only [ceil(M / group_rows), D] scratch."""
+    config = plan.config
+    n_groups = triton.cdiv(n_rows, config.block_rows)
+    partials = torch.empty((n_groups, n_cols), device=updated_residual.device, dtype=torch.float32)
+    _fused_add_rmsnorm_bwd_grouped_kernel[(n_groups,)](
+        updated_residual,
+        inverse_rms,
+        weight,
+        grad_y,
+        grad_updated_residual_output,
+        grad_x,
+        grad_residual,
+        partials,
+        n_rows,
+        n_cols,
+        BLOCK_SIZE=triton.next_power_of_2(n_cols),
+        ROWS_PER_GROUP=config.block_rows,
+        num_warps=_NUM_WARPS,
+        enable_fp_fusion=False,
+    )
+    # Same-stream fixed-order merge; no atomic additions or host synchronization.
+    _fused_add_rmsnorm_bwd_weight_tiled_kernel[(triton.cdiv(n_cols, config.block_cols),)](
+        partials,
+        grad_weight,
+        n_groups,
+        n_cols,
+        BLOCK_SIZE=config.block_cols,
+        BLOCK_ROWS=_WEIGHT_BLOCK_ROWS,
+        num_warps=config.num_warps,
+        enable_fp_fusion=False,
+    )
+
+
+_BACKWARD_LAUNCHERS: dict[RMSNormWeightGradStrategy, _BackwardLauncher] = {
+    RMSNormWeightGradStrategy.SEQUENTIAL: _launch_backward_with_row_contributions,
+    RMSNormWeightGradStrategy.TILED: _launch_backward_with_row_contributions,
+    RMSNormWeightGradStrategy.PARALLEL: _launch_backward_with_row_contributions,
+    RMSNormWeightGradStrategy.FUSED: _launch_backward_with_grouped_contributions,
+}
+
+
 def _validate_inputs(
     x: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor, eps: float
 ) -> None:
@@ -457,15 +749,15 @@ def _launch_fused_add_rmsnorm_bwd(
     *,
     x_dtype: torch.dtype,
     residual_dtype: torch.dtype,
-    weight_grad_strategy: RMSNormWeightGradStrategy = RMSNormWeightGradStrategy.SEQUENTIAL,
+    weight_grad_strategy: RMSNormWeightGradStrategy | None = None,
     weight_grad_config: RMSNormWeightGradConfig | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Return input-dtype gradients using the FP32 values saved by forward.
 
-    An unused output contributes zero. By default, weight gradients left-fold
-    FP32 row contributions before casting to the weight dtype. TILED/PARALLEL
-    opt into other summation orders. No strategy guarantees that adding
-    separately reduced microbatch gradients reproduces a single call bitwise.
+    An unused output contributes zero. Automatic selection only changes the
+    final weight reduction, which casts once to the weight dtype.
+    No strategy guarantees that adding separately reduced microbatch gradients
+    reproduces a single call bitwise.
     """
     _validate_backward_inputs(updated_residual, inverse_rms, weight)
     n_cols = updated_residual.shape[-1]
@@ -477,6 +769,9 @@ def _launch_fused_add_rmsnorm_bwd(
     if n_rows == 0:
         return grad_x, grad_residual, torch.zeros_like(weight)
 
+    plan = _resolve_weight_grad_plan(
+        updated_residual.device, x_dtype, n_rows, n_cols, weight_grad_strategy, weight_grad_config
+    )
     grad_y_c = torch.zeros_like(updated_residual) if grad_y is None else grad_y.contiguous()
     grad_updated_residual_c = (
         torch.zeros_like(updated_residual)
@@ -484,36 +779,24 @@ def _launch_fused_add_rmsnorm_bwd(
         else grad_updated_residual_output.contiguous()
     )
     grad_weight = torch.empty((n_cols,), device=weight.device, dtype=weight.dtype)
-    grad_weight_per_row = torch.empty(
-        (n_rows, n_cols), device=updated_residual.device, dtype=torch.float32
-    )
     with (
         torch.cuda.device(updated_residual.device)
         if updated_residual.device.type == "cuda"
         else nullcontext()
     ):
-        _fused_add_rmsnorm_bwd_kernel[(n_rows,)](
-            updated_residual.contiguous(),
-            inverse_rms.contiguous(),
-            weight.contiguous(),
-            grad_y_c,
-            grad_updated_residual_c,
-            grad_x,
-            grad_residual,
-            grad_weight_per_row,
-            n_cols,
-            BLOCK_SIZE=triton.next_power_of_2(n_cols),
-            num_warps=_NUM_WARPS,
-            enable_fp_fusion=False,
-        )
-        # Launch on the same stream: the merge observes completed row contributions.
-        launch_weight_grad = _WEIGHT_GRAD_LAUNCHERS[weight_grad_strategy]
-        launch_weight_grad(
-            grad_weight_per_row=grad_weight_per_row,
+        launch_backward = _BACKWARD_LAUNCHERS[plan.strategy]
+        launch_backward(
+            updated_residual=updated_residual.contiguous(),
+            inverse_rms=inverse_rms.contiguous(),
+            weight=weight.contiguous(),
+            grad_y=grad_y_c,
+            grad_updated_residual_output=grad_updated_residual_c,
+            grad_x=grad_x,
+            grad_residual=grad_residual,
             grad_weight=grad_weight,
             n_rows=n_rows,
             n_cols=n_cols,
-            config=weight_grad_config,
+            plan=plan,
         )
     return grad_x, grad_residual, grad_weight
 
@@ -526,12 +809,20 @@ class _FusedAddRMSNormTritonFunction(torch.autograd.Function):
         y, updated_residual, inverse_rms = _launch_fused_add_rmsnorm_fwd(
             x, residual, weight, eps=eps
         )
+        plan = _resolve_weight_grad_plan(
+            x.device,
+            x.dtype,
+            inverse_rms.numel(),
+            x.shape[-1],
+            weight_grad_strategy,
+            weight_grad_config,
+        )
         # Keep the existing FP32 output, not copies of x/residual or a rounded sum.
         ctx.save_for_backward(updated_residual, inverse_rms, weight)
         ctx.x_dtype = x.dtype
         ctx.residual_dtype = residual.dtype
-        ctx.weight_grad_strategy = weight_grad_strategy
-        ctx.weight_grad_config = weight_grad_config
+        ctx.weight_grad_strategy = plan.strategy
+        ctx.weight_grad_config = plan.config
         # Backward explicitly handles an output that was not used by the loss.
         ctx.set_materialize_grads(False)
         return y, updated_residual
@@ -567,9 +858,13 @@ class TritonFusedAddRMSNormOp:
     Both outputs retain the input shape and use FP32; each input gradient uses
     that input's dtype. Noncontiguous tensors are copied to contiguous buffers.
     Normalization uses the FP32 residual sum without an intermediate downcast.
-    weight_grad_strategy selects only the final weight-gradient reduction.
-    SEQUENTIAL preserves the original order; TILED/PARALLEL are opt-in experiments.
-    weight_grad_config optionally overrides the reduction tile/warp settings.
+    weight_grad_strategy selects how backward accumulates weight gradients.
+    Experimental FUSED combines row backward and grouped weight accumulation,
+    keeping the row's fixed arithmetic and using a smaller partial workspace.
+    None selects a conservative metadata-based strategy and configuration.
+    An explicit strategy retains its original defaults; weight_grad_config
+    overrides them. A config alone keeps the previous SEQUENTIAL behavior.
+    The resolved plan belongs to each autograd call, not to this reusable Op.
     """
 
     op_class = "norm"
@@ -577,7 +872,7 @@ class TritonFusedAddRMSNormOp:
     def __init__(
         self,
         *,
-        weight_grad_strategy: RMSNormWeightGradStrategy = RMSNormWeightGradStrategy.SEQUENTIAL,
+        weight_grad_strategy: RMSNormWeightGradStrategy | None = None,
         weight_grad_config: RMSNormWeightGradConfig | None = None,
     ):
         self.weight_grad_strategy = weight_grad_strategy

@@ -163,6 +163,79 @@ def test_dispatch_overrides_and_reverse_run_do_not_expand_or_drop_cases(benchmar
             benchmark._parse_args(["--finalist-configs", incompatible])
 
 
+@pytest.mark.parametrize("graph", [False, True])
+def test_auto_only_plan_skips_reduction_sweeps(benchmark, graph):
+    options = ["--auto-only", "--rows", "8", "9", "16384", "--cols", "2688", "--dtypes", "bf16"]
+    if graph:
+        options.append("--public-graph")
+    args = benchmark._parse_args(options)
+    assert benchmark._case_plan(args) == {
+        "case_count": 3,
+        "reduction_config_count": 0,
+        "measurement_count": 36 if graph else 18,
+    }
+    for incompatible in ("--sweep-configs", "--shortlist-configs", "--finalist-configs"):
+        with pytest.raises(SystemExit):
+            benchmark._parse_args(["--auto-only", incompatible])
+
+
+def test_auto_report_records_selection_without_claiming_a_control_comparison(benchmark):
+    args = benchmark._parse_args(
+        ["--auto-only", "--rows", "9", "--cols", "2688", "--dtypes", "bf16"]
+    )
+    payload = dict(
+        complete=False,
+        environment=dict(gpu="test", torch="test", triton="test"),
+        config=vars(args),
+        case_plan=benchmark._case_plan(args),
+        results=[],
+        diagnostics=[
+            dict(
+                input_dtype="bf16",
+                shape=[9, 2688],
+                same_forward_spread=1.0,
+                selections={
+                    "auto": dict(strategy="tiled", block_rows=32, block_cols=64, num_warps=4)
+                },
+            )
+        ],
+    )
+    report = benchmark._report(payload)
+    assert "automatic tiled, rows=32, cols=64, warps=4" in report
+    assert "policy/device caches are warm" in report
+    assert "One Triton provider; no across-strategy identical-forward control" in report
+    assert "within 15%" not in report
+
+
+@pytest.mark.parametrize("graph", [False, True])
+def test_fused_plan_compares_public_paths_across_widths(benchmark, graph):
+    options = ["--preset", "fused", "--fused-configs"]
+    if graph:
+        options.append("--public-graph")
+    args = benchmark._parse_args(options)
+    assert benchmark._case_plan(args) == {
+        "case_count": 36,
+        "reduction_config_count": 0,
+        "measurement_count": 1728 if graph else 864,
+    }
+    shapes = {tuple(shape) for shape in args.shapes}
+    assert {(8192, 2688), (8192, 4096), (8192, 8192), (8192, 8193), (65536, 2688)} <= shapes
+    assert (65536, 8193) not in shapes
+    specs = benchmark._fused_comparison_specs()
+    assert {s["block_rows"] for s in specs if s["strategy"] == "fused"} == {16, 64, 256}
+    assert {s["strategy"] for s in specs} == {"sequential", "tiled", "parallel", "fused"}
+    reverse = benchmark._parse_args(options + ["--reverse-cases"])
+    assert benchmark._cases(reverse) == benchmark._cases(args)[::-1]
+    for incompatible in (
+        "--auto-only",
+        "--sweep-configs",
+        "--shortlist-configs",
+        "--finalist-configs",
+    ):
+        with pytest.raises(SystemExit):
+            benchmark._parse_args(["--fused-configs", incompatible])
+
+
 def _comparison_record(strategy, medians, *, mode="forward_backward", timing="eager"):
     return dict(
         provider=strategy,
@@ -230,7 +303,7 @@ def test_captured_return_checks_bits_shape_and_dtype(benchmark):
         (torch.ones(1, 3), torch.ones(3)),
         (torch.ones(3, dtype=torch.float64), torch.ones(3)),
     ):
-        with pytest.raises(AssertionError, match="CUDA Graph"):
+        with pytest.raises(AssertionError, match="shape or dtype|bitwise"):
             benchmark._assert_same_outputs((actual,), (expected,))
 
 
@@ -535,3 +608,116 @@ def test_public_graph_shortlist_matches_eager_and_reference_after_replays(
     # The smoke's single round cannot establish a performance recommendation.
     assert len(benchmark._strategy_comparisons(records)) == 8
     assert all(c["candidate"] == "inconclusive" for c in benchmark._strategy_comparisons(records))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA or ROCm GPU required")
+@pytest.mark.filterwarnings("error:.*AccumulateGrad.*:UserWarning")
+@pytest.mark.parametrize("graph", [False, True])
+def test_auto_benchmark_runs_only_public_providers_and_verifies_graphs(
+    benchmark, monkeypatch, graph
+):
+    triton = pytest.importorskip("triton")
+    if not hasattr(triton, "jit"):
+        pytest.skip("A working Triton runtime is required")
+    module = importlib.import_module("rl_engine.kernels.ops.triton.norm.fused_add_rmsnorm")
+
+    def no_reducers(*args, **kwargs):
+        raise AssertionError("auto-only must skip isolated reductions")
+
+    monkeypatch.setattr(benchmark, "_prepare_reducers", no_reducers)
+    options = [
+        "--auto-only",
+        "--rounds",
+        "1",
+        "--warmup",
+        "1",
+        "--repeat",
+        "2",
+        "--graph-unroll",
+        "2",
+    ]
+    if graph:
+        options.append("--public-graph")
+    args = benchmark._parse_args(options)
+    records, _, diagnostic = benchmark._run_case(args, module, 33, 129, "bf16")
+    assert len(records) == (12 if graph else 6)
+    assert {r["provider"] for r in records} == {"native", "auto"}
+    assert {r["mode"] for r in records} == {"forward", "backward", "forward_backward"}
+    assert diagnostic["selections"]["auto"] == dict(
+        strategy="tiled", block_rows=64, block_cols=64, num_warps=8
+    )
+    assert all(r["train_inference_bitwise"] for r in records)
+    if graph:
+        captured = [r for r in records if r["timing"] == "graph"]
+        assert len(captured) == 6
+        assert all(r["graph_matches_eager_bitwise"] and r["graph_repeat_bitwise"] for r in captured)
+    else:
+        assert {r["timing"] for r in records} == {"eager"}
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA or ROCm GPU required")
+@pytest.mark.filterwarnings("error:.*AccumulateGrad.*:UserWarning")
+@pytest.mark.parametrize("graph", [False, True])
+def test_fused_benchmark_checks_all_candidates_before_timing(benchmark, monkeypatch, graph):
+    triton = pytest.importorskip("triton")
+    if not hasattr(triton, "jit"):
+        pytest.skip("A working Triton runtime is required")
+    module = importlib.import_module("rl_engine.kernels.ops.triton.norm.fused_add_rmsnorm")
+
+    def no_reducers(*args, **kwargs):
+        raise AssertionError("Fused backward must not be timed as a standalone sum")
+
+    monkeypatch.setattr(benchmark, "_prepare_reducers", no_reducers)
+    options = [
+        "--fused-configs",
+        "--rounds",
+        "1",
+        "--warmup",
+        "1",
+        "--repeat",
+        "2",
+        "--graph-unroll",
+        "2",
+    ]
+    if graph:
+        options.append("--public-graph")
+    args = benchmark._parse_args(options)
+    records, _, diagnostic = benchmark._run_case(args, module, 257, 129, "bf16")
+    assert len(records) == (48 if graph else 24)
+    assert {r["mode"] for r in records} == {"forward", "backward", "forward_backward"}
+    assert len({r["provider"] for r in records}) == 8
+    for r in records:
+        assert r["train_inference_bitwise"]
+        if r["provider"] != "native":
+            assert r["matches_row_path_bitwise"] and r["backward_repeat_bitwise"]
+            assert r["row_invariance_bitwise"]
+        if r.get("strategy") == "fused":
+            assert r["contribution_workspace_mib"] == 0.0
+            assert (
+                r["workspace_mib"]
+                == ((257 + r["block_rows"] - 1) // r["block_rows"]) * 129 * 4 / 2**20
+            )
+            assert r["input_gradient_num_warps"] == 4
+        if r["timing"] == "graph":
+            assert r["graph_matches_eager_bitwise"] and r["graph_repeat_bitwise"]
+    assert any(c["right_strategy"] == "fused" for c in diagnostic["strategy_comparisons"])
+
+    # Force a fused candidate to fail its repeatability gate; even native timing must not start.
+    specs = benchmark._fused_comparison_specs()
+    monkeypatch.setattr(benchmark, "_fused_comparison_specs", lambda: [specs[-1]])
+    assert_same = benchmark._assert_same_outputs
+    checks = [0]
+
+    def fail_fused(actual, expected):
+        checks[0] += 1
+        if checks[0] == 4:  # Automatic path first, then fused row/repeat checks.
+            raise AssertionError("injected fused repeat failure")
+        return assert_same(actual, expected)
+
+    def no_timing(*args, **kwargs):
+        raise AssertionError("Timing started before every correctness gate passed")
+
+    monkeypatch.setattr(benchmark, "_assert_same_outputs", fail_fused)
+    monkeypatch.setattr(benchmark, "_measure_group", no_timing)
+    with pytest.raises(AssertionError, match="injected fused repeat failure"):
+        benchmark._run_case(args, module, 33, 129, "bf16")
