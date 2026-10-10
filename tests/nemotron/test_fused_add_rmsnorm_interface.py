@@ -337,7 +337,7 @@ def test_auto_boundaries_match_explicit_plan_and_preserve_consistency(triton_mod
     elif rows < 16384:
         strategy, block_rows, block_cols, warps = "tiled", 64, 64, 8
     else:
-        strategy, block_rows, block_cols, warps = "parallel", 512, 64, 4
+        strategy, block_rows, block_cols, warps = "fused", 64, 64, 4
     selected_strategy = module.RMSNormWeightGradStrategy(strategy)
     config = module.RMSNormWeightGradConfig(
         block_rows=block_rows, block_cols=block_cols, num_warps=warps
@@ -449,6 +449,60 @@ def test_config_is_saved_per_forward_and_preserves_row_results(triton_module, dt
         assert torch.equal(original.view(torch.uint8), repeated.view(torch.uint8))
     for before, after in zip(saved_before, outputs[0].grad_fn.saved_tensors, strict=True):
         assert torch.equal(before.view(torch.uint8), after.view(torch.uint8))
+
+
+@pytest.mark.filterwarnings("error:.*AccumulateGrad.*:UserWarning")
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("strategy", ["auto", "sequential", "tiled", "parallel", "fused"])
+@pytest.mark.parametrize("mode", ["backward", "forward_backward"])
+def test_public_graph_replay_matches_eager_without_mutating_live_graph(
+    triton_module, dtype, strategy, mode
+):
+    # Exercise automatic FUSED at its boundary and every explicit strategy at a tail.
+    shape = (16384, 2688) if strategy == "auto" else (65, 129)
+    selected = None if strategy == "auto" else triton_module.RMSNormWeightGradStrategy(strategy)
+    op = triton_module.TritonFusedAddRMSNormOp(weight_grad_strategy=selected)
+    inputs = _inputs(shape, (dtype, dtype, torch.float32), "cuda")
+    upstream = tuple(_rand(shape, seed, device="cuda") for seed in (190, 191))
+    eager_outputs = op(*inputs)
+    eager_grads = torch.autograd.grad(eager_outputs, inputs, upstream, retain_graph=True)
+    expected = eager_grads if mode == "backward" else eager_outputs + eager_grads
+    if strategy == "auto":
+        assert eager_outputs[0].grad_fn.weight_grad_strategy == (
+            triton_module.RMSNormWeightGradStrategy.FUSED
+        )
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        # Fresh leaves isolate AccumulateGrad stream metadata from the live eager graph.
+        leaves = tuple(value.detach().requires_grad_(True) for value in inputs)
+        prebuilt = op(*leaves) if mode == "backward" else None
+
+        def call():
+            outputs = prebuilt if prebuilt is not None else op(*leaves)
+            gradients = torch.autograd.grad(
+                outputs, leaves, upstream, retain_graph=prebuilt is not None
+            )
+            return gradients if mode == "backward" else outputs + gradients
+
+        for _ in range(3):
+            call()
+    stream.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        captured = call()
+    torch.cuda.current_stream().wait_stream(stream)
+    for _ in range(2):
+        graph.replay()
+        torch.cuda.synchronize()
+        for actual, reference in zip(captured, expected, strict=True):
+            assert actual.shape == reference.shape and actual.dtype == reference.dtype
+            assert torch.equal(actual.view(torch.uint8), reference.view(torch.uint8))
+
+    repeated = torch.autograd.grad(eager_outputs, inputs, upstream)
+    for actual, reference in zip(repeated, eager_grads, strict=True):
+        assert torch.equal(actual.view(torch.uint8), reference.view(torch.uint8))
 
 
 @pytest.mark.parametrize("platform", ["cpu", "musa", "npu"])

@@ -44,11 +44,12 @@ def policy(monkeypatch):
         (33, "tiled", (64, 64, 8)),
         (8193, "tiled", (64, 64, 8)),
         (16383, "tiled", (64, 64, 8)),
-        (16384, "parallel", (512, 64, 4)),
-        (16385, "parallel", (512, 64, 4)),
-        (65536, "parallel", (512, 64, 4)),
-        (65537, "parallel", (512, 64, 4)),
-        (2**31 + 1, "parallel", (512, 64, 4)),
+        (16384, "fused", (64, 64, 4)),
+        (16385, "fused", (64, 64, 4)),
+        (32768, "fused", (64, 64, 4)),
+        (65536, "fused", (64, 64, 4)),
+        (65537, "fused", (64, 64, 4)),
+        (2**31 + 1, "fused", (64, 64, 4)),
     ],
 )
 def test_model_width_boundaries_and_large_row_fallback(policy, dtype, rows, strategy, config):
@@ -59,9 +60,9 @@ def test_model_width_boundaries_and_large_row_fallback(policy, dtype, rows, stra
     assert (plan.config.block_rows, plan.config.block_cols, plan.config.num_warps) == config
 
 
-@pytest.mark.parametrize("width", [1, 129, 2687, 2689, 8193, 65536])
+@pytest.mark.parametrize("width", [1, 129, 2687, 2689, 4096, 8192, 8193, 65536])
 @pytest.mark.parametrize("rows", [16384, 65537])
-def test_other_widths_do_not_inherit_model_parallel_cutoff(policy, width, rows):
+def test_other_widths_do_not_inherit_model_fused_cutoff(policy, width, rows):
     plan = policy.select_rmsnorm_weight_grad_plan(("cuda", "other GPU"), torch.float32, rows, width)
     assert plan.strategy == policy.RMSNormWeightGradStrategy.TILED
     assert plan.config == policy.RMSNormWeightGradConfig(block_rows=64, block_cols=64, num_warps=8)
@@ -210,9 +211,8 @@ def test_resolved_plan_is_saved_per_autograd_call(policy, monkeypatch):
     )
 
 
-def test_fused_is_explicit_only_and_allocates_grouped_workspace(policy, monkeypatch):
+def test_fused_allocates_only_grouped_workspace(policy, monkeypatch):
     strategy = policy.RMSNormWeightGradStrategy.FUSED
-    assert all(plan.strategy != strategy for plan in policy.WEIGHT_GRAD_POLICY.values())
     plan = policy._resolve_weight_grad_plan(
         torch.device("cpu"), torch.bfloat16, 129, 7, strategy, None
     )

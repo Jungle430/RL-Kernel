@@ -8,12 +8,13 @@ Forward also saves one FP32 inverse_rms per row for backward.
 Launch one program per row, with a fixed power-of-two BLOCK_SIZE >= n_cols > 0,
 fixed num_warps, and enable_fp_fusion=False.
 
-Backward launches one program per row, reusing updated_residual and inverse_rms.
-It writes input gradients and FP32 weight-gradient contributions [rows, n_cols].
-A metadata policy chooses the weight reduction. SEQUENTIAL left-folds in row
+Backward reuses updated_residual and inverse_rms. The unfused strategies launch
+one program per row and write input gradients plus FP32 weight-gradient
+contributions [rows, n_cols]. A metadata policy chooses the strategy.
+SEQUENTIAL left-folds in row
 order. TILED uses row lanes within each program. PARALLEL partitions rows and merges
 FP32 partials in a second launch. The strategies have different addition orders.
-Experimental FUSED instead accumulates weight contributions while computing
+FUSED instead accumulates weight contributions while computing
 input gradients for a fixed group of rows, then merges [groups, n_cols] partials.
 It never allocates the full [rows, n_cols] contribution matrix.
 Both upstream gradient buffers are required; supply zeros for an unused output branch.
@@ -98,10 +99,11 @@ class RMSNormWeightGradKey:
 
 # Conservative defaults informed by H100 80 GB measurements, shared by other
 # devices until they acquire explicit entries. They are not proven optima for
-# every shape/device. The wide fallback stays TILED: D=8193 did not consistently
-# benefit from PARALLEL. D=2688 large-row extrapolation keeps PARALLEL beyond the
-# measured M=65536. All reductions read FP32 contributions, so dtype rules share
-# settings for now. No graph/eager detection changes the reduction order.
+# every shape/device. Only D=2688 and M>=16384 use grouped FUSED backward;
+# smaller/other widths keep the old rules. Groups of 64 retain most of the large-M
+# gain without another cutoff for the marginally faster 256-row configuration.
+# M>65536 is an explicit extrapolation. Dtypes share settings; graph/eager mode
+# never changes selection or reduction order.
 WEIGHT_GRAD_POLICY: dict[RMSNormWeightGradKey, RMSNormWeightGradPlan] = {
     RMSNormWeightGradKey("default", None, None, 0, 8): RMSNormWeightGradPlan(
         RMSNormWeightGradStrategy.SEQUENTIAL,
@@ -112,8 +114,8 @@ WEIGHT_GRAD_POLICY: dict[RMSNormWeightGradKey, RMSNormWeightGradPlan] = {
         RMSNormWeightGradConfig(block_rows=32, block_cols=64, num_warps=4),
     ),
     RMSNormWeightGradKey("default", None, 2688, 16384, None): RMSNormWeightGradPlan(
-        RMSNormWeightGradStrategy.PARALLEL,
-        RMSNormWeightGradConfig(block_rows=512, block_cols=64, num_warps=4),
+        RMSNormWeightGradStrategy.FUSED,
+        RMSNormWeightGradConfig(block_rows=64, block_cols=64, num_warps=4),
     ),
     RMSNormWeightGradKey("default", None, None, 33, None): RMSNormWeightGradPlan(
         RMSNormWeightGradStrategy.TILED,
@@ -754,8 +756,9 @@ def _launch_fused_add_rmsnorm_bwd(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Return input-dtype gradients using the FP32 values saved by forward.
 
-    An unused output contributes zero. Automatic selection only changes the
-    final weight reduction, which casts once to the weight dtype.
+    An unused output contributes zero. Automatic selection changes how weight
+    contributions are accumulated, preserving the per-row input-gradient math.
+    The final reduction casts once to the weight dtype.
     No strategy guarantees that adding separately reduced microbatch gradients
     reproduces a single call bitwise.
     """
@@ -859,7 +862,7 @@ class TritonFusedAddRMSNormOp:
     that input's dtype. Noncontiguous tensors are copied to contiguous buffers.
     Normalization uses the FP32 residual sum without an intermediate downcast.
     weight_grad_strategy selects how backward accumulates weight gradients.
-    Experimental FUSED combines row backward and grouped weight accumulation,
+    FUSED combines row backward and grouped weight accumulation,
     keeping the row's fixed arithmetic and using a smaller partial workspace.
     None selects a conservative metadata-based strategy and configuration.
     An explicit strategy retains its original defaults; weight_grad_config
