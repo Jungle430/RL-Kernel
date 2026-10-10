@@ -257,7 +257,7 @@ def test_zero_residual_sum_has_finite_gradients(kernels):
     ],
 )
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
-def test_configured_reduction_overwrites_workspace_and_replays_in_graph(
+def test_configured_reduction_overwrites_output_and_replays_in_graph(
     kernels, strategy, block_rows, block_cols, num_warps, dtype
 ):
     _, module = kernels
@@ -273,10 +273,6 @@ def test_configured_reduction_overwrites_workspace_and_replays_in_graph(
     kwargs = dict(
         grad_weight_per_row=rows, grad_weight=actual, n_rows=n_rows, n_cols=n_cols, config=config
     )
-    partials = None
-    if strategy == "parallel":
-        partials = torch.full((34, n_cols), float("nan"), device="cuda")
-        kwargs["partials"] = partials
     launcher = module._WEIGHT_GRAD_LAUNCHERS[module.RMSNormWeightGradStrategy(strategy)]
     launcher(**kwargs)
     expected = rows.double().sum(dim=0)
@@ -286,12 +282,8 @@ def test_configured_reduction_overwrites_workspace_and_replays_in_graph(
     )
     first = actual.clone()
     actual.fill_(float("nan"))
-    if partials is not None:
-        partials.fill_(float("nan"))
     launcher(**kwargs)
     assert torch.equal(first.view(torch.uint8), actual.view(torch.uint8))
-    if partials is not None:
-        assert torch.isfinite(partials).all()
 
     torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()
@@ -299,8 +291,6 @@ def test_configured_reduction_overwrites_workspace_and_replays_in_graph(
         launcher(**kwargs)
     for _ in range(2):
         actual.fill_(float("nan"))
-        if partials is not None:
-            partials.fill_(float("nan"))
         graph.replay()
         assert torch.equal(first.view(torch.uint8), actual.view(torch.uint8))
     assert torch.isnan(buffer[n_cols:]).all()

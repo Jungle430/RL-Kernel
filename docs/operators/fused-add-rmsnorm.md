@@ -75,7 +75,7 @@ y, updated_residual = op(x, residual, weight, eps=1e-5)
 
 | Backend | Implementation | Status |
 | --- | --- | --- |
-| CUDA | `TritonFusedAddRMSNormOp` | preferred; kernel/configuration validation on H100 |
+| CUDA | `TritonFusedAddRMSNormOp` | preferred; automatic dispatch and operator regression validated on H100 |
 | ROCm | same Triton implementation via `torch.cuda` | preferred; validation pending |
 | PyTorch | `NativeFusedAddRMSNormOp` | CPU reference and fallback when Triton cannot load |
 
@@ -150,36 +150,17 @@ op = TritonFusedAddRMSNormOp(
 )
 ```
 
-### Tuning evidence
+### Policy rationale
 
-H100 sweeps compared all strategies, then checked the FUSED row boundaries with
-33 input cases and a separate nine-case reversed-order confirmation. All
-correctness, forward-consistency and Graph replay gates passed. Eager and Graph
-measurements were kept separate; noisy eager minima were not treated as stable
-cutoffs. The final boundary run's tests reported 836 passed / 5 skipped (two-GPU
-cases on a single-GPU server).
+H100 boundary and confirmation runs support FUSED 64 for large model-width
+inputs. Larger groups offered only marginal additional gains, while smaller-row
+and other-width results did not justify broader rules. Explicit configurations
+remain available for other hardware; detailed strategy comparisons belong in
+PR attachments rather than the routine benchmark.
 
-For `[65536, 2688]`, these are the means of two runs' eager **forward + backward**
-median latencies, in milliseconds:
-
-| Input dtype | PyTorch | Previous PARALLEL 512 | FUSED 64 | Latency reduction vs previous |
-| --- | ---: | ---: | ---: | ---: |
-| FP16 | 10.547 | 2.100 | 1.695 | 19.3% |
-| BF16 | 10.557 | 2.102 | 1.696 | 19.3% |
-| FP32 | 8.798 | 2.562 | 2.157 | 15.8% |
-
-FUSED 256 improved those FUSED 64 timings by only about 0.9–1.2%, so it remains
-an explicit option instead of adding another automatic cutoff. FUSED 16 at
-M = 8192 did not establish a stable eager advantage; the existing smaller-row
-rule remains. Other widths were not promoted: earlier BF16 measurements at
-D = 8192/8193 showed substantial regressions with FUSED 16.
-
-At `[65536, 2688]`, the full FP32 per-row contribution buffer is 672 MiB;
-FUSED 64 instead needs 10.5 MiB of grouped partials. These are calculated scratch
-sizes, not total peak allocation. The table above is tuning evidence from
-explicit configurations. Final public automatic-Op measurements use the
-benchmark below and must be reported separately. Raw tuning reports belong in
-PR attachments, not repository files.
+At `[65536, 2688]`, FUSED 64 replaces the 672 MiB FP32 per-row contribution buffer
+with 10.5 MiB of grouped partials. These are calculated scratch sizes, not total
+peak allocation.
 
 ## Correctness and training/inference consistency
 
@@ -232,8 +213,7 @@ uv run --no-sync python benchmarks/benchmark_fused_add_rmsnorm.py \
 ```
 
 `--modes` selects any of `forward`, `backward`, `forward_backward`; `--dry-run`
-prints the case plan without a GPU. Tuning sweeps and strategy-comparison CLI
-options have been removed from the routine benchmark.
+prints the case plan without a GPU.
 
 The shared `PerformanceProfiler` event timer measures 10 warmups / 50 repetitions
 by default. It records median latency, sample standard deviation and extra peak
@@ -254,6 +234,10 @@ Reports default to `reports/fused-add-rmsnorm/{report.md,results.json}` and are
 checkpointed after each comparison. `complete` becomes true only after the
 entire plan finishes. Attach results to the PR instead of committing them.
 
-The newly enabled automatic FUSED policy and simplified benchmark need a final
-H100 regression. ROCm validation, model cast-point alignment, and full-model /
-distributed validation remain separate work.
+The H100 regression passed forward/backward accuracy, training/inference byte
+equality, automatic-selection boundaries, and Graph replay. The final public
+benchmark completed 30 input cases / 90 comparisons, including the FUSED cutoff
+and other-width fallbacks. Single-GPU runs skip the noncurrent-device tests.
+Performance reports retain timing variation alongside medians; small advantages
+should not be treated as stable wins. ROCm validation, model cast-point alignment,
+and full-model / distributed validation remain separate work.

@@ -148,6 +148,7 @@ def test_only_one_input_requires_grad(implementation, trainable):
 
 
 @pytest.mark.parametrize("eps", [0.0, -1e-5, float("nan"), float("inf")])
+@pytest.mark.parametrize("implementation", ["native", "auto"], indirect=True)
 def test_invalid_epsilon(implementation, eps):
     op, device = implementation
     with pytest.raises(ValueError, match="eps"):
@@ -155,6 +156,7 @@ def test_invalid_epsilon(implementation, eps):
 
 
 @pytest.mark.parametrize("invalid_input", [0, 1, 2])
+@pytest.mark.parametrize("implementation", ["native", "auto"], indirect=True)
 def test_unsupported_input_dtype(implementation, invalid_input):
     op, device = implementation
     inputs = list(_inputs((3, 7), _DTYPES[0], device))
@@ -173,6 +175,7 @@ def test_unsupported_input_dtype(implementation, invalid_input):
         (((2, 7), (2, 7), (8,)), "weight"),
     ],
 )
+@pytest.mark.parametrize("implementation", ["native", "auto"], indirect=True)
 def test_invalid_shapes(implementation, shapes, match):
     op, device = implementation
     inputs = tuple(torch.zeros(shape, device=device) for shape in shapes)

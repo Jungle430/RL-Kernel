@@ -404,7 +404,7 @@ def _fused_add_rmsnorm_bwd_weight_tiled_kernel(
     BLOCK_SIZE: tl.constexpr,
     BLOCK_ROWS: tl.constexpr,
 ):
-    """Experiment: accumulate row tiles, then reduce the row lanes once.
+    """Accumulate row tiles, then reduce the row lanes once.
 
     Each program still owns distinct output columns; no atomics are used.
     Row lane k accumulates rows k, k + BLOCK_ROWS, ... in FP32. Reducing those
@@ -506,21 +506,18 @@ def _launch_fused_add_rmsnorm_bwd_weight_parallel(
     n_rows: int,
     n_cols: int,
     config: RMSNormWeightGradConfig | None = None,
-    partials: torch.Tensor | None = None,
 ) -> None:
     """Partition rows, then merge on the same stream using a fixed reduction layout.
 
-    Optional partials is an FP32 [max(1, ceil(rows / block_rows)), n_cols]
-    workspace on the input device. Microbenchmarks preallocate it; public calls
-    allocate it here. Every element is overwritten on every launch, including tails.
+    Allocate FP32 [max(1, ceil(rows / block_rows)), n_cols] partials on the input
+    device. Every element is overwritten on every launch, including tails.
     The split depends on the explicit configuration, never on SM count/occupancy.
     """
     config = config or _WEIGHT_GRAD_CONFIGS[RMSNormWeightGradStrategy.PARALLEL]
     n_partials = max(1, triton.cdiv(n_rows, config.block_rows))
-    if partials is None:
-        partials = torch.empty(
-            (n_partials, n_cols), device=grad_weight_per_row.device, dtype=torch.float32
-        )
+    partials = torch.empty(
+        (n_partials, n_cols), device=grad_weight_per_row.device, dtype=torch.float32
+    )
     col_blocks = triton.cdiv(n_cols, config.block_cols)
     _fused_add_rmsnorm_bwd_weight_partial_kernel[(col_blocks, n_partials)](
         grad_weight_per_row,
@@ -630,7 +627,7 @@ def _launch_backward_with_grouped_contributions(
     n_cols: int,
     plan: RMSNormWeightGradPlan,
 ) -> None:
-    """Experimental fused backward with only [ceil(M / group_rows), D] scratch."""
+    """Fused backward with only [ceil(M / group_rows), D] scratch."""
     config = plan.config
     n_groups = triton.cdiv(n_rows, config.block_rows)
     partials = torch.empty((n_groups, n_cols), device=updated_residual.device, dtype=torch.float32)

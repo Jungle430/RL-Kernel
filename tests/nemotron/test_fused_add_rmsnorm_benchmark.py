@@ -178,7 +178,7 @@ def test_report_preserves_completion_latency_and_configuration(benchmark, tmp_pa
     assert json.loads((tmp_path / "results.json").read_text()) == payload
     report = (tmp_path / "report.md").read_text()
     assert "Status: complete; 1/1 comparisons" in report
-    assert "fused (64/64/4) | forward_backward | 4.000000 | 1.000000 | 4.00x" in report
+    assert "fused | forward_backward | 4.000000 | 1.000000 | 4.00x" in report
     assert "No torch.compile or CUDA Graph timing" in report
     assert "Extra peak allocation excludes inputs and prebuilt graphs" in report
 

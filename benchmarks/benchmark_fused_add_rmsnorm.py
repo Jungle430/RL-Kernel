@@ -180,19 +180,15 @@ def _report(payload):
         "gradient tolerance is rtol=2e-5, atol=2e-5*sqrt(M). JSON records all error bounds "
         "and measured errors. This is operator validation, not full-model or microbatch parity.",
         "",
-        "| Input | Shape | Strategy (rows/cols/warps) | Mode | Native ms | Triton ms | "
+        "| Input | Shape | Triton strategy | Mode | Native ms | Triton ms | "
         "Speedup | Native extra MiB | Triton extra MiB |",
         "| --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: |",
     ]
     for result in payload["results"]:
         native, triton, selected = result["native"], result["triton"], result["triton_plan"]
         shape = "x".join(map(str, result["shape"]))
-        strategy = (
-            f"{selected['strategy']} "
-            f"({selected['block_rows']}/{selected['block_cols']}/{selected['num_warps']})"
-        )
         lines.append(
-            f"| {result['dtype']} | {shape} | {strategy} | {result['mode']} | "
+            f"| {result['dtype']} | {shape} | {selected['strategy']} | {result['mode']} | "
             f"{native['median_ms']:.6f} | {triton['median_ms']:.6f} | "
             f"{result['speedup']:.2f}x | {native['peak_extra_mib']:.2f} | "
             f"{triton['peak_extra_mib']:.2f} |"
