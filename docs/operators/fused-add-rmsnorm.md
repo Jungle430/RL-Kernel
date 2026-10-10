@@ -125,8 +125,9 @@ validation remains pending. Standard ROCm PyTorch uses the `cuda` device type.
   [Mamba's backward](https://github.com/state-spaces/mamba/blob/main/mamba_ssm/ops/triton/layer_norm.py),
   but groups use fixed row counts rather than the device's SM count, and the
   operator's FP32 outputs/saved statistics/cast points are retained. Large widths
-  can increase register pressure; GPU correctness and performance validation are
-  pending. FUSED is explicit-only and is not selected by the automatic policy.
+  can increase register pressure. H100 correctness/consistency gates passed,
+  but performance depends on width and row count; dispatch boundaries remain
+  under evaluation. FUSED is explicit-only and is not selected automatically.
 - `RMSNormWeightGradConfig` exposes `block_rows`, `block_cols` and `num_warps` for
   experiments. Settings are saved per autograd call; changing a reusable Op
   afterwards does not change a graph's backward. Forward and per-row backward
@@ -223,8 +224,8 @@ keeps SEQUENTIAL rather than attaching arbitrary settings to an automatic strate
 
 ### Experimental grouped backward comparison
 
-FUSED is not part of automatic selection while its GPU gates and performance are
-unverified. Run correctness first, then compare complete public calls:
+FUSED remains outside automatic selection until its useful dispatch ranges are
+validated. Run correctness first, then compare complete public calls:
 
 ```bash
 uv run --no-sync python -m pytest tests/nemotron/test_fused_add_rmsnorm*.py -q -rs -x && \
@@ -248,8 +249,56 @@ path before any timing starts for that case. Graph returns are checked again
 after timed replay. Reports record actual public peak allocation as well as
 calculated contribution/partial workspace sizes. The comparison also includes
 TILED/FUSED and PARALLEL/FUSED families; no measured winner is installed into
-the policy automatically. This is a new experiment, not covered by earlier H100
-results for the standalone reductions.
+the policy automatically.
+
+The grouped H100 run completed 826 tests (five two-GPU skips) and all 36 cases /
+1728 measurements. All training/inference, original row-path output/input-gradient,
+repeatability and graph replay checks passed. Different weight-gradient grouping
+orders passed tolerance checks; they are not claimed to be bitwise identical.
+At [65536, 2688], eager forward+backward with FUSED groups of 256 reduced latency
+relative to PARALLEL (512/64/4) by 20.3% / 20.4% / 16.6% for FP16 / BF16 / FP32.
+BF16 extra peak allocation fell from 2689.6 to 2018.9 MiB. Conversely, at
+[8192, 8192] and [8192, 8193], even the fastest tested FUSED configuration took
+about 3.3x and 3.4x the best tested old strategy's eager combined time. Small and
+medium eager measurements were often noisy; stable graph results alone cannot
+set eager dispatch thresholds. These measurements support a focused experiment,
+not a universal FUSED default.
+
+### Focused FUSED boundary validation
+
+```bash
+uv run --no-sync python benchmarks/benchmark_fused_add_rmsnorm.py \
+  --preset fused-boundary --fused-configs --public-graph \
+  --rounds 4 --warmup 10 --repeat 50 \
+  --output-dir reports/fused-rmsnorm-fused-boundary
+uv run --no-sync python benchmarks/benchmark_fused_add_rmsnorm.py \
+  --preset fused-confirm --fused-configs --public-graph --reverse-cases \
+  --rounds 4 --warmup 10 --repeat 50 \
+  --output-dir reports/fused-rmsnorm-fused-confirm
+```
+
+The main run has **33 cases / 924 measurements**. At D=2688 it measures
+M=4096, 8191/8192/8193, 16383/16384/16385, 32768 and 65536. Two additional shapes,
+[8192, 4096] and [16384, 4096], probe reuse at another width. The proposed
+8192/16384 cutoffs are hypotheses; they are not installed as selection rules.
+All three input dtypes use FP32 weights. Seven providers compare PyTorch,
+the existing automatic policy, TILED (64/64/8), PARALLEL (512/64/4), and FUSED
+groups of 16/64/256 with 64-column/four-warp merges.
+
+Only backward and forward+backward are timed, each in eager and graph mode.
+Forward accuracy and training/inference byte checks still run before timing,
+as do repeated backward, row invariance and original row-path comparisons.
+Forward timing spread is reported as unavailable, not as a successful timing
+control. `--modes` can explicitly select public timing scopes when using
+`--auto-only` or `--fused-configs`; it does not disable correctness gates.
+
+The separate confirmation process repeats M=8192/16384/65536 at D=2688 in
+reversed case order: **9 cases / 252 measurements**. Use both runs' individual
+rounds, eager/graph results and peak allocation to judge the candidate group
+sizes. A small numerical timing difference is not enough to justify another
+dispatch branch. `--rows`/`--cols` replace either sparse preset for a quick
+smoke; `--dry-run` shows the exact case count. Production kernels and the
+automatic policy remain unchanged during this experiment.
 
 ## Validation
 
@@ -351,9 +400,9 @@ with a **fixed explicit PARALLEL (512/64/4)** configuration was:
 | BF16 | 10.553 ms | 2.100 ms | 5.03x |
 | FP32 | 8.795 ms | 2.563 ms | 3.43x |
 
-This is configuration evidence, not a performance measurement of the newly
-connected automatic wrapper. Automatic boundary tests and a short public
-benchmark remain the next GPU regression gate; a full sweep need not be repeated.
+This is explicit-configuration evidence. The subsequent grouped experiment also
+checks the automatic wrapper; FUSED selection boundaries are the next focused
+GPU regression gate. A full standalone-reduction sweep need not be repeated.
 
 ## Benchmark
 

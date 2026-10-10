@@ -236,6 +236,104 @@ def test_fused_plan_compares_public_paths_across_widths(benchmark, graph):
             benchmark._parse_args(["--fused-configs", incompatible])
 
 
+@pytest.mark.parametrize("graph", [False, True])
+def test_fused_boundary_plan_limits_scopes_and_covers_cutoffs(benchmark, graph):
+    options = ["--preset", "fused-boundary", "--fused-configs"]
+    if graph:
+        options.append("--public-graph")
+    args = benchmark._parse_args(options)
+    assert args.modes == ["backward", "forward_backward"]
+    assert benchmark._case_plan(args) == {
+        "case_count": 33,
+        "reduction_config_count": 0,
+        "measurement_count": 924 if graph else 462,
+    }
+    shapes = {tuple(shape) for shape in args.shapes}
+    for cutoff in (8192, 16384):
+        assert {(cutoff - 1, 2688), (cutoff, 2688), (cutoff + 1, 2688)} <= shapes
+    assert {(4096, 2688), (32768, 2688), (65536, 2688)} <= shapes
+    assert {shape for shape in shapes if shape[1] != 2688} == {(8192, 4096), (16384, 4096)}
+    specs = benchmark._public_fused_specs(args)
+    assert len(specs) == 5
+    assert {s["strategy"] for s in specs} == {"tiled", "parallel", "fused"}
+    assert {s["block_rows"] for s in specs if s["strategy"] == "fused"} == {16, 64, 256}
+
+    # Overrides replace the sparse preset instead of retaining the expensive cases.
+    smoke = benchmark._parse_args(options + ["--rows", "33", "--cols", "129", "--dtypes", "bf16"])
+    assert smoke.shapes == [[33, 129]]
+    assert benchmark._case_plan(smoke)["measurement_count"] == (28 if graph else 14)
+
+
+def test_fused_confirmation_is_a_reversed_subset_of_boundary_cases(benchmark):
+    full = benchmark._parse_args(["--preset", "fused-boundary", "--fused-configs"])
+    options = ["--preset", "fused-confirm", "--fused-configs", "--public-graph"]
+    args = benchmark._parse_args(options)
+    assert benchmark._case_plan(args) == {
+        "case_count": 9,
+        "reduction_config_count": 0,
+        "measurement_count": 252,
+    }
+    assert args.shapes == [[8192, 2688], [16384, 2688], [65536, 2688]]
+    assert set(benchmark._cases(args)) <= set(benchmark._cases(full))
+    reverse = benchmark._parse_args(options + ["--reverse-cases"])
+    assert benchmark._cases(reverse) == benchmark._cases(args)[::-1]
+
+
+@pytest.mark.parametrize("preset", ["fused-boundary", "fused-confirm"])
+def test_focused_presets_require_public_fused_comparison(benchmark, preset):
+    for incompatible in ([], ["--auto-only"], ["--sweep-configs"]):
+        with pytest.raises(SystemExit):
+            benchmark._parse_args(["--preset", preset, *incompatible])
+
+
+@pytest.mark.parametrize("configs,providers", [("--auto-only", 2), ("--fused-configs", 8)])
+def test_public_modes_override_deduplicates_and_counts(benchmark, configs, providers):
+    args = benchmark._parse_args(
+        [
+            configs,
+            "--rows",
+            "33",
+            "--cols",
+            "129",
+            "--dtypes",
+            "bf16",
+            "--public-graph",
+            "--modes",
+            "backward",
+            "backward",
+        ]
+    )
+    assert args.modes == ["backward"]
+    assert benchmark._case_plan(args)["measurement_count"] == providers * 2
+    with pytest.raises(SystemExit):
+        benchmark._parse_args(["--modes", "backward"])
+
+
+def test_boundary_report_does_not_claim_unmeasured_forward_timing(benchmark):
+    args = benchmark._parse_args(["--preset", "fused-boundary", "--fused-configs"])
+    payload = dict(
+        complete=False,
+        environment=dict(gpu="test", torch="test", triton="test"),
+        config=vars(args),
+        case_plan=benchmark._case_plan(args),
+        results=[],
+        diagnostics=[
+            dict(
+                input_dtype="bf16",
+                shape=[8192, 2688],
+                same_forward_spread=None,
+                selections={
+                    "auto": dict(strategy="tiled", block_rows=64, block_cols=64, num_warps=8)
+                },
+            )
+        ],
+    )
+    report = benchmark._report(payload)
+    assert "Forward timing omitted; forward correctness gates still ran." in report
+    assert "Identical-forward timing spread" not in report
+    assert "Neither preset installs a FUSED selection rule" in report
+
+
 def _comparison_record(strategy, medians, *, mode="forward_backward", timing="eager"):
     return dict(
         provider=strategy,
@@ -658,7 +756,8 @@ def test_auto_benchmark_runs_only_public_providers_and_verifies_graphs(
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA or ROCm GPU required")
 @pytest.mark.filterwarnings("error:.*AccumulateGrad.*:UserWarning")
 @pytest.mark.parametrize("graph", [False, True])
-def test_fused_benchmark_checks_all_candidates_before_timing(benchmark, monkeypatch, graph):
+@pytest.mark.parametrize("preset", ["model", "fused-boundary"])
+def test_fused_benchmark_checks_all_candidates_before_timing(benchmark, monkeypatch, graph, preset):
     triton = pytest.importorskip("triton")
     if not hasattr(triton, "jit"):
         pytest.skip("A working Triton runtime is required")
@@ -669,6 +768,8 @@ def test_fused_benchmark_checks_all_candidates_before_timing(benchmark, monkeypa
 
     monkeypatch.setattr(benchmark, "_prepare_reducers", no_reducers)
     options = [
+        "--preset",
+        preset,
         "--fused-configs",
         "--rounds",
         "1",
@@ -683,9 +784,14 @@ def test_fused_benchmark_checks_all_candidates_before_timing(benchmark, monkeypa
         options.append("--public-graph")
     args = benchmark._parse_args(options)
     records, _, diagnostic = benchmark._run_case(args, module, 257, 129, "bf16")
-    assert len(records) == (48 if graph else 24)
-    assert {r["mode"] for r in records} == {"forward", "backward", "forward_backward"}
-    assert len({r["provider"] for r in records}) == 8
+    focused = preset == "fused-boundary"
+    expected_eager = 14 if focused else 24
+    assert len(records) == expected_eager * (2 if graph else 1)
+    modes = {"backward", "forward_backward"}
+    assert {r["mode"] for r in records} == (modes if focused else modes | {"forward"})
+    assert len({r["provider"] for r in records}) == (7 if focused else 8)
+    if focused:
+        assert diagnostic["same_forward_spread"] is None
     for r in records:
         assert r["train_inference_bitwise"]
         if r["provider"] != "native":

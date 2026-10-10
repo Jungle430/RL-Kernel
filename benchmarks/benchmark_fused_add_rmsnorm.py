@@ -14,6 +14,9 @@ These sweeps collect tuning evidence. --auto-only instead compares the public
 automatic policy with PyTorch, skipping all isolated reduction experiments.
 --fused-configs compares grouped fused backward with the existing public paths;
 all correctness/bitwise gates finish before timing, and no isolated sum is timed.
+--preset fused-boundary narrows that experiment to prospective row cutoffs;
+fused-confirm repeats three anchors in a separate run. Both omit sequential
+timing and default to backward/combined scopes without changing dispatch.
 """
 
 import argparse
@@ -30,6 +33,7 @@ from pathlib import Path
 import torch
 
 _DTYPES = {"fp16": torch.float16, "bf16": torch.bfloat16, "fp32": torch.float32}
+_PUBLIC_MODES = ("forward", "backward", "forward_backward")
 _DEFAULT_CONFIGS = {
     "sequential": (1, 128, 4),
     "tiled": (32, 128, 4),
@@ -157,6 +161,17 @@ _FUSED_SHAPES = (
     (1024, 8193),
     (8192, 8193),
 )
+# Prospective crossovers, not production rules. Check both sides and exact
+# boundaries, including incomplete row groups. D=4096 gets two reuse probes;
+# the already-slow 8192/8193 widths are not swept again.
+_FUSED_BOUNDARY_ROWS = (4096, 8191, 8192, 8193, 16383, 16384, 16385, 32768, 65536)
+_FUSED_FOCUSED_PRESETS = ("fused-boundary", "fused-confirm")
+_FUSED_PRESET_SHAPES = {
+    "fused": _FUSED_SHAPES,
+    "fused-boundary": tuple((rows, 2688) for rows in _FUSED_BOUNDARY_ROWS)
+    + ((8192, 4096), (16384, 4096)),
+    "fused-confirm": ((8192, 2688), (16384, 2688), (65536, 2688)),
+}
 
 
 def _fused_comparison_specs():
@@ -170,6 +185,15 @@ def _fused_comparison_specs():
         )
         for strategy, rows, cols, warps in _FUSED_COMPARISON_CONFIGS
     ]
+
+
+def _public_fused_specs(args):
+    specs = _fused_comparison_specs()
+    if args.preset in _FUSED_FOCUSED_PRESETS:
+        # SEQUENTIAL is only useful at small M; keep auto and the two measured
+        # large-M controls, along with every candidate FUSED group length.
+        specs = [spec for spec in specs if spec["strategy"] != "sequential"]
+    return specs
 
 
 def _positive_int(value):
@@ -518,7 +542,7 @@ def _run_case(args, module, n_rows, n_cols, dtype_name):
         # Drop isolated workspaces before measuring public peak allocation.
         del reducers, reduced, per_row, updated, inverse_rms, fn, first
     if args.fused_configs:
-        public_specs = _fused_comparison_specs()
+        public_specs = _public_fused_specs(args)
     providers = {"native": native}
     provider_meta = {"native": {}}
     if args.auto_only or args.fused_configs:
@@ -537,7 +561,7 @@ def _run_case(args, module, n_rows, n_cols, dtype_name):
             weight_grad_config=_config(module, spec),
         )
         provider_meta[spec["name"]] = dict(spec)
-    functions = {mode: {} for mode in ("forward", "backward", "forward_backward")}
+    functions = {mode: {} for mode in args.modes}
     row_reference = None
     for name, op in providers.items():
         outputs = op(*inputs)
@@ -614,9 +638,9 @@ def _run_case(args, module, n_rows, n_cols, dtype_name):
         def forward_backward(op=op):
             return torch.autograd.grad(op(*inputs), inputs, upstream)
 
-        functions["forward"][name] = forward
-        functions["backward"][name] = backward
-        functions["forward_backward"][name] = forward_backward
+        calls = dict(forward=forward, backward=backward, forward_backward=forward_backward)
+        for mode in functions:
+            functions[mode][name] = calls[mode]
     # Do not retain the correctness gate's extra gradient buffers during timing.
     if args.fused_configs:
         del row_reference, row_results, repeated
@@ -672,11 +696,12 @@ def _run_case(args, module, n_rows, n_cols, dtype_name):
         for r in records
         if r["mode"] == "forward" and r["timing"] == "eager" and r["provider"] != "native"
     ]
-    control_ratio = max(forward_times) / min(forward_times)
+    control_ratio = max(forward_times) / min(forward_times) if forward_times else None
     diagnostic = dict(
         **metadata,
         same_forward_spread=control_ratio,
-        timing_warning=control_ratio > 1.15 or any(r["round_spread"] > 1.15 for r in records),
+        timing_warning=(control_ratio is not None and control_ratio > 1.15)
+        or any(r["round_spread"] > 1.15 for r in records),
         selections=selections,
         unstable_measurements=[
             dict(
@@ -771,8 +796,8 @@ def _report(payload):
         "and timing mode. No torch.compile. Forward uses no_grad, backward reuses a graph, "
         "forward+backward builds a fresh graph. Weight reduction uses torch.sum as its baseline, "
         "identical FP32 inputs, and preallocated outputs/parallel workspaces.",
-        "With --public-graph, all measured public configurations also run forward, backward and "
-        "forward+backward under CUDA Graph replay. Autograd traversal/allocation decisions happen "
+        "With --public-graph, all selected public scopes also run under CUDA Graph replay. "
+        "Autograd traversal/allocation decisions happen "
         "during capture; replay measures captured GPU work. Captured returns must match an "
         "independent eager call bitwise, repeat bitwise, and pass reference checks after timing.",
         "",
@@ -797,6 +822,12 @@ def _report(payload):
         "outputs/input gradients bitwise and repeat all gradients bitwise. FUSED preserves "
         "four-warps row arithmetic. JSON records contribution/partial scratch separately from "
         "measured extra peak allocation. This experiment does not change automatic dispatch.",
+        "The fused-boundary/fused-confirm presets omit SEQUENTIAL timing and default to "
+        "backward plus forward+backward. Forward correctness, training/inference equality, "
+        "row invariance and repeatability gates still run for every provider. The boundary "
+        "preset probes M=8192/16384 and neighboring rows at D=2688, plus D=4096 reuse checks. "
+        "The confirm preset repeats three model-width anchors; use --reverse-cases in a "
+        "separate process. Neither preset installs a FUSED selection rule.",
         "",
         "| Input | Shape | Scope | Timing | Provider | Median ms | Speedup | "
         "Extra peak MiB | Partial workspace MiB | Round max/min |",
@@ -853,9 +884,13 @@ def _report(payload):
                 f"rows={selected['block_rows']}, cols={selected['block_cols']}, "
                 f"warps={selected['num_warps']}. "
                 + (
-                    f"Identical-forward timing spread {d['same_forward_spread']:.2f}x."
-                    if payload["config"].get("fused_configs")
-                    else "One Triton provider; no across-strategy identical-forward control."
+                    "Forward timing omitted; forward correctness gates still ran."
+                    if d["same_forward_spread"] is None
+                    else (
+                        f"Identical-forward timing spread {d['same_forward_spread']:.2f}x."
+                        if payload["config"].get("fused_configs")
+                        else "One Triton provider; no across-strategy identical-forward control."
+                    )
                 )
             )
         else:
@@ -890,10 +925,18 @@ def _save(payload, folder):
 
 def _parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--preset", choices=[*_PRESETS, "dispatch", "fused"], default="model")
+    parser.add_argument(
+        "--preset", choices=[*_PRESETS, "dispatch", *_FUSED_PRESET_SHAPES], default="model"
+    )
     parser.add_argument("--rows", nargs="+", type=_positive_int)
     parser.add_argument("--cols", nargs="+", type=_positive_int)
     parser.add_argument("--dtypes", nargs="+", choices=_DTYPES, default=list(_DTYPES))
+    parser.add_argument(
+        "--modes",
+        nargs="+",
+        choices=_PUBLIC_MODES,
+        help="Public scopes to time with --auto-only/--fused-configs; correctness always runs",
+    )
     configs = parser.add_mutually_exclusive_group()
     configs.add_argument("--sweep-configs", action="store_true")
     configs.add_argument(
@@ -934,20 +977,29 @@ def _parse_args(argv=None):
     parser.add_argument("--output-dir", type=Path, default=Path("reports/fused-add-rmsnorm"))
     parser.add_argument("--dry-run", action="store_true", help="Print the case plan without a GPU")
     args = parser.parse_args(argv)
+    if args.preset in _FUSED_FOCUSED_PRESETS and not args.fused_configs:
+        parser.error(f"--preset {args.preset} requires --fused-configs")
+    if args.modes is not None and not (args.auto_only or args.fused_configs):
+        parser.error("--modes requires --auto-only or --fused-configs")
+    default_modes = (
+        ("backward", "forward_backward") if args.preset in _FUSED_FOCUSED_PRESETS else _PUBLIC_MODES
+    )
+    args.modes = list(dict.fromkeys(args.modes or default_modes))
     if args.preset == "dispatch":
         rows, cols = _DISPATCH_ROWS, [2688]
-    elif args.preset == "fused":
-        rows, cols = [1, 32, 1024, 8192, 65536], [2688]
+    elif args.preset in _FUSED_PRESET_SHAPES:
+        rows = [m for m, d in _FUSED_PRESET_SHAPES[args.preset] if d == 2688]
+        cols = [2688]
     else:
         rows, cols = _PRESETS[args.preset]
     sparse_dispatch = args.preset == "dispatch" and args.rows is None and args.cols is None
-    sparse_fused = args.preset == "fused" and args.rows is None and args.cols is None
+    sparse_fused = args.preset in _FUSED_PRESET_SHAPES and args.rows is None and args.cols is None
     args.rows = list(dict.fromkeys(args.rows or rows))
     args.cols = list(dict.fromkeys(args.cols or cols))
     args.dtypes = list(dict.fromkeys(args.dtypes))
     shapes = list(itertools.product(args.rows, args.cols))
     if sparse_fused:
-        shapes = list(_FUSED_SHAPES)
+        shapes = list(_FUSED_PRESET_SHAPES[args.preset])
     if sparse_dispatch:
         # Cross all three dtypes with these exact pairs, not a large Cartesian
         # product of every row boundary with every synthetic feature width.
@@ -964,17 +1016,20 @@ def _cases(args):
 def _case_plan(args):
     count = len(_cases(args))
     if args.fused_configs:
-        public_providers = len(_fused_comparison_specs()) + 2  # Native and automatic controls.
+        public_providers = len(_public_fused_specs(args)) + 2  # Native and automatic controls.
         return dict(
             case_count=count,
             reduction_config_count=0,
-            measurement_count=count * public_providers * (6 if args.public_graph else 3),
+            measurement_count=count
+            * public_providers
+            * len(args.modes)
+            * (2 if args.public_graph else 1),
         )
     if args.auto_only:
         return dict(
             case_count=count,
             reduction_config_count=0,
-            measurement_count=count * (12 if args.public_graph else 6),
+            measurement_count=count * 2 * len(args.modes) * (2 if args.public_graph else 1),
         )
     reduction_providers = (
         len(_variants(args.sweep_configs, args.shortlist_configs, args.finalist_configs)) + 1
@@ -1049,8 +1104,10 @@ def main(argv=None):
         payload["diagnostics"].append(diagnostic)
         payload["elapsed_seconds"] = time.perf_counter() - started
         _save(payload, args.output_dir)
+        spread = diagnostic["same_forward_spread"]
+        forward_control = "not timed" if spread is None else f"{spread:.2f}x"
         print(
-            f"Same-forward spread: {diagnostic['same_forward_spread']:.2f}x; "
+            f"Same-forward spread: {forward_control}; "
             f"measurements with round spread > 15%: "
             f"{len(diagnostic['unstable_measurements'])}; "
             f"timing warning: {diagnostic['timing_warning']}; "
