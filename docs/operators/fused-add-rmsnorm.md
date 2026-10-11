@@ -257,8 +257,7 @@ entire plan finishes. Attach results to the PR instead of committing them.
 
 The H100 regression passed forward/backward accuracy, training/inference byte
 equality, automatic-selection boundaries, and Graph replay. The final public
-benchmark completed 30 input cases / 90 comparisons, including the FUSED cutoff
-and other-width fallbacks. Single-GPU runs skip the noncurrent-device tests.
+benchmark completed the default 15 input cases / 45 comparisons, including the
+FUSED cutoff. Single-GPU runs skip the noncurrent-device tests.
 Performance reports retain timing variation alongside medians; small advantages
-should not be treated as stable wins. ROCm validation, model cast-point alignment,
-and full-model / distributed validation remain separate work.
+should not be treated as stable wins. ROCm validation remains pending.
