@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
-# Copyright (c) 2026 RL-Kernel Contributors
+"""Compatibility import; the canonical module is loaded below."""
 
-from .softcapped_selected_logprob import NativeSoftcappedSelectedLogprobOp
+from importlib import import_module
 
-__all__ = ["NativeSoftcappedSelectedLogprobOp"]
+
+def __getattr__(name):
+    return getattr(import_module("rl_engine.reference.loss"), name)

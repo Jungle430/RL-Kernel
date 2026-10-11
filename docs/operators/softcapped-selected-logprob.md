@@ -1,7 +1,9 @@
 # Softcapped selected logprob
 
-Gemma's fixed-30 softcap followed by one selected-token log-probability per row
-([issue #415](https://github.com/RL-Align/RL-Kernel/issues/415)):
+A shared logprob operator that applies a fixed-30 softcap and returns one
+selected-token log-probability per row. It was introduced for Gemma
+([issue #415](https://github.com/RL-Align/RL-Kernel/issues/415)); the interface
+accepts any positive vocabulary width, with no model-topology dependency:
 
 $$
 s_{ij}=30\tanh(x_{ij}/30),\qquad
@@ -32,7 +34,7 @@ accepted; Triton copies them to contiguous storage. Inputs are not modified.
 Autograd supports first-order gradients. Native PyTorch supplies its own autograd.
 
 ```python
-from rl_engine.kernels.registry import kernel_registry
+from rl_engine.runtime.registry import kernel_registry
 
 op = kernel_registry.get_op("softcapped_selected_logprob", device=logits.device)
 selected_logprob = op(logits, token_ids)
@@ -73,7 +75,7 @@ training/rollout, tensor-parallel or cross-device equivalence.
 ## Automatic strategy selection
 
 ```python
-from rl_engine.kernels.ops.triton.loss import (
+from rl_engine.backends.shared.triton.logprob.softcapped_selected_logprob import (
     SoftcappedLogprobStrategy,
     TritonSoftcappedSelectedLogprobOp,
 )
@@ -83,8 +85,8 @@ row_op = TritonSoftcappedSelectedLogprobOp(forward_impl=SoftcappedLogprobStrateg
 parallel_op = TritonSoftcappedSelectedLogprobOp(forward_impl=SoftcappedLogprobStrategy.PARALLEL)
 ```
 
-The static map and selector live in the
-[operator file](https://github.com/RL-Align/RL-Kernel/blob/2c1ec09fc7a3ce438da62549ea50c18c9b1a50cd/rl_engine/kernels/ops/triton/loss/softcapped_selected_logprob.py).
+The static map and selector live alongside the shared Triton implementation in
+`rl_engine/backends/shared/triton/logprob/softcapped_selected_logprob.py`.
 `ForwardConfigKey` records device identity, dtype, inclusive minimum/maximum row
 counts and an **exact** vocabulary size. Lookup checks device-specific entries,
 then `default`, then falls back to ROW. Unlisted widths or row counts outside
@@ -118,20 +120,25 @@ would require resolving its different numerical results.
 
 ```bash
 uv sync --extra dev
-uv run --no-sync python -m pytest tests/gemma/test_softcapped_selected_logprob*.py -q -rs
-uv run --no-sync python scripts/check_operator.py --op softcapped_selected_logprob \
+uv run --no-sync python -m pytest \
+  tests/ops/logprob/test_softcapped_selected_logprob.py \
+  tests/backends/shared/triton/logprob/test_softcapped_selected_logprob_config.py \
+  tests/runtime/test_softcapped_selected_logprob_registry.py \
+  tests/validation/operators/test_softcapped_selected_logprob_harness.py \
+  tests/benchmarks/test_softcapped_selected_logprob_benchmark.py -q -rs
+uv run --no-sync python tools/validation/operators/check_operator.py --op softcapped_selected_logprob \
   --candidate triton --device cuda --dtype bf16 --batch 2 --seq 16 --vocab 262144
 
 # Inspect the benchmark plan without a GPU.
-uv run --no-sync python benchmarks/benchmark_softcapped_selected_logprob.py --list-cases
+uv run --no-sync python benchmarks/operators/logprob/benchmark_softcapped_selected_logprob.py --list-cases
 
 # Small GPU smoke run, covering all three timing modes.
-uv run --no-sync python benchmarks/benchmark_softcapped_selected_logprob.py \
+uv run --no-sync python benchmarks/operators/logprob/benchmark_softcapped_selected_logprob.py \
   --dtypes bf16 --shapes 3x1025 --warmup 1 --repeat 2 \
   --output-dir reports/softcapped-selected-logprob/smoke
 
 # Default comparison; --shapes, --dtypes and --modes can narrow or extend it.
-uv run --no-sync python benchmarks/benchmark_softcapped_selected_logprob.py \
+uv run --no-sync python benchmarks/operators/logprob/benchmark_softcapped_selected_logprob.py \
   --output-dir reports/softcapped-selected-logprob
 ```
 
