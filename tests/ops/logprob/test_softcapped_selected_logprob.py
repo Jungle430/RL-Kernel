@@ -353,8 +353,9 @@ def test_softcap_range_depends_on_vocabulary(operator_impl):
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="A CUDA or ROCm GPU is required")
 @pytest.mark.parametrize("softcap", (17.3, 50.0))
 @pytest.mark.parametrize("dtype", _DTYPES)
-def test_configurable_softcap_auto_switch_preserves_bits(softcap, dtype):
-    """M=17 uses ROW, while the first 16 rows use PARALLEL at V=32767."""
+def test_configurable_softcap_auto_switch_preserves_bits(softcap, dtype, monkeypatch, request):
+    """Exercise a batch-dependent switch with different caps and a small allocation."""
+    from rl_engine.backends.shared.triton.logprob import softcapped_selected_logprob as module
     from rl_engine.backends.shared.triton.logprob.softcapped_selected_logprob import (
         SoftcappedLogprobStrategy,
         TritonSoftcappedSelectedLogprobOp,
@@ -362,6 +363,22 @@ def test_configurable_softcap_auto_switch_preserves_bits(softcap, dtype):
         softcapped_logprob_device_key,
     )
 
+    select_softcapped_logprob_strategy.cache_clear()
+    request.addfinalizer(select_softcapped_logprob_strategy.cache_clear)
+    monkeypatch.setattr(
+        module,
+        "FORWARD_STRATEGY_CONFIGS",
+        {
+            module.ForwardConfigKey(
+                device=module._DEFAULT_DEVICE,
+                dtype=dtype,
+                min_rows=1,
+                max_rows=16,
+                min_tiles=32,
+                max_tiles=None,
+            ): SoftcappedLogprobStrategy.PARALLEL,
+        },
+    )
     generator = torch.Generator().manual_seed(438)
     logits = (torch.randn((17, 32767), generator=generator) * softcap).to("cuda", dtype)
     ids = torch.arange(17, device="cuda") * 1025
@@ -762,8 +779,19 @@ def _evaluate_triton_with_statistics(op, logits, token_ids, upstream):
 
 
 @pytest.mark.parametrize("dtype", _DTYPES)
-@pytest.mark.parametrize("shape", [(0, 7), (4, 262144), (16, 49152), (64, 32768), (256, 65536)])
-def test_triton_auto_matches_explicit_row_and_inference(dtype, shape):
+@pytest.mark.parametrize(
+    "shape,softcap",
+    [
+        ((0, 7), 30.0),
+        ((4, 262144), 30.0),
+        ((16, 49152), 30.0),
+        ((64, 32768), 30.0),
+        ((256, 65536), 30.0),
+        ((8, 202048), 20.0),
+        ((2, 2097153), 30.0),
+    ],
+)
+def test_triton_auto_matches_explicit_row_and_inference(dtype, shape, softcap):
     if not torch.cuda.is_available():
         pytest.skip("A CUDA or ROCm GPU is required")
     from rl_engine.backends.shared.triton.logprob.softcapped_selected_logprob import (
@@ -775,9 +803,12 @@ def test_triton_auto_matches_explicit_row_and_inference(dtype, shape):
     logits = (torch.randn(shape, generator=generator) * 30).to(device="cuda", dtype=dtype)
     ids = torch.arange(shape[0], device="cuda", dtype=torch.int64) * 1025 % shape[1]
     upstream = torch.randn(shape[0], generator=generator).to(device="cuda")
-    op = TritonSoftcappedSelectedLogprobOp(forward_impl=None)
+    op = partial(TritonSoftcappedSelectedLogprobOp(forward_impl=None), softcap=softcap)
     reference = _evaluate_triton_with_statistics(
-        TritonSoftcappedSelectedLogprobOp(forward_impl=SoftcappedLogprobStrategy.ROW),
+        partial(
+            TritonSoftcappedSelectedLogprobOp(forward_impl=SoftcappedLogprobStrategy.ROW),
+            softcap=softcap,
+        ),
         logits,
         ids,
         upstream,
@@ -814,7 +845,12 @@ def test_triton_auto_batch_split_switches_strategy_without_changing_bits(
         "FORWARD_STRATEGY_CONFIGS",
         {
             module.ForwardConfigKey(
-                "default", dtype, 3, 1024, 262144
+                device=module._DEFAULT_DEVICE,
+                dtype=dtype,
+                min_rows=3,
+                max_rows=1024,
+                min_tiles=256,
+                max_tiles=256,
             ): SoftcappedLogprobStrategy.PARALLEL,
         },
     )
@@ -854,7 +890,7 @@ def test_triton_auto_batch_split_switches_strategy_without_changing_bits(
 
 
 @pytest.mark.parametrize("dtype", _DTYPES)
-@pytest.mark.parametrize("vocab", (32768, 262143, 262144, 262145, 1048577))
+@pytest.mark.parametrize("vocab", (31745, 32768, 32769))
 def test_triton_production_range_boundary_preserves_output_statistics_and_gradients(dtype, vocab):
     if not torch.cuda.is_available():
         pytest.skip("A CUDA or ROCm GPU is required")
@@ -865,14 +901,8 @@ def test_triton_production_range_boundary_preserves_output_statistics_and_gradie
         softcapped_logprob_device_key,
     )
 
-    max_rows = {
-        32768: 2049,
-        262143: 1026,
-        262144: 2049 if dtype == torch.float32 else 4096,
-        262145: 1026,
-        1048577: 16,
-    }[vocab]
-    # Allocate on the GPU directly: inputs use at most about 2 GiB here.
+    max_rows = 4096
+    # Allocate on the GPU directly: inputs use at most about 513 MiB here.
     # Compare each chunk in place rather than concatenating full-sized gradients.
     generator = torch.Generator(device="cuda").manual_seed(431)
     n_rows = max_rows + 1

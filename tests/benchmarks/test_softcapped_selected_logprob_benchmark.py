@@ -63,6 +63,50 @@ def test_benchmark_rejects_cpu():
         run_benchmark(args)
 
 
+@pytest.mark.parametrize("deviation", (None, 0.1))
+def test_forward_comparison_rotates_providers_and_keeps_round_samples(monkeypatch, deviation):
+    """Every provider takes each timing position once, even for one-sample timing."""
+    order = []
+    received_caps = []
+
+    def workload(op, logits, ids, upstream, mode, *, softcap):
+        assert mode == "forward"
+        received_caps.append(softcap)
+        return op
+
+    def measure(profiler, op):
+        order.append(op)
+        return {"median_ms": float(len(order)), "std_ms": deviation, "peak_extra_mib": 2.0}
+
+    monkeypatch.setattr(benchmark, "_make_workload", workload)
+    monkeypatch.setattr(benchmark, "_measure", measure)
+    providers = [(name, name) for name in ("native", "triton", "row", "parallel")]
+    result = benchmark._measure_forward_comparison(None, providers, None, None, None, softcap=20.0)
+    assert order == [
+        "native",
+        "triton",
+        "row",
+        "parallel",
+        "triton",
+        "row",
+        "parallel",
+        "native",
+        "row",
+        "parallel",
+        "native",
+        "triton",
+        "parallel",
+        "native",
+        "triton",
+        "row",
+    ]
+    assert received_caps == [20.0] * 16
+    assert result["native"]["median_ms"] == 9.5
+    for measurement in result.values():
+        assert len(measurement["rounds"]) == 4
+        assert measurement["std_ms"] == deviation
+
+
 def test_benchmark_entry_point_runs_outside_checkout(tmp_path):
     """The relocated script must find the shared profiler and canonical reference."""
     root = Path(__file__).resolve().parents[2]
@@ -83,6 +127,8 @@ def test_benchmark_entry_point_runs_outside_checkout(tmp_path):
     assert plan["softcap"] == 30.0
     assert plan["case_count"] == 15
     assert plan["measurement_count"] == 45
+    assert not plan["compare_forward_strategies"]
+    assert plan["forward_timing_rounds"] == 1
     assert not (tmp_path / "reports").exists()
 
 
@@ -137,6 +183,7 @@ def test_list_cases_needs_no_gpu_or_report_files(monkeypatch, capsys, tmp_path):
         [
             "benchmark",
             "--list-cases",
+            "--compare-strategies",
             "--softcap",
             "50",
             "--dtypes",
@@ -161,10 +208,13 @@ def test_list_cases_needs_no_gpu_or_report_files(monkeypatch, capsys, tmp_path):
     assert plan["shapes"] == [[1, 1025], [16, 262144]]
     assert plan["case_count"] == plan["measurement_count"] == 2
     assert plan["modes"] == ["forward"]
+    assert plan["compare_forward_strategies"]
+    assert plan["forward_timing_rounds"] == 4
     assert not output_dir.exists()
 
 
-def test_report_preserves_incomplete_status_and_slowdowns(tmp_path):
+@pytest.mark.parametrize("compare_strategies", (False, True))
+def test_report_preserves_incomplete_status_and_slowdowns(tmp_path, compare_strategies):
     measurement = {"median_ms": 2.0, "std_ms": 0.1, "peak_extra_mib": 1.0}
     report = {
         "environment": {
@@ -192,6 +242,12 @@ def test_report_preserves_incomplete_status_and_slowdowns(tmp_path):
             }
         ],
     }
+    if compare_strategies:
+        report["results"][0]["strategy_comparison"] = {
+            "row": measurement,
+            "parallel": dict(measurement, median_ms=1.0),
+            "auto_over_best_explicit": 2.0,
+        }
     benchmark._write_report(report, tmp_path)
     saved = json.loads((tmp_path / "results.json").read_text())
     assert saved == report
@@ -201,6 +257,11 @@ def test_report_preserves_incomplete_status_and_slowdowns(tmp_path):
     assert "Softcap: 50.0" in markdown
     assert "automatic strategy selection" in markdown
     assert "no torch.compile or CUDA Graph capture" in markdown
+    if compare_strategies:
+        assert "Forward dispatch check" in markdown
+        assert "2.000x" in markdown
+    else:
+        assert "Forward dispatch check" not in markdown
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="A CUDA or ROCm GPU is required")
@@ -236,3 +297,40 @@ def test_public_auto_benchmark_gpu_smoke(tmp_path, dtype, softcap):
         assert row["native"]["std_ms"] is not None
         assert row["triton"]["std_ms"] is not None
         assert set(row["accuracy"]) == {"output", "gradient"}
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="A CUDA or ROCm GPU is required")
+@pytest.mark.parametrize("dtype", ("fp16", "bf16", "fp32"))
+def test_forward_strategy_comparison_gpu_smoke(tmp_path, dtype):
+    args = build_arg_parser().parse_args(
+        [
+            "--compare-strategies",
+            "--softcap",
+            "20",
+            "--dtypes",
+            dtype,
+            "--shapes",
+            "2x31745",
+            "--warmup",
+            "1",
+            "--repeat",
+            "1",
+            "--output-dir",
+            str(tmp_path),
+        ]
+    )
+    report = run_benchmark(args)
+    assert report["complete"] and len(report["results"]) == 3
+    for row in report["results"]:
+        assert row["triton_strategy"] == "parallel"
+        if row["mode"] != "forward":
+            assert "strategy_comparison" not in row
+            continue
+        comparison = row["strategy_comparison"]
+        assert comparison["auto_over_best_explicit"] > 0
+        for name in ("row", "parallel"):
+            assert set(comparison["accuracy"][name]) == {"output", "gradient"}
+            assert len(comparison[name]["rounds"]) == 4
+            assert comparison[name]["std_ms"] is None
+        assert len(row["triton"]["rounds"]) == len(row["native"]["rounds"]) == 4
+    assert json.loads((tmp_path / "results.json").read_text()) == report

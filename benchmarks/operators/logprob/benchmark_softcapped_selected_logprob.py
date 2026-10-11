@@ -8,6 +8,7 @@ import argparse
 import json
 import math
 import platform
+import statistics
 import subprocess
 import sys
 from datetime import datetime, timezone
@@ -120,6 +121,8 @@ def _case_plan(args):
         "modes": args.modes,
         "case_count": len(args.dtypes) * len(args.shapes),
         "measurement_count": len(args.dtypes) * len(args.shapes) * len(args.modes),
+        "compare_forward_strategies": args.compare_strategies,
+        "forward_timing_rounds": 4 if args.compare_strategies else 1,
     }
 
 
@@ -137,6 +140,29 @@ def _measure(profiler, fn):
     profiler._sync()
     peak = torch.cuda.max_memory_allocated(profiler.device) - baseline
     return {"median_ms": median_ms, "std_ms": std_ms, "peak_extra_mib": peak / 1024**2}
+
+
+def _measure_forward_comparison(profiler, providers, logits, ids, upstream, *, softcap):
+    """Rotate four public providers over four rounds, including a warm AUTO selector.
+
+    Every provider occupies each timing position once. Report the median of
+    round medians and keep individual samples for checking timing variation.
+    """
+    samples = {name: [] for name, _ in providers}
+    for start in range(len(providers)):
+        for name, op in providers[start:] + providers[:start]:
+            fn = _make_workload(op, logits, ids, upstream, "forward", softcap=softcap)
+            samples[name].append(_measure(profiler, fn))
+    measurements = {}
+    for name, rounds in samples.items():
+        deviations = [sample["std_ms"] for sample in rounds if sample["std_ms"] is not None]
+        measurements[name] = {
+            "median_ms": statistics.median(sample["median_ms"] for sample in rounds),
+            "std_ms": max(deviations) if deviations else None,
+            "peak_extra_mib": max(sample["peak_extra_mib"] for sample in rounds),
+            "rounds": rounds,
+        }
+    return measurements
 
 
 def _command_output(command):
@@ -227,6 +253,35 @@ def _markdown(report):
             f"{triton['median_ms']:.6f} | {row['speedup']:.2f}x | "
             f"{native['peak_extra_mib']:.2f} | {triton['peak_extra_mib']:.2f} |"
         )
+    comparisons = [row for row in report["results"] if "strategy_comparison" in row]
+    if comparisons:
+        lines.extend(
+            [
+                "",
+                "## Forward dispatch check",
+                "",
+                "Four rounds rotate PyTorch, AUTO, explicit ROW and explicit PARALLEL. "
+                "Values are medians of round medians; JSON retains every round, its sample "
+                "standard deviation and peak allocation. Aggregate std_ms is the maximum "
+                "within-round deviation, not a confidence interval. All providers pass "
+                "reference output/gradient checks before timing.",
+                "AUTO / best explicit compares public-call latency, including AUTO dispatch; "
+                "values above 1 expose overhead or a slower choice. Near ties need repeated "
+                "measurements; this check does not automatically rewrite the policy.",
+                "",
+                "| Input | Shape | AUTO choice | ROW ms | PARALLEL ms | AUTO ms | "
+                "AUTO / best explicit |",
+                "| --- | --- | --- | ---: | ---: | ---: | ---: |",
+            ]
+        )
+        for row in comparisons:
+            comparison = row["strategy_comparison"]
+            lines.append(
+                f"| {row['dtype']} | {'x'.join(map(str, row['shape']))} | "
+                f"{row['triton_strategy']} | {comparison['row']['median_ms']:.6f} | "
+                f"{comparison['parallel']['median_ms']:.6f} | {row['triton']['median_ms']:.6f} | "
+                f"{comparison['auto_over_best_explicit']:.3f}x |"
+            )
     return "\n".join(lines) + "\n"
 
 
@@ -242,6 +297,11 @@ def build_arg_parser():
     parser.add_argument("--warmup", type=_positive_int, default=10)
     parser.add_argument("--repeat", type=_positive_int, default=50)
     parser.add_argument("--seed", type=int, default=415)
+    parser.add_argument(
+        "--compare-strategies",
+        action="store_true",
+        help="Add explicit ROW/PARALLEL to forward timing, using four rotated rounds",
+    )
     parser.add_argument(
         "--list-cases", action="store_true", help="Print the plan without a GPU run"
     )
@@ -262,6 +322,7 @@ def run_benchmark(args):
 
     from rl_engine.backends.shared.triton.logprob.softcapped_selected_logprob import (
         _BLOCK_V,
+        SoftcappedLogprobStrategy,
         TritonSoftcappedSelectedLogprobOp,
         select_softcapped_logprob_strategy,
         softcapped_logprob_device_key,
@@ -271,6 +332,12 @@ def run_benchmark(args):
         profiler = PerformanceProfiler(device=device, warmup=args.warmup, repeat=args.repeat)
         native = NativeSoftcappedSelectedLogprobOp()
         candidate = TritonSoftcappedSelectedLogprobOp()
+        explicit = []
+        if args.compare_strategies and "forward" in args.modes:
+            explicit = [
+                (strategy.value, TritonSoftcappedSelectedLogprobOp(forward_impl=strategy))
+                for strategy in (SoftcappedLogprobStrategy.ROW, SoftcappedLogprobStrategy.PARALLEL)
+            ]
         env = _environment(device, args, triton.__version__, _BLOCK_V, profiler.gpu_info)
         report = {
             "environment": env,
@@ -293,26 +360,53 @@ def run_benchmark(args):
                 accuracy = _check_accuracy(
                     native, candidate, logits, ids, upstream, softcap=args.softcap
                 )
+                explicit_accuracy = {
+                    name: _check_accuracy(native, op, logits, ids, upstream, softcap=args.softcap)
+                    for name, op in explicit
+                }
                 # Descriptive metadata only: the timed Op still selects its strategy itself.
                 strategy = select_softcapped_logprob_strategy(
                     softcapped_logprob_device_key(logits.device), logits.dtype, *shape
                 ).value
                 for mode in args.modes:
                     measurements = {}
-                    for name, op in (("native", native), ("triton", candidate)):
-                        fn = _make_workload(op, logits, ids, upstream, mode, softcap=args.softcap)
-                        measurements[name] = _measure(profiler, fn)
-                        del fn  # Free the retained graph before measuring the next backend.
+                    if explicit and mode == "forward":
+                        measurements = _measure_forward_comparison(
+                            profiler,
+                            [("native", native), ("triton", candidate), *explicit],
+                            logits,
+                            ids,
+                            upstream,
+                            softcap=args.softcap,
+                        )
+                    else:
+                        for name, op in (("native", native), ("triton", candidate)):
+                            fn = _make_workload(
+                                op, logits, ids, upstream, mode, softcap=args.softcap
+                            )
+                            measurements[name] = _measure(profiler, fn)
+                            del fn  # Free the retained graph before the next backend.
                     row = {
                         "dtype": dtype_name,
                         "shape": list(shape),
                         "mode": mode,
                         "triton_strategy": strategy,
                         "accuracy": accuracy,
-                        **measurements,
+                        "native": measurements["native"],
+                        "triton": measurements["triton"],
                         "speedup": measurements["native"]["median_ms"]
                         / measurements["triton"]["median_ms"],
                     }
+                    if explicit and mode == "forward":
+                        row["strategy_comparison"] = {
+                            name: measurements[name] for name, _ in explicit
+                        }
+                        row["strategy_comparison"]["accuracy"] = explicit_accuracy
+                        row["strategy_comparison"]["auto_over_best_explicit"] = measurements[
+                            "triton"
+                        ]["median_ms"] / min(
+                            measurements[name]["median_ms"] for name, _ in explicit
+                        )
                     report["results"].append(row)
                     # Retain completed cases on interruption; disk I/O is outside timing.
                     _write_report(report, args.output_dir)

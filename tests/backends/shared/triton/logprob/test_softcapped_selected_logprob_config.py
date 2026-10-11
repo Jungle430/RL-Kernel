@@ -14,28 +14,12 @@ ROW = "row"
 PARALLEL = "parallel"
 _DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 
-# Representative policy boundaries, including dtype-dependent choices and tails.
+# Include both ends of a tile, unseen interior widths, model widths and values
+# beyond the old measured maximum. Expected choices are independent of the map.
 _RANGE_CASES = [
-    (dtype, vocab, max_rows)
+    (dtype, vocab, 4096)
     for dtype in _DTYPES
-    for vocab, max_rows in (
-        (32767, 16),
-        (32768, 2049),
-        (32769, 1024),
-        (49152, 2048),
-        (262143, 1026),
-        (262145, 1026),
-        (524288, 2048),
-        (1048576, 1024),
-        (1048577, 16),
-    )
-] + [
-    (torch.float16, 262144, 4096),
-    (torch.bfloat16, 262144, 4096),
-    (torch.float32, 262144, 2049),
-    (torch.float16, 131072, 4096),
-    (torch.bfloat16, 131072, 2048),
-    (torch.float32, 131072, 2048),
+    for vocab in (31745, 32767, 32768, 32769, 49151, 128256, 202048, 262145, 2097153)
 ]
 
 
@@ -143,7 +127,12 @@ def test_auto_policy_excludes_explicit_experiments(config):
 def test_default_range_includes_boundaries_and_interior(config, dtype, vocab, max_rows):
     for rows in (1, 2, max_rows // 2, max_rows - 1, max_rows):
         assert (
-            config.select_softcapped_logprob_strategy(("cuda", "NVIDIA H100"), dtype, rows, vocab)
+            config.select_softcapped_logprob_strategy(
+                config.SoftcappedLogprobDevice(backend="cuda", gpu_name="NVIDIA H100"),
+                dtype,
+                rows,
+                vocab,
+            )
             == PARALLEL
         )
 
@@ -152,7 +141,12 @@ def test_default_range_includes_boundaries_and_interior(config, dtype, vocab, ma
 def test_rows_outside_default_range_use_row(config, dtype, vocab, max_rows):
     for rows in (0, max_rows + 1, max_rows * 2, 1 << 40):
         assert (
-            config.select_softcapped_logprob_strategy(("cuda", "NVIDIA H100"), dtype, rows, vocab)
+            config.select_softcapped_logprob_strategy(
+                config.SoftcappedLogprobDevice(backend="cuda", gpu_name="NVIDIA H100"),
+                dtype,
+                rows,
+                vocab,
+            )
             == ROW
         )
 
@@ -162,27 +156,37 @@ def test_rows_outside_default_range_use_row(config, dtype, vocab, max_rows):
     "rows,vocab",
     (
         (16384, 262144),  # Rows above the configured maximum.
-        (16, 2097152),  # Vocabulary above the configured maximum.
-        (32768, 2097152),  # Both above the configured maximum.
+        (16, 31744),  # Last width below the minimum tile count.
+        (32768, 2097152),  # Large vocabulary still respects the row limit.
         (1 << 40, 1 << 40),  # Metadata only: no allocation or integer truncation.
     ),
 )
 def test_all_out_of_map_dimensions_have_an_explicit_final_default(config, dtype, rows, vocab):
     assert config.DEFAULT_FORWARD_STRATEGY is config.SoftcappedLogprobStrategy.ROW
     assert (
-        config.select_softcapped_logprob_strategy(("cuda", "NVIDIA H100"), dtype, rows, vocab)
+        config.select_softcapped_logprob_strategy(
+            config.SoftcappedLogprobDevice(backend="cuda", gpu_name="NVIDIA H100"),
+            dtype,
+            rows,
+            vocab,
+        )
         is config.DEFAULT_FORWARD_STRATEGY
     )
 
 
 def test_final_default_is_configurable_without_overriding_matched_rules(config, monkeypatch):
-    key = ("cuda", "test GPU")
+    key = config.SoftcappedLogprobDevice(backend="cuda", gpu_name="test GPU")
     _install_configs(
         config,
         monkeypatch,
         {
             config.ForwardConfigKey(
-                "default", torch.bfloat16, 1, 1024, 262144
+                device=config._DEFAULT_DEVICE,
+                dtype=torch.bfloat16,
+                min_rows=1,
+                max_rows=1024,
+                min_tiles=256,
+                max_tiles=256,
             ): config.SoftcappedLogprobStrategy.ROW,
         },
     )
@@ -194,27 +198,47 @@ def test_final_default_is_configurable_without_overriding_matched_rules(config, 
     assert select(key, torch.bfloat16, 2048, 524288) == PARALLEL
 
 
-@pytest.mark.parametrize("vocab", (1025, 28672, 32766, 32770, 49151, 65534, 262141, 262147))
-def test_unmeasured_vocabulary_does_not_round_to_a_measured_neighbor(config, vocab):
+@pytest.mark.parametrize("vocab", (31745, 32766, 32770, 49151, 65534, 202048, 262147))
+def test_unmeasured_vocabulary_reuses_a_tile_range(config, vocab):
     assert (
-        config.select_softcapped_logprob_strategy(("cuda", "NVIDIA A40"), torch.bfloat16, 16, vocab)
-        == ROW
+        config.select_softcapped_logprob_strategy(
+            config.SoftcappedLogprobDevice(backend="cuda", gpu_name="NVIDIA A40"),
+            torch.bfloat16,
+            16,
+            vocab,
+        )
+        == PARALLEL
     )
+
+
+@pytest.mark.parametrize("dtype", _DTYPES)
+def test_tile_count_boundary_uses_ceiling_without_power_of_two_rounding(config, dtype):
+    select = config.select_softcapped_logprob_strategy
+    device = config.SoftcappedLogprobDevice(backend="cuda", gpu_name="test GPU")
+    # 31 full tiles -> ROW; adding one element creates the 32nd tile -> PARALLEL.
+    assert select(device, dtype, 16, 31744) == ROW
+    assert select(device, dtype, 16, 31745) == PARALLEL
+    # next_power_of_2 would incorrectly send this 17-tile width to PARALLEL.
+    assert select(device, dtype, 16, 16385) == ROW
 
 
 def test_dtype_must_match_an_entry(config):
     assert (
         config.select_softcapped_logprob_strategy(
-            ("cuda", "NVIDIA H100"), torch.float64, 16, 262144
+            config.SoftcappedLogprobDevice(backend="cuda", gpu_name="NVIDIA H100"),
+            torch.float64,
+            16,
+            262144,
         )
         == ROW
     )
 
 
 @pytest.mark.parametrize(
-    "device", [("cuda", "unlisted GPU"), ("rocm", "unlisted GPU"), ("xpu", "")]
+    "backend,gpu_name", [("cuda", "unlisted GPU"), ("rocm", "unlisted GPU"), ("xpu", "")]
 )
-def test_unlisted_devices_reuse_the_default_policy(config, device):
+def test_unlisted_devices_reuse_the_default_policy(config, backend, gpu_name):
+    device = config.SoftcappedLogprobDevice(backend=backend, gpu_name=gpu_name)
     for vocab in (32768, 49152, 65536, 262143, 262144, 262145, 1048576):
         assert (
             config.select_softcapped_logprob_strategy(device, torch.bfloat16, 16, vocab) == PARALLEL
@@ -227,51 +251,64 @@ def test_unlisted_devices_reuse_the_default_policy(config, device):
 @pytest.mark.parametrize("vocab", (512, 1024, 8192, 16384))
 def test_small_vocabularies_keep_row_even_when_rows_are_large(config, dtype, rows, vocab):
     assert (
-        config.select_softcapped_logprob_strategy(("cuda", "NVIDIA H100"), dtype, rows, vocab)
+        config.select_softcapped_logprob_strategy(
+            config.SoftcappedLogprobDevice(backend="cuda", gpu_name="NVIDIA H100"),
+            dtype,
+            rows,
+            vocab,
+        )
         == ROW
     )
 
 
 @pytest.mark.parametrize("dtype", _DTYPES)
-def test_neighbors_can_have_different_policy_at_the_same_row_count(config, dtype):
+def test_same_tile_neighbors_share_policy(config, dtype):
     select = config.select_softcapped_logprob_strategy
-    device = ("cuda", "NVIDIA H100")
-    assert select(device, dtype, 1024, 32767) == ROW
-    assert select(device, dtype, 1024, 32768) == PARALLEL
-    assert select(device, dtype, 1024, 32769) == PARALLEL
-
-
-def test_large_gemma_batches_distinguish_storage_precision(config):
-    select = config.select_softcapped_logprob_strategy
-    device = ("cuda", "NVIDIA H100")
-    for rows in (1025, 1026, 2048, 2049):
-        for dtype in _DTYPES:
-            assert select(device, dtype, rows, 262144) == PARALLEL
-    for rows in (3072, 4096):
-        assert select(device, torch.float16, rows, 262144) == PARALLEL
-        assert select(device, torch.bfloat16, rows, 262144) == PARALLEL
-        assert select(device, torch.float32, rows, 262144) == ROW
+    for vocab in (32767, 32768, 32769, 202048):
+        assert (
+            select(
+                config.SoftcappedLogprobDevice(backend="cuda", gpu_name="test GPU"),
+                dtype,
+                4096,
+                vocab,
+            )
+            == PARALLEL
+        )
+        assert (
+            select(
+                config.SoftcappedLogprobDevice(backend="cuda", gpu_name="test GPU"),
+                dtype,
+                4097,
+                vocab,
+            )
+            == ROW
+        )
 
 
 def test_production_ranges_are_valid_and_disjoint(config):
-    groups = {}
-    for key in config.FORWARD_STRATEGY_CONFIGS:
+    keys = list(config.FORWARD_STRATEGY_CONFIGS)
+    for index, key in enumerate(keys):
         assert 1 <= key.min_rows <= key.max_rows
-        assert key.vocab_size > 0
-        groups.setdefault((key.device_key, key.dtype, key.vocab_size), []).append(
-            (key.min_rows, key.max_rows)
-        )
-    for ranges in groups.values():
-        ordered = sorted(ranges)
-        assert all(left[1] < right[0] for left, right in zip(ordered, ordered[1:], strict=False))
+        assert key.min_tiles > 0
+        assert key.max_tiles is None or key.min_tiles <= key.max_tiles
+        for other in keys[:index]:
+            if (key.device, key.dtype) != (other.device, other.dtype):
+                continue
+            rows_overlap = key.min_rows <= other.max_rows and other.min_rows <= key.max_rows
+            tiles_overlap = (key.max_tiles is None or other.min_tiles <= key.max_tiles) and (
+                other.max_tiles is None or key.min_tiles <= other.max_tiles
+            )
+            assert not (rows_overlap and tiles_overlap)
 
 
 def test_device_override_precedes_default_without_hiding_other_default_entries(config, monkeypatch):
-    key = ("cuda", "test GPU")
+    key = config.SoftcappedLogprobDevice(backend="cuda", gpu_name="test GPU")
     entries = dict(config.FORWARD_STRATEGY_CONFIGS)
-    entries[config.ForwardConfigKey(key, torch.bfloat16, 8, 32, 262144)] = (
-        config.SoftcappedLogprobStrategy.ROW
-    )
+    entries[
+        config.ForwardConfigKey(
+            device=key, dtype=torch.bfloat16, min_rows=8, max_rows=32, min_tiles=256, max_tiles=256
+        )
+    ] = config.SoftcappedLogprobStrategy.ROW
     _install_configs(config, monkeypatch, entries)
     for rows in (8, 16, 32):
         assert config.select_softcapped_logprob_strategy(key, torch.bfloat16, rows, 262144) == ROW
@@ -282,21 +319,47 @@ def test_device_override_precedes_default_without_hiding_other_default_entries(c
     assert config.select_softcapped_logprob_strategy(key, torch.float16, 16, 262144) == PARALLEL
     # A model-name match alone must not select a CUDA-specific override on ROCm.
     assert (
-        config.select_softcapped_logprob_strategy(("rocm", "test GPU"), torch.bfloat16, 16, 262144)
+        config.select_softcapped_logprob_strategy(
+            config.SoftcappedLogprobDevice(backend="rocm", gpu_name="test GPU"),
+            torch.bfloat16,
+            16,
+            262144,
+        )
         == PARALLEL
     )
 
 
-@pytest.mark.parametrize("scope", ("default", ("cuda", "test GPU")))
+@pytest.mark.parametrize("device_specific", (False, True))
 @pytest.mark.parametrize("reverse_order", (False, True))
-def test_overlapping_ranges_at_the_same_precedence_fail(config, monkeypatch, scope, reverse_order):
+def test_overlapping_ranges_at_the_same_precedence_fail(
+    config, monkeypatch, device_specific, reverse_order
+):
+    scope = (
+        config.SoftcappedLogprobDevice(backend="cuda", gpu_name="test GPU")
+        if device_specific
+        else config._DEFAULT_DEVICE
+    )
     entries = [
         (
-            config.ForwardConfigKey(scope, torch.bfloat16, 1, 16, 262144),
+            config.ForwardConfigKey(
+                device=scope,
+                dtype=torch.bfloat16,
+                min_rows=1,
+                max_rows=16,
+                min_tiles=256,
+                max_tiles=256,
+            ),
             config.SoftcappedLogprobStrategy.ROW,
         ),
         (
-            config.ForwardConfigKey(scope, torch.bfloat16, 16, 32, 262144),
+            config.ForwardConfigKey(
+                device=scope,
+                dtype=torch.bfloat16,
+                min_rows=16,
+                max_rows=32,
+                min_tiles=256,
+                max_tiles=256,
+            ),
             config.SoftcappedLogprobStrategy.PARALLEL,
         ),
     ]
@@ -305,37 +368,161 @@ def test_overlapping_ranges_at_the_same_precedence_fail(config, monkeypatch, sco
     _install_configs(config, monkeypatch, dict(entries))
     # Inclusive endpoints mean both rules match row count 16.
     with pytest.raises(ValueError, match="overlapping forward strategy ranges"):
-        config.select_softcapped_logprob_strategy(("cuda", "test GPU"), torch.bfloat16, 16, 262144)
+        config.select_softcapped_logprob_strategy(
+            config.SoftcappedLogprobDevice(backend="cuda", gpu_name="test GPU"),
+            torch.bfloat16,
+            16,
+            262144,
+        )
     assert (
-        config.select_softcapped_logprob_strategy(("cuda", "test GPU"), torch.bfloat16, 15, 262144)
+        config.select_softcapped_logprob_strategy(
+            config.SoftcappedLogprobDevice(backend="cuda", gpu_name="test GPU"),
+            torch.bfloat16,
+            15,
+            262144,
+        )
         == ROW
     )
     assert (
-        config.select_softcapped_logprob_strategy(("cuda", "test GPU"), torch.bfloat16, 17, 262144)
+        config.select_softcapped_logprob_strategy(
+            config.SoftcappedLogprobDevice(backend="cuda", gpu_name="test GPU"),
+            torch.bfloat16,
+            17,
+            262144,
+        )
         == PARALLEL
     )
 
 
 def test_device_match_does_not_consult_ambiguous_default_ranges(config, monkeypatch):
-    device = ("cuda", "test GPU")
+    device = config.SoftcappedLogprobDevice(backend="cuda", gpu_name="test GPU")
     _install_configs(
         config,
         monkeypatch,
         {
             config.ForwardConfigKey(
-                "default", torch.bfloat16, 1, 32, 262144
+                device=config._DEFAULT_DEVICE,
+                dtype=torch.bfloat16,
+                min_rows=1,
+                max_rows=32,
+                min_tiles=256,
+                max_tiles=256,
             ): config.SoftcappedLogprobStrategy.ROW,
             config.ForwardConfigKey(
-                "default", torch.bfloat16, 16, 64, 262144
+                device=config._DEFAULT_DEVICE,
+                dtype=torch.bfloat16,
+                min_rows=16,
+                max_rows=64,
+                min_tiles=256,
+                max_tiles=256,
             ): config.SoftcappedLogprobStrategy.PARALLEL,
             config.ForwardConfigKey(
-                device, torch.bfloat16, 1, 64, 262144
+                device=device,
+                dtype=torch.bfloat16,
+                min_rows=1,
+                max_rows=64,
+                min_tiles=256,
+                max_tiles=256,
             ): config.SoftcappedLogprobStrategy.ROW,
         },
     )
     assert config.select_softcapped_logprob_strategy(device, torch.bfloat16, 16, 262144) == ROW
     with pytest.raises(ValueError, match="overlapping forward strategy ranges"):
-        config.select_softcapped_logprob_strategy(("rocm", "test GPU"), torch.bfloat16, 16, 262144)
+        config.select_softcapped_logprob_strategy(
+            config.SoftcappedLogprobDevice(backend="rocm", gpu_name="test GPU"),
+            torch.bfloat16,
+            16,
+            262144,
+        )
+
+
+def test_adjacent_tile_ranges_and_open_upper_bound(config, monkeypatch):
+    """Finite and unbounded rules can share rows when their tile ranges are disjoint."""
+    _install_configs(
+        config,
+        monkeypatch,
+        {
+            config.ForwardConfigKey(
+                device=config._DEFAULT_DEVICE,
+                dtype=torch.bfloat16,
+                min_rows=1,
+                max_rows=16,
+                min_tiles=32,
+                max_tiles=64,
+            ): config.SoftcappedLogprobStrategy.ROW,
+            config.ForwardConfigKey(
+                device=config._DEFAULT_DEVICE,
+                dtype=torch.bfloat16,
+                min_rows=1,
+                max_rows=16,
+                min_tiles=65,
+                max_tiles=None,
+            ): config.SoftcappedLogprobStrategy.PARALLEL,
+        },
+    )
+    select = config.select_softcapped_logprob_strategy
+    for vocab in (32767, 32768, 65535, 65536):
+        assert (
+            select(
+                config.SoftcappedLogprobDevice(backend="cuda", gpu_name="test GPU"),
+                torch.bfloat16,
+                16,
+                vocab,
+            )
+            == ROW
+        )
+    for vocab in (65537, 65538, 1 << 40):
+        assert (
+            select(
+                config.SoftcappedLogprobDevice(backend="cuda", gpu_name="test GPU"),
+                torch.bfloat16,
+                16,
+                vocab,
+            )
+            == PARALLEL
+        )
+        assert (
+            select(
+                config.SoftcappedLogprobDevice(backend="cuda", gpu_name="test GPU"),
+                torch.bfloat16,
+                17,
+                vocab,
+            )
+            == ROW
+        )
+
+
+@pytest.mark.parametrize("upper", (64, None))
+def test_overlapping_tile_ranges_fail_at_the_shared_endpoint(config, monkeypatch, upper):
+    _install_configs(
+        config,
+        monkeypatch,
+        {
+            config.ForwardConfigKey(
+                device=config._DEFAULT_DEVICE,
+                dtype=torch.bfloat16,
+                min_rows=1,
+                max_rows=16,
+                min_tiles=32,
+                max_tiles=upper,
+            ): config.SoftcappedLogprobStrategy.ROW,
+            config.ForwardConfigKey(
+                device=config._DEFAULT_DEVICE,
+                dtype=torch.bfloat16,
+                min_rows=1,
+                max_rows=16,
+                min_tiles=64,
+                max_tiles=None,
+            ): config.SoftcappedLogprobStrategy.PARALLEL,
+        },
+    )
+    with pytest.raises(ValueError, match="overlapping forward strategy ranges"):
+        config.select_softcapped_logprob_strategy(
+            config.SoftcappedLogprobDevice(backend="cuda", gpu_name="test GPU"),
+            torch.bfloat16,
+            16,
+            65536,
+        )
 
 
 def test_repeated_metadata_skips_configuration_matching(config, monkeypatch):
@@ -347,46 +534,87 @@ def test_repeated_metadata_skips_configuration_matching(config, monkeypatch):
             return super().items()
 
     _install_configs(config, monkeypatch, ObservedConfigs(config.FORWARD_STRATEGY_CONFIGS))
-    args = (("cuda", "test GPU"), torch.bfloat16, 17, 262144)
+    args = (
+        config.SoftcappedLogprobDevice(backend="cuda", gpu_name="test GPU"),
+        torch.bfloat16,
+        17,
+        262144,
+    )
     assert config.select_softcapped_logprob_strategy(*args) == PARALLEL
     first_scans = len(scans)
     assert first_scans > 0
-    assert config.select_softcapped_logprob_strategy(*args) == PARALLEL
+    # A newly constructed equivalent device must hit the same cached selection.
+    equivalent_device = config.SoftcappedLogprobDevice(backend="cuda", gpu_name="test GPU")
+    assert equivalent_device is not args[0]
+    assert config.select_softcapped_logprob_strategy(equivalent_device, *args[1:]) == PARALLEL
     assert len(scans) == first_scans
     assert config.select_softcapped_logprob_strategy.cache_info().hits == 1
 
 
 @pytest.mark.parametrize(
-    "different_metadata",
+    "backend,gpu_name,dtype,n_rows,vocab_size",
     [
-        (("cuda", "other GPU"), torch.bfloat16, 16, 262144),
-        (("cuda", "test GPU"), torch.float32, 16, 262144),
-        (("cuda", "test GPU"), torch.bfloat16, 1025, 262144),
-        (("cuda", "test GPU"), torch.bfloat16, 16, 262143),
+        ("cuda", "other GPU", torch.bfloat16, 16, 262144),
+        ("cuda", "test GPU", torch.float32, 16, 262144),
+        ("cuda", "test GPU", torch.bfloat16, 1025, 262144),
+        ("cuda", "test GPU", torch.bfloat16, 16, 262145),
     ],
 )
-def test_cache_distinguishes_each_metadata_field(config, monkeypatch, different_metadata):
+def test_cache_distinguishes_each_metadata_field(
+    config, monkeypatch, backend, gpu_name, dtype, n_rows, vocab_size
+):
     _install_configs(
         config,
         monkeypatch,
         {
             config.ForwardConfigKey(
-                "default", torch.bfloat16, 1, 1024, 262144
+                device=config._DEFAULT_DEVICE,
+                dtype=torch.bfloat16,
+                min_rows=1,
+                max_rows=1024,
+                min_tiles=256,
+                max_tiles=256,
             ): config.SoftcappedLogprobStrategy.PARALLEL,
             config.ForwardConfigKey(
-                ("cuda", "other GPU"), torch.bfloat16, 1, 1024, 262144
+                device=config.SoftcappedLogprobDevice(backend="cuda", gpu_name="other GPU"),
+                dtype=torch.bfloat16,
+                min_rows=1,
+                max_rows=1024,
+                min_tiles=256,
+                max_tiles=256,
             ): config.SoftcappedLogprobStrategy.ROW,
         },
     )
     select = config.select_softcapped_logprob_strategy
-    assert select(("cuda", "test GPU"), torch.bfloat16, 16, 262144) == PARALLEL
-    assert select(*different_metadata) == ROW
+    assert (
+        select(
+            config.SoftcappedLogprobDevice(backend="cuda", gpu_name="test GPU"),
+            torch.bfloat16,
+            16,
+            262144,
+        )
+        == PARALLEL
+    )
+    assert (
+        select(
+            config.SoftcappedLogprobDevice(backend=backend, gpu_name=gpu_name),
+            dtype,
+            n_rows,
+            vocab_size,
+        )
+        == ROW
+    )
     assert select.cache_info().misses == 2
 
 
 def test_clearing_cache_applies_a_replacement_policy(config, monkeypatch):
     select = config.select_softcapped_logprob_strategy
-    args = (("cuda", "test GPU"), torch.bfloat16, 16, 262144)
+    args = (
+        config.SoftcappedLogprobDevice(backend="cuda", gpu_name="test GPU"),
+        torch.bfloat16,
+        16,
+        262144,
+    )
     assert select(*args) == PARALLEL
     monkeypatch.setattr(config, "FORWARD_STRATEGY_CONFIGS", {})
     select.cache_clear()
@@ -394,7 +622,12 @@ def test_clearing_cache_applies_a_replacement_policy(config, monkeypatch):
 
 
 def test_selection_does_not_depend_on_grad_recording(config):
-    args = (("cuda", "NVIDIA H100"), torch.bfloat16, 513, 262144)
+    args = (
+        config.SoftcappedLogprobDevice(backend="cuda", gpu_name="NVIDIA H100"),
+        torch.bfloat16,
+        513,
+        262144,
+    )
     with torch.enable_grad():
         training = config.select_softcapped_logprob_strategy(*args)
     with torch.no_grad():
@@ -422,11 +655,19 @@ def test_device_lookup_uses_tensor_device_and_caches_each_gpu(
     monkeypatch.setattr(torch.version, "hip", None)
     monkeypatch.setattr(torch.cuda, "get_device_name", name)
     monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
-    assert config.softcapped_logprob_device_key(torch.device("cuda:1")) == ("cuda", "another GPU")
-    assert config.softcapped_logprob_device_key(torch.device("cuda:1")) == ("cuda", "another GPU")
-    assert config.softcapped_logprob_device_key(torch.device("cuda")) == ("cuda", "NVIDIA H100")
+    assert config.softcapped_logprob_device_key(
+        torch.device("cuda:1")
+    ) == config.SoftcappedLogprobDevice(backend="cuda", gpu_name="another GPU")
+    assert config.softcapped_logprob_device_key(
+        torch.device("cuda:1")
+    ) == config.SoftcappedLogprobDevice(backend="cuda", gpu_name="another GPU")
+    assert config.softcapped_logprob_device_key(
+        torch.device("cuda")
+    ) == config.SoftcappedLogprobDevice(backend="cuda", gpu_name="NVIDIA H100")
     monkeypatch.setattr(torch.cuda, "current_device", lambda: 1)
-    assert config.softcapped_logprob_device_key(torch.device("cuda")) == ("cuda", "another GPU")
+    assert config.softcapped_logprob_device_key(
+        torch.device("cuda")
+    ) == config.SoftcappedLogprobDevice(backend="cuda", gpu_name="another GPU")
     assert calls == [1, 0]
 
 
@@ -455,7 +696,9 @@ def test_rocm_uses_cuda_namespace_but_a_separate_config_key(
 ):
     monkeypatch.setattr(torch.version, "hip", "test HIP")
     monkeypatch.setattr(torch.cuda, "get_device_name", lambda index: "AMD test GPU")
-    assert config.softcapped_logprob_device_key(torch.device("cuda:2")) == ("rocm", "AMD test GPU")
+    assert config.softcapped_logprob_device_key(
+        torch.device("cuda:2")
+    ) == config.SoftcappedLogprobDevice(backend="rocm", gpu_name="AMD test GPU")
 
 
 def test_other_backends_do_not_query_cuda(config, monkeypatch):
@@ -464,4 +707,6 @@ def test_other_backends_do_not_query_cuda(config, monkeypatch):
 
     monkeypatch.setattr(torch.cuda, "get_device_name", unexpected_query)
     monkeypatch.setattr(torch.cuda, "current_device", unexpected_query)
-    assert config.softcapped_logprob_device_key(torch.device("xpu:1")) == ("xpu", "")
+    assert config.softcapped_logprob_device_key(
+        torch.device("xpu:1")
+    ) == config.SoftcappedLogprobDevice(backend="xpu", gpu_name="")
