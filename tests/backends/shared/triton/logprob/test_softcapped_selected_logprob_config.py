@@ -100,6 +100,20 @@ def config():
     yield softcapped_selected_logprob
 
 
+@pytest.mark.parametrize("softcap", (0.0, -1.0, float("nan"), float("inf"), 1e-50, 100.0))
+def test_softcap_rejects_unsafe_values(config, softcap):
+    with pytest.raises(ValueError, match="softcap"):
+        config._validate_softcap(softcap, 1)
+
+
+def test_softcap_range_depends_on_vocabulary(config):
+    for cap in (1.0, 17.3, 20.0, 30.0, 50.0):
+        config._validate_softcap(cap, 262144)
+    config._validate_softcap(80.0, 1)
+    with pytest.raises(ValueError, match="V=32768.*FP32 exp/sum range"):
+        config._validate_softcap(80.0, 32768)
+
+
 @pytest.fixture(autouse=True)
 def clear_strategy_cache(config):
     # A test may temporarily replace the map. Cached choices must not escape

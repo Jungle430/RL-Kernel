@@ -1,12 +1,13 @@
 # Softcapped selected logprob
 
-A shared logprob operator that applies a fixed-30 softcap and returns one
+A shared logprob operator that applies a configurable softcap and returns one
 selected-token log-probability per row. It was introduced for Gemma
 ([issue #415](https://github.com/RL-Align/RL-Kernel/issues/415)); the interface
-accepts any positive vocabulary width, with no model-topology dependency:
+has no model-topology dependency. The scalar `softcap` is denoted by $c$ below
+and defaults to `30.0`:
 
 $$
-s_{ij}=30\tanh(x_{ij}/30),\qquad
+s_{ij}=c\tanh(x_{ij}/c),\qquad
 \ell_i=s_{i,t_i}-\log\sum_j e^{s_{ij}}.
 $$
 
@@ -15,7 +16,7 @@ $p_{ij}=\exp(s_{ij}-\log\sum_k e^{s_{ik}})$:
 
 $$
 \frac{\partial L}{\partial x_{ij}}
-=g_i\bigl(\mathbf{1}_{j=t_i}-p_{ij}\bigr)\bigl(1-\tanh^2(x_{ij}/30)\bigr).
+=g_i\bigl(\mathbf{1}_{j=t_i}-p_{ij}\bigr)\bigl(1-\tanh^2(x_{ij}/c)\bigr).
 $$
 
 ## Interface and precision
@@ -24,6 +25,7 @@ $$
 | --- | --- | --- |
 | `logits` | `[M, V]`, `M >= 0`, `V > 0` | FP16 / BF16 / FP32 |
 | `token_ids` | `[M]`, values in `[0, V)` | int64, same device as logits |
+| `softcap` forward keyword argument | Scalar; default `30.0` | Positive real number; no gradient |
 | Output | `[M]` | FP32 |
 | Upstream gradient accepted by the backward launcher | `[M]` | FP16 / BF16 / FP32; computed in FP32 |
 | Input gradient | `[M, V]` | Same dtype as logits |
@@ -33,11 +35,41 @@ or token-masking argument. Noncontiguous inputs and upstream gradients are
 accepted; Triton copies them to contiguous storage. Inputs are not modified.
 Autograd supports first-order gradients. Native PyTorch supplies its own autograd.
 
+`softcap` is passed per call, independently of the strategy/tuning configuration.
+The same Op can serve calls with different caps. Each autograd invocation keeps
+its own cap for backward; the Op does not store or mutate this value.
+It must be finite and at least `torch.finfo(torch.float32).tiny`. Both
+implementations preserve the original direct `exp -> sum -> log` calculation.
+To avoid overflow or flushing every exponential in a negative saturated row to
+zero, they reject cap/vocabulary combinations unless
+`exp(-c) >= 2 * float32.tiny` and `V * exp(c) <= float32.max / 2`.
+The bounds are checked in log space, using only the scalar and shape metadata.
+For example, both `30` and `50` are accepted at `V=262144`; `100` is not.
+Supporting caps outside this range would require a stable, shifted reduction.
+
 ```python
 from rl_engine.runtime.registry import kernel_registry
 
 op = kernel_registry.get_op("softcapped_selected_logprob", device=logits.device)
 selected_logprob = op(logits, token_ids)
+selected_logprob_cap20 = op(logits, token_ids, softcap=20.0)
+```
+
+Omitting `softcap` uses `30.0`. Both registry-created and directly constructed
+Ops accept another cap at call time:
+
+```python
+from rl_engine.reference.logprob.softcapped_selected_logprob import (
+    NativeSoftcappedSelectedLogprobOp,
+)
+from rl_engine.backends.shared.triton.logprob.softcapped_selected_logprob import (
+    TritonSoftcappedSelectedLogprobOp,
+)
+
+reference = NativeSoftcappedSelectedLogprobOp()
+op = TritonSoftcappedSelectedLogprobOp()
+expected = reference(logits, token_ids, softcap=50.0)
+selected_logprob = op(logits, token_ids, softcap=50.0)
 ```
 
 The registry prefers Triton on CUDA/ROCm, falling back to native PyTorch if the
@@ -51,7 +83,9 @@ directly so they cannot silently measure a native fallback.
 
 All softcap, exponential, reduction and backward arithmetic uses FP32. Vocabulary
 tiles contain 1024 elements and use four warps, with FP fusion disabled. The
-vocabulary width is a compile-time constant; partial tiles are masked.
+vocabulary width and softcap are compile-time constants; partial tiles are masked.
+Different caps may compile separate kernels. The default `30.0` retains the
+original arithmetic and tile-reduction order.
 
 - `ROW`: one program processes each row, reducing each tile and accumulating
   its sum in ascending vocabulary order.
@@ -63,8 +97,10 @@ Both paths save one FP32 `log_sum_exp` per row (`4 * M` bytes) and use the same
 backward kernel. Backward processes disjoint row/vocabulary tiles, reusing the
 saved statistics without repeating the reduction. It casts gradients only on
 store. Neither path materializes a full softcapped or probability tensor.
-The fixed cap bounds scores to `[-30, 30]`, keeping the exponential sum in FP32
-range for Gemma's 262144-token vocabulary.
+The cap bounds scores to `[-c, c]`; host validation checks the FP32 range above.
+Autograd saves the cap used by each forward call, so later calls with a different
+cap do not change that graph's backward. Direct backward-launcher callers must
+pass the same cap used to compute the saved `log_sum_exp`.
 
 ROW and PARALLEL preserve the same arithmetic order so changing the strategy
 with batch size does not change the bits on the same tested device. Tests check
@@ -94,12 +130,13 @@ configured ranges remain supported; neither dimension is rounded or clamped.
 Overlapping rules within a scope raise an error. Device-query failures propagate.
 
 Selection is cached for 1024 exact metadata combinations. It does not depend on
-gradient mode, input values or runtime timing. GPU names are cached by backend
+softcap, gradient mode, input values or runtime timing. Caps reuse the same
+launch schedules. GPU names are cached by backend
 and device index. After changing the map or final fallback at runtime, call
 `select_softcapped_logprob_strategy.cache_clear()`.
 
 The default map is based on H100 80GB HBM3 measurements,
-with PyTorch 2.13.0+cu130 and Triton 3.7.1: 837 eager cases and 27 CUDA Graph
+with `softcap=30.0`, PyTorch 2.13.0+cu130 and Triton 3.7.1: 837 eager cases and 27 CUDA Graph
 checks. Range endpoints describe the measured evidence, not proven hardware
 crossovers; intermediate row counts are interpolated. For Gemma's `V=262144`,
 PARALLEL is selected for rows 1–4096 with FP16/BF16 and 1–2049 with FP32.
@@ -109,6 +146,8 @@ A separate automatic-policy check completed 39 eager and 12 CUDA Graph cases.
 All output/gradient accuracy and strategy bitwise checks passed; selection
 matched every conclusive ROW/PARALLEL winner under the per-round 5% criterion.
 This does not establish optimal performance for every shape or execution mode.
+The existing measurements also do not establish performance for other caps;
+use `--softcap` in the benchmark to measure those separately.
 
 Two explicit experimental strategies remain available: `ROW_PIPELINED` requests
 three loop stages with ROW arithmetic; `ROW_ACCUMULATE` accumulates a vector
@@ -140,12 +179,21 @@ uv run --no-sync python benchmarks/operators/logprob/benchmark_softcapped_select
 # Default comparison; --shapes, --dtypes and --modes can narrow or extend it.
 uv run --no-sync python benchmarks/operators/logprob/benchmark_softcapped_selected_logprob.py \
   --output-dir reports/softcapped-selected-logprob
+
+# Compare another model's cap with the same PyTorch reference and timing modes.
+uv run --no-sync python benchmarks/operators/logprob/benchmark_softcapped_selected_logprob.py \
+  --softcap 50 --output-dir reports/softcapped-selected-logprob-cap50
 ```
 
 Operator tests cover an independent FP64 reference, random upstream gradients,
 the shared `logprob` tolerance contract, batch/layout invariance, saved-tensor
 reuse, strategy boundaries and indexing guards. GPU tests skip on CPU hosts;
 a GPU host that cannot load Triton fails rather than silently skipping.
+Nondefault-cap cases cover reference outputs and gradients, all four strategies
+and automatic selection, training/inference equality, batch-split strategy
+changes, and two-GPU launches. The default reference is also compared bitwise
+against the original fixed-30 expression. These GPU checks must pass on the
+target hardware before extending the existing validation claims to new caps.
 
 The benchmark compares eager `NativeSoftcappedSelectedLogprobOp` with the public
 Triton automatic wrapper on the same CUDA/ROCm GPU. Defaults cover five shapes
@@ -162,7 +210,7 @@ preparation are outside timing. Timed wrappers include allocation and dispatch
 with a warm selector cache; small inputs can be affected by host launch gaps.
 
 JSON/Markdown reports record the selected strategy, median latency, speedup,
-extra peak allocation and the hardware/software environment. JSON also retains
+extra peak allocation, softcap and the hardware/software environment. JSON also retains
 sample standard deviations and accuracy errors. Extra allocation excludes
 inputs and prebuilt graphs. Cases are saved outside timing as they finish;
 interrupted reports remain marked `complete: false`. Speedup is native latency

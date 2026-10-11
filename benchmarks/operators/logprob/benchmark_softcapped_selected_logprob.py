@@ -37,6 +37,13 @@ def _positive_int(value: str) -> int:
     return number
 
 
+def _positive_float(value: str) -> float:
+    number = float(value)
+    if not math.isfinite(number) or number <= 0:
+        raise argparse.ArgumentTypeError("must be finite and positive")
+    return number
+
+
 def _shape(value: str) -> tuple[int, int]:
     try:
         rows, vocab = map(int, value.split("x"))
@@ -47,19 +54,19 @@ def _shape(value: str) -> tuple[int, int]:
         raise argparse.ArgumentTypeError("shape must be positive MxV, e.g. 16x262144") from exc
 
 
-def _make_workload(op, logits, token_ids, upstream, mode):
+def _make_workload(op, logits, token_ids, upstream, mode, *, softcap: float):
     """Prepare inputs/graphs outside timing; discard results without accumulating .grad."""
     if mode == "forward":
 
         @torch.no_grad()
         def forward():
-            op(logits, token_ids)
+            op(logits, token_ids, softcap=softcap)
 
         return forward
 
     leaf = logits.detach().requires_grad_(True)
     if mode == "backward":
-        output = op(leaf, token_ids)
+        output = op(leaf, token_ids, softcap=softcap)
 
         def backward():
             torch.autograd.grad(output, leaf, grad_outputs=upstream, retain_graph=True)
@@ -68,16 +75,16 @@ def _make_workload(op, logits, token_ids, upstream, mode):
     if mode == "forward_backward":
 
         def forward_backward():
-            torch.autograd.grad(op(leaf, token_ids), leaf, grad_outputs=upstream)
+            torch.autograd.grad(op(leaf, token_ids, softcap=softcap), leaf, grad_outputs=upstream)
 
         return forward_backward
     raise ValueError(f"unknown mode: {mode}")
 
 
-def _check_accuracy(native, candidate, logits, token_ids, upstream):
+def _check_accuracy(native, candidate, logits, token_ids, upstream, *, softcap: float):
     def evaluate(op):
         leaf = logits.detach().requires_grad_(True)
-        output = op(leaf, token_ids)
+        output = op(leaf, token_ids, softcap=softcap)
         gradient = torch.autograd.grad(output, leaf, grad_outputs=upstream)[0]
         return output.detach(), gradient
 
@@ -107,6 +114,7 @@ def _check_accuracy(native, candidate, logits, token_ids, upstream):
 
 def _case_plan(args):
     return {
+        "softcap": args.softcap,
         "dtypes": args.dtypes,
         "shapes": [list(shape) for shape in args.shapes],
         "modes": args.modes,
@@ -173,7 +181,7 @@ def _environment(device, args, triton_version, block_v, target: GPUTargetInfo):
             "median and sample standard deviation"
         ),
         "operator": "softcapped_selected_logprob",
-        "softcap": 30.0,
+        "softcap": args.softcap,
         "baseline": "eager NativeSoftcappedSelectedLogprobOp on the same GPU; no torch.compile",
         "candidate": "TritonSoftcappedSelectedLogprobOp with automatic forward selection",
         "cache_policy": "reused contiguous inputs, warm selector cache, no explicit eviction",
@@ -192,6 +200,7 @@ def _markdown(report):
         f"{env['backend']} runtime: {env['runtime']}.",
         f"Status: {'complete' if report['complete'] else 'incomplete'}; "
         f"{len(report['results'])}/{report['case_plan']['measurement_count']} measurements.",
+        f"Softcap: {env['softcap']}. "
         f"Warmup: {env['warmup']}; measured repetitions: {env['repeat']}; seed: {env['seed']}.",
         "",
         "Eager NativeSoftcappedSelectedLogprobOp vs TritonSoftcappedSelectedLogprobOp "
@@ -224,6 +233,7 @@ def _markdown(report):
 def build_arg_parser():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--device", default="cuda:0")
+    parser.add_argument("--softcap", type=_positive_float, default=30.0)
     parser.add_argument("--dtypes", nargs="+", choices=DTYPES, default=list(DTYPES))
     parser.add_argument(
         "--shapes", nargs="+", type=_shape, default=list(map(_shape, DEFAULT_SHAPES))
@@ -259,7 +269,8 @@ def run_benchmark(args):
 
     with torch.cuda.device(device):
         profiler = PerformanceProfiler(device=device, warmup=args.warmup, repeat=args.repeat)
-        native, candidate = NativeSoftcappedSelectedLogprobOp(), TritonSoftcappedSelectedLogprobOp()
+        native = NativeSoftcappedSelectedLogprobOp()
+        candidate = TritonSoftcappedSelectedLogprobOp()
         env = _environment(device, args, triton.__version__, _BLOCK_V, profiler.gpu_info)
         report = {
             "environment": env,
@@ -279,7 +290,9 @@ def run_benchmark(args):
                 upstream = torch.randn(
                     shape[0], device=device, generator=generator, dtype=torch.float32
                 )
-                accuracy = _check_accuracy(native, candidate, logits, ids, upstream)
+                accuracy = _check_accuracy(
+                    native, candidate, logits, ids, upstream, softcap=args.softcap
+                )
                 # Descriptive metadata only: the timed Op still selects its strategy itself.
                 strategy = select_softcapped_logprob_strategy(
                     softcapped_logprob_device_key(logits.device), logits.dtype, *shape
@@ -287,7 +300,7 @@ def run_benchmark(args):
                 for mode in args.modes:
                     measurements = {}
                     for name, op in (("native", native), ("triton", candidate)):
-                        fn = _make_workload(op, logits, ids, upstream, mode)
+                        fn = _make_workload(op, logits, ids, upstream, mode, softcap=args.softcap)
                         measurements[name] = _measure(profiler, fn)
                         del fn  # Free the retained graph before measuring the next backend.
                     row = {

@@ -24,25 +24,30 @@ from rl_engine.reference.logprob.softcapped_selected_logprob import (
 
 
 @pytest.mark.parametrize("mode", ("forward", "backward", "forward_backward"))
-def test_workload_timing_and_random_upstream(mode):
+@pytest.mark.parametrize("softcap", (1.0, 30.0))
+def test_workload_timing_and_random_upstream(mode, softcap):
     logits = torch.tensor([[1.0, 2.0, 3.0], [-1.0, 0.0, 1.0]])
     ids = torch.tensor([2, 0])
     upstream = torch.tensor([0.5, -2.0])
     native = NativeSoftcappedSelectedLogprobOp()
     gold_leaf = logits.clone().requires_grad_(True)
-    expected = torch.autograd.grad(native(gold_leaf, ids), gold_leaf, grad_outputs=upstream)[0]
-    calls, gradients = [], []
+    expected = torch.autograd.grad(
+        native(gold_leaf, ids, softcap=softcap), gold_leaf, grad_outputs=upstream
+    )[0]
+    calls, gradients, received_caps = [], [], []
 
-    def observed(leaf, token_ids):
+    def observed(leaf, token_ids, *, softcap):
         calls.append(torch.is_grad_enabled())
+        received_caps.append(softcap)
         if torch.is_grad_enabled() and len(calls) == 1:
             leaf.register_hook(lambda grad: gradients.append(grad.clone()))
-        return native(leaf, token_ids)
+        return native(leaf, token_ids, softcap=softcap)
 
-    fn = _make_workload(observed, logits, ids, upstream, mode)
+    fn = _make_workload(observed, logits, ids, upstream, mode, softcap=softcap)
     assert len(calls) == (1 if mode == "backward" else 0)
     assert fn() is None and fn() is None
     assert len(calls) == (1 if mode == "backward" else 2)
+    assert received_caps == [softcap] * len(calls)
     if mode == "forward":
         assert calls == [False, False] and not gradients
     else:
@@ -75,34 +80,49 @@ def test_benchmark_entry_point_runs_outside_checkout(tmp_path):
     )
     assert result.returncode == 0, result.stderr
     plan = json.loads(result.stdout)
+    assert plan["softcap"] == 30.0
     assert plan["case_count"] == 15
     assert plan["measurement_count"] == 45
     assert not (tmp_path / "reports").exists()
 
 
-def test_accuracy_gate_rejects_incorrect_gradient():
+@pytest.mark.parametrize("softcap", (1.0, 30.0))
+def test_accuracy_gate_rejects_incorrect_gradient(softcap):
     class WrongGradient(torch.autograd.Function):
         @staticmethod
-        def forward(ctx, logits, token_ids):
+        def forward(ctx, logits, token_ids, softcap):
             ctx.shape = logits.shape
-            return NativeSoftcappedSelectedLogprobOp()(logits, token_ids)
+            return NativeSoftcappedSelectedLogprobOp()(logits, token_ids, softcap=softcap)
 
         @staticmethod
         def backward(ctx, grad_output):
-            return torch.ones(ctx.shape, device=grad_output.device), None
+            return torch.ones(ctx.shape, device=grad_output.device), None, None
+
+    def candidate(logits, token_ids, *, softcap):
+        return WrongGradient.apply(logits, token_ids, softcap)
 
     with pytest.raises(AssertionError):
         _check_accuracy(
             NativeSoftcappedSelectedLogprobOp(),
-            WrongGradient.apply,
+            candidate,
             torch.tensor([[1.0, 2.0, 3.0], [-1.0, 0.0, 1.0]]),
             torch.tensor([2, 0]),
             torch.tensor([0.5, -2.0]),
+            softcap=softcap,
         )
 
 
 @pytest.mark.parametrize(
-    "arguments", [["--shapes", "0x10"], ["--shapes", "2x3x4"], ["--repeat", "0"]]
+    "arguments",
+    [
+        ["--shapes", "0x10"],
+        ["--shapes", "2x3x4"],
+        ["--repeat", "0"],
+        ["--softcap", "0"],
+        ["--softcap", "-1"],
+        ["--softcap", "nan"],
+        ["--softcap", "inf"],
+    ],
 )
 def test_benchmark_rejects_invalid_measurements(arguments):
     with pytest.raises(SystemExit):
@@ -117,6 +137,8 @@ def test_list_cases_needs_no_gpu_or_report_files(monkeypatch, capsys, tmp_path):
         [
             "benchmark",
             "--list-cases",
+            "--softcap",
+            "50",
             "--dtypes",
             "bf16",
             "--shapes",
@@ -135,6 +157,7 @@ def test_list_cases_needs_no_gpu_or_report_files(monkeypatch, capsys, tmp_path):
     monkeypatch.setattr(benchmark, "run_benchmark", unexpected_gpu_run)
     benchmark.main()
     plan = json.loads(capsys.readouterr().out)
+    assert plan["softcap"] == 50.0
     assert plan["shapes"] == [[1, 1025], [16, 262144]]
     assert plan["case_count"] == plan["measurement_count"] == 2
     assert plan["modes"] == ["forward"]
@@ -153,6 +176,7 @@ def test_report_preserves_incomplete_status_and_slowdowns(tmp_path):
             "warmup": 10,
             "repeat": 50,
             "seed": 415,
+            "softcap": 50.0,
         },
         "case_plan": {"measurement_count": 2},
         "complete": False,
@@ -174,15 +198,19 @@ def test_report_preserves_incomplete_status_and_slowdowns(tmp_path):
     markdown = (tmp_path / "report.md").read_text()
     assert "Status: incomplete; 1/2 measurements" in markdown
     assert "0.50x" in markdown and "| row |" in markdown
+    assert "Softcap: 50.0" in markdown
     assert "automatic strategy selection" in markdown
     assert "no torch.compile or CUDA Graph capture" in markdown
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="A CUDA or ROCm GPU is required")
 @pytest.mark.parametrize("dtype", ("fp16", "bf16", "fp32"))
-def test_public_auto_benchmark_gpu_smoke(tmp_path, dtype):
+@pytest.mark.parametrize("softcap", (30.0, 50.0))
+def test_public_auto_benchmark_gpu_smoke(tmp_path, dtype, softcap):
     args = build_arg_parser().parse_args(
         [
+            "--softcap",
+            str(softcap),
             "--dtypes",
             dtype,
             "--shapes",
@@ -196,6 +224,8 @@ def test_public_auto_benchmark_gpu_smoke(tmp_path, dtype):
         ]
     )
     report = run_benchmark(args)
+    assert report["environment"]["softcap"] == softcap
+    assert report["case_plan"]["softcap"] == softcap
     assert report["complete"]
     assert json.loads((tmp_path / "results.json").read_text()) == report
     assert {row["mode"] for row in report["results"]} == set(benchmark.MODES)

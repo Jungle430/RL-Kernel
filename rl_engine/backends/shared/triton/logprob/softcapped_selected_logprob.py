@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 RL-Kernel Contributors
-"""Shared Triton forward/backward cores for fixed-30 softcapped selected logprob.
+"""Shared Triton forward/backward cores for softcapped selected logprob.
 
 Automatic forward selects a row loop or a two-kernel parallel implementation
 using device, dtype, exact vocabulary width and bounded row-count ranges.
@@ -19,6 +19,7 @@ row/vocabulary tile, with disjoint gradient stores. The autograd wrapper saves t
 inputs and these statistics. The registry exposes this as softcapped_selected_logprob.
 """
 
+import math
 from collections.abc import Callable
 from contextlib import nullcontext
 from dataclasses import dataclass
@@ -79,7 +80,8 @@ class ForwardConfigKey:
     vocab_size: int
 
 
-# H100 80GB HBM3, PyTorch 2.13.0+cu130, Triton 3.7.1.
+# H100 80GB HBM3, PyTorch 2.13.0+cu130, Triton 3.7.1, softcap=30.0.
+# Other caps reuse these schedules but have no measured performance claim.
 # Evidence: 837 eager/reuse cases and 27 CUDA Graph checks, each with 12 balanced rounds.
 # A separate auto-dispatch check covered 39 eager and 12 CUDA Graph cases;
 # accuracy and output/LSE/gradient bitwise checks passed for all measured cases.
@@ -224,6 +226,26 @@ def softcapped_logprob_device_key(device: torch.device) -> tuple[str, str]:
     return device.type, ""
 
 
+def _validate_softcap(softcap: float, vocab_size: int) -> None:
+    """Check the scalar and the FP32 exp/sum range for a positive vocabulary width.
+
+    Rely on type annotations. Require a finite positive FP32-normal cap,
+    exp(-softcap) >= 2 * float32.tiny and V * exp(softcap) <= float32.max / 2.
+    The factor-of-two margins keep exponentials and their sum away from limits.
+    """
+    limits = torch.finfo(torch.float32)
+    if not math.isfinite(softcap) or softcap < limits.tiny:
+        raise ValueError("softcap must be finite, positive and at least float32.tiny.")
+    max_softcap = min(
+        -math.log(2.0 * limits.tiny), math.log(limits.max / 2.0) - math.log(vocab_size)
+    )
+    if softcap > max_softcap:
+        raise ValueError(
+            f"softcap={softcap} with V={vocab_size} exceeds the FP32 exp/sum range "
+            f"(maximum {max_softcap:.6g})."
+        )
+
+
 @triton.jit
 def _softcapped_selected_logprob_fwd_kernel(
     logits_ptr,
@@ -232,6 +254,7 @@ def _softcapped_selected_logprob_fwd_kernel(
     log_sum_exp_ptr,
     vocab_size: tl.constexpr,
     BLOCK_V: tl.constexpr,
+    SOFTCAP: tl.constexpr,
     ACCUMULATE_BEFORE_REDUCE: tl.constexpr = False,
     PIPELINE_STAGES: tl.constexpr = None,
 ):
@@ -254,8 +277,8 @@ def _softcapped_selected_logprob_fwd_kernel(
         mask = vocab_offsets < vocab_size
         logits = tl.load(logits_ptr + row_start + vocab_offsets, mask=mask, other=0.0).to(tl.float32)  # noqa: E501 # fmt: skip
 
-        scaled_logits = tl.div_rn(logits, 30.0)
-        softcapped = 30.0 * libdevice.tanh(scaled_logits)
+        scaled_logits = tl.div_rn(logits, SOFTCAP)
+        softcapped = SOFTCAP * libdevice.tanh(scaled_logits)
         exp_softcapped = tl.exp(softcapped)
         # Padding must contribute zero, not exp(softcap(0)) = 1.
         exp_softcapped = tl.where(mask, exp_softcapped, 0.0)
@@ -268,8 +291,8 @@ def _softcapped_selected_logprob_fwd_kernel(
     if ACCUMULATE_BEFORE_REDUCE:
         sum_exp = tl.sum(partial_exp, axis=0)
 
-    # With softcap fixed at 30, no max-shift is needed to avoid overflow for
-    # the Gemma vocabulary. This assumption must be revisited for other caps.
+    # Host validation bounds exp(-SOFTCAP) and V * exp(SOFTCAP), so this
+    # path keeps the original reduction order without a max-shift pass.
     log_sum_exp = tl.log(sum_exp)
 
     # 2. Load only the selected score and apply the same softcap arithmetic.
@@ -279,7 +302,7 @@ def _softcapped_selected_logprob_fwd_kernel(
         mask=(token_id >= 0) & (token_id < vocab_size),
         other=float("nan"),
     ).to(tl.float32)
-    selected_softcapped = 30.0 * libdevice.tanh(tl.div_rn(selected_logit, 30.0))
+    selected_softcapped = SOFTCAP * libdevice.tanh(tl.div_rn(selected_logit, SOFTCAP))
 
     # 3. Store one FP32 log-probability for this row.
     selected_logprob = selected_softcapped - log_sum_exp
@@ -294,6 +317,7 @@ def _softcapped_selected_logprob_fwd_partial_kernel(
     vocab_size: tl.constexpr,
     n_tiles: tl.constexpr,
     BLOCK_V: tl.constexpr,
+    SOFTCAP: tl.constexpr,
 ):
     row = tl.program_id(0).to(tl.int64)
     tile = tl.program_id(1).to(tl.int64)
@@ -304,8 +328,8 @@ def _softcapped_selected_logprob_fwd_partial_kernel(
 
     # Keep the original 1024-element tile arithmetic and reduction order.
     logits = tl.load(logits_ptr + row_start + vocab_offsets, mask=mask, other=0.0).to(tl.float32)  # noqa: E501 # fmt: skip
-    scaled_logits = tl.div_rn(logits, 30.0)
-    softcapped = 30.0 * libdevice.tanh(scaled_logits)
+    scaled_logits = tl.div_rn(logits, SOFTCAP)
+    softcapped = SOFTCAP * libdevice.tanh(scaled_logits)
     exp_softcapped = tl.exp(softcapped)
     exp_softcapped = tl.where(mask, exp_softcapped, 0.0)
     tile_sum_exp = tl.sum(exp_softcapped, axis=0)
@@ -323,6 +347,7 @@ def _softcapped_selected_logprob_fwd_merge_kernel(
     log_sum_exp_ptr,
     vocab_size: tl.constexpr,
     n_tiles: tl.constexpr,
+    SOFTCAP: tl.constexpr,
     MERGE_UNROLL: tl.constexpr = 1,
 ):
     row = tl.program_id(0).to(tl.int64)
@@ -363,7 +388,7 @@ def _softcapped_selected_logprob_fwd_merge_kernel(
         mask=(token_id >= 0) & (token_id < vocab_size),
         other=float("nan"),
     ).to(tl.float32)
-    selected_softcapped = 30.0 * libdevice.tanh(tl.div_rn(selected_logit, 30.0))
+    selected_softcapped = SOFTCAP * libdevice.tanh(tl.div_rn(selected_logit, SOFTCAP))
     selected_logprob = selected_softcapped - log_sum_exp
     tl.store(selected_logprob_ptr + row, selected_logprob)
     tl.store(log_sum_exp_ptr + row, log_sum_exp)
@@ -378,6 +403,7 @@ def _softcapped_selected_logprob_bwd_kernel(
     grad_logits_ptr,
     vocab_size: tl.constexpr,
     BLOCK_V: tl.constexpr,
+    SOFTCAP: tl.constexpr,
 ):
     row = tl.program_id(0).to(tl.int64)
     tile = tl.program_id(1).to(tl.int64)
@@ -394,9 +420,9 @@ def _softcapped_selected_logprob_bwd_kernel(
     # 2. Each program computes one tile using the shared, read-only row statistics.
     logits = tl.load(logits_ptr + row_start + vocab_offsets, mask=mask, other=0.0).to(tl.float32)  # noqa: E501 # fmt: skip
 
-    scaled_logits = tl.div_rn(logits, 30.0)
+    scaled_logits = tl.div_rn(logits, SOFTCAP)
     tanh_scaled_logits = libdevice.tanh(scaled_logits)
-    softcapped = 30.0 * tanh_scaled_logits
+    softcapped = SOFTCAP * tanh_scaled_logits
     probability = tl.exp(softcapped - log_sum_exp)
 
     # 3. Chain through selected logprob: upstream * (selected - p).
@@ -415,7 +441,8 @@ def _softcapped_selected_logprob_bwd_kernel(
     )
 
 
-def _validate_inputs(logits: torch.Tensor, token_ids: torch.Tensor) -> None:
+def _validate_inputs(logits: torch.Tensor, token_ids: torch.Tensor, softcap: float) -> None:
+    """Validate tensors and the FP32 row-sum bound for their vocabulary width."""
     if logits.device.type not in _SUPPORTED_DEVICES:
         raise RuntimeError(
             "The Triton core requires a GPU tensor; "
@@ -423,6 +450,7 @@ def _validate_inputs(logits: torch.Tensor, token_ids: torch.Tensor) -> None:
         )
     if logits.ndim != 2 or logits.shape[1] == 0:
         raise ValueError("logits must have shape [M, V] with V > 0.")
+    _validate_softcap(softcap, logits.shape[1])
     if logits.dtype not in _SUPPORTED_DTYPES:
         raise TypeError(f"logits must have dtype {_SUPPORTED_DTYPES}, got {logits.dtype}.")
     if token_ids.shape != logits.shape[:1]:
@@ -436,8 +464,9 @@ def _validate_backward_inputs(
     token_ids: torch.Tensor,
     grad_selected_logprob: torch.Tensor,
     log_sum_exp: torch.Tensor,
+    softcap: float,
 ) -> None:
-    _validate_inputs(logits, token_ids)
+    _validate_inputs(logits, token_ids, softcap)
     if grad_selected_logprob.shape != logits.shape[:1]:
         raise ValueError("grad_selected_logprob must have shape [M].")
     if grad_selected_logprob.device != logits.device:
@@ -458,19 +487,19 @@ def _validate_backward_inputs(
 def _launch_softcapped_selected_logprob_fwd(
     logits: torch.Tensor,
     token_ids: torch.Tensor,
+    softcap: float,
     *,
     accumulate_before_reduce: bool = False,
     pipeline_stages: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Return FP32 selected_logprob and log_sum_exp, both [M], without autograd.
 
+    The caller must validate tensor metadata and softcap before launching.
     Valid token IDs in [0, V) are a caller precondition. The kernel masks
     invalid IDs to NaN to avoid out-of-bounds reads, without a host/GPU sync.
     pipeline_stages sets the loop hint, not the launch num_stages. ROW_PIPELINED
     requests three stages; None retains the original unhinted ROW baseline.
     """
-    _validate_inputs(logits, token_ids)
-
     n_rows, vocab_size = logits.shape
     logits_c = logits.contiguous()
     token_ids_c = token_ids.contiguous()
@@ -488,6 +517,7 @@ def _launch_softcapped_selected_logprob_fwd(
             log_sum_exp,
             vocab_size,
             BLOCK_V=_BLOCK_V,
+            SOFTCAP=softcap,
             ACCUMULATE_BEFORE_REDUCE=accumulate_before_reduce,
             PIPELINE_STAGES=pipeline_stages,
             num_warps=4,
@@ -497,16 +527,15 @@ def _launch_softcapped_selected_logprob_fwd(
 
 
 def _launch_softcapped_selected_logprob_fwd_parallel(
-    logits: torch.Tensor, token_ids: torch.Tensor, *, merge_unroll: int = 1
+    logits: torch.Tensor, token_ids: torch.Tensor, softcap: float, *, merge_unroll: int = 1
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Two-kernel forward with FP32 [M, ceil(V / 1024)] scratch.
 
+    The caller must validate tensor metadata and softcap before launching.
     Return the same FP32 [M] output/statistics pair as the row-loop version.
     Allocation, partial reduction and ordered merge all belong to this call.
     merge_unroll=4 is a benchmark-only experiment; normal dispatch uses 1.
     """
-    _validate_inputs(logits, token_ids)
-
     n_rows, vocab_size = logits.shape
     logits_c = logits.contiguous()
     token_ids_c = token_ids.contiguous()
@@ -524,6 +553,7 @@ def _launch_softcapped_selected_logprob_fwd_parallel(
             vocab_size,
             n_tiles,
             BLOCK_V=_BLOCK_V,
+            SOFTCAP=softcap,
             num_warps=4,
             enable_fp_fusion=False,
         )
@@ -538,6 +568,7 @@ def _launch_softcapped_selected_logprob_fwd_parallel(
             vocab_size,
             n_tiles,
             MERGE_UNROLL=merge_unroll,
+            SOFTCAP=softcap,
             num_warps=4,
             enable_fp_fusion=False,
         )
@@ -549,19 +580,20 @@ def _launch_softcapped_selected_logprob_bwd(
     token_ids: torch.Tensor,
     grad_selected_logprob: torch.Tensor,
     log_sum_exp: torch.Tensor,
+    softcap: float,
     *,
     block_v: int = _BLOCK_V,
     num_warps: int = 4,
 ) -> torch.Tensor:
     """Return input-dtype grad_logits; grad_selected_logprob has shape [M].
 
-    log_sum_exp is the FP32 [M] statistic returned by forward for these inputs.
+    log_sum_exp is the FP32 [M] statistic returned by forward with the same softcap.
     The autograd wrapper supplies it together with the inputs and upstream gradient.
     As in forward, invalid token IDs produce NaN; valid IDs are a precondition.
     Private launch parameters let the benchmark sweep backward independently;
     autograd continues to use the default configuration.
     """
-    _validate_backward_inputs(logits, token_ids, grad_selected_logprob, log_sum_exp)
+    _validate_backward_inputs(logits, token_ids, grad_selected_logprob, log_sum_exp, softcap)
 
     n_rows, vocab_size = logits.shape
     logits_c = logits.contiguous()
@@ -582,17 +614,18 @@ def _launch_softcapped_selected_logprob_bwd(
             grad_logits,
             vocab_size,
             BLOCK_V=block_v,
+            SOFTCAP=softcap,
             num_warps=num_warps,
             enable_fp_fusion=False,
         )
     return grad_logits
 
 
-# Each forward strategy accepts (logits, token_ids) and returns (output, log_sum_exp).
+# Each forward strategy accepts (logits, token_ids, softcap) and returns (output, log_sum_exp).
 # Register new implementations here; the autograd wrapper only dispatches by key.
 _FORWARD_LAUNCHERS: dict[
     SoftcappedLogprobStrategy,
-    Callable[[torch.Tensor, torch.Tensor], tuple[torch.Tensor, torch.Tensor]],
+    Callable[[torch.Tensor, torch.Tensor, float], tuple[torch.Tensor, torch.Tensor]],
 ] = {
     SoftcappedLogprobStrategy.ROW: _launch_softcapped_selected_logprob_fwd,
     # H100 V=262144: stages=3 improved ROW at measured M<=512. Keep this
@@ -613,13 +646,18 @@ class _SoftcappedSelectedLogprobTritonFunction(torch.autograd.Function):
 
     @staticmethod
     def forward(
-        ctx, logits: torch.Tensor, token_ids: torch.Tensor, strategy: SoftcappedLogprobStrategy
+        ctx,
+        logits: torch.Tensor,
+        token_ids: torch.Tensor,
+        strategy: SoftcappedLogprobStrategy,
+        softcap: float,
     ) -> torch.Tensor:
         logits_c = logits.contiguous()
         token_ids_c = token_ids.contiguous()
         launch_forward = _FORWARD_LAUNCHERS[strategy]
-        selected_logprob, log_sum_exp = launch_forward(logits_c, token_ids_c)
+        selected_logprob, log_sum_exp = launch_forward(logits_c, token_ids_c, softcap)
         ctx.save_for_backward(logits_c, token_ids_c, log_sum_exp)
+        ctx.softcap = softcap
         return selected_logprob
 
     @staticmethod
@@ -628,10 +666,10 @@ class _SoftcappedSelectedLogprobTritonFunction(torch.autograd.Function):
         grad_logits = None
         if ctx.needs_input_grad[0]:
             grad_logits = _launch_softcapped_selected_logprob_bwd(
-                logits, token_ids, grad_selected_logprob, log_sum_exp
+                logits, token_ids, grad_selected_logprob, log_sum_exp, ctx.softcap
             )
-        # Integer token IDs and the forward implementation selector have no gradient.
-        return grad_logits, None, None
+        # Token IDs, the strategy and the scalar softcap have no gradient.
+        return grad_logits, None, None, None
 
 
 class TritonSoftcappedSelectedLogprobOp:
@@ -639,7 +677,9 @@ class TritonSoftcappedSelectedLogprobOp:
 
     logits [M, V] must use a supported floating dtype on an accepted GPU; token_ids
     [M] must be int64 on the same device with values in [0, V). Output is FP32
-    [M], and gradients use the logits dtype. Softcap is fixed at 30.0.
+    [M], and gradients use the logits dtype. Each forward call accepts softcap,
+    defaulting to 30.0, as a positive scalar within the FP32 exp/sum range for
+    the vocabulary. Autograd saves that call's value for its own backward.
     forward_impl=None selects by device, dtype, vocabulary width and row count.
     Explicit SoftcappedLogprobStrategy values bypass selection. All strategies
     reuse the same backward. ROW, ROW_PIPELINED and PARALLEL preserve arithmetic order;
@@ -652,17 +692,24 @@ class TritonSoftcappedSelectedLogprobOp:
     def __init__(self, *, forward_impl: SoftcappedLogprobStrategy | None = None):
         self.forward_impl = forward_impl
 
-    def __call__(self, logits: torch.Tensor, token_ids: torch.Tensor) -> torch.Tensor:
-        return self.forward(logits, token_ids)
+    def __call__(
+        self, logits: torch.Tensor, token_ids: torch.Tensor, *, softcap: float = 30.0
+    ) -> torch.Tensor:
+        return self.forward(logits, token_ids, softcap=softcap)
 
-    def forward(self, logits: torch.Tensor, token_ids: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, logits: torch.Tensor, token_ids: torch.Tensor, *, softcap: float = 30.0
+    ) -> torch.Tensor:
+        """Compute with this call's softcap and save it for the matching backward."""
         # Validate before reading [M, V] or querying hardware. No GPU data is
         # read to choose a strategy, and training/inference use the same rule.
-        _validate_inputs(logits, token_ids)
+        _validate_inputs(logits, token_ids, softcap)
         strategy = self.forward_impl
         if strategy is None:
             n_rows, vocab_size = logits.shape
             strategy = select_softcapped_logprob_strategy(
                 softcapped_logprob_device_key(logits.device), logits.dtype, n_rows, vocab_size
             )
-        return _SoftcappedSelectedLogprobTritonFunction.apply(logits, token_ids, strategy)
+        return _SoftcappedSelectedLogprobTritonFunction.apply(
+            logits, token_ids, strategy, float(softcap)
+        )
