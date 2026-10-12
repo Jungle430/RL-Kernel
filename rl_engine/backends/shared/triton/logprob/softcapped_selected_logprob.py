@@ -5,7 +5,9 @@
 Automatic forward selects a row loop or a two-kernel parallel implementation
 using device, dtype, row-count ranges and vocabulary tile-count ranges.
 Both reduce vocabulary tiles of 1024 elements in the same order, in FP32 with four warps
-and no FP contraction. Parallel forward writes tile sums to FP32 scratch,
+and no FP contraction. Forward uses libdevice.exp for FP32 exponentials;
+the fast tl.exp approximation can exceed the output tolerance at larger caps.
+Parallel forward writes tile sums to FP32 scratch,
 then merges them in the same ascending order in a second kernel.
 Explicit ROW_PIPELINED requests three loop stages with the ROW arithmetic.
 An explicit ROW_ACCUMULATE experiment instead accumulates a 1024-element
@@ -272,7 +274,7 @@ def _softcapped_selected_logprob_fwd_kernel(
 
         scaled_logits = tl.div_rn(logits, SOFTCAP)
         softcapped = SOFTCAP * libdevice.tanh(scaled_logits)
-        exp_softcapped = tl.exp(softcapped)
+        exp_softcapped = libdevice.exp(softcapped)
         # Padding must contribute zero, not exp(softcap(0)) = 1.
         exp_softcapped = tl.where(mask, exp_softcapped, 0.0)
         if ACCUMULATE_BEFORE_REDUCE:
@@ -323,7 +325,7 @@ def _softcapped_selected_logprob_fwd_partial_kernel(
     logits = tl.load(logits_ptr + row_start + vocab_offsets, mask=mask, other=0.0).to(tl.float32)  # noqa: E501 # fmt: skip
     scaled_logits = tl.div_rn(logits, SOFTCAP)
     softcapped = SOFTCAP * libdevice.tanh(scaled_logits)
-    exp_softcapped = tl.exp(softcapped)
+    exp_softcapped = libdevice.exp(softcapped)
     exp_softcapped = tl.where(mask, exp_softcapped, 0.0)
     tile_sum_exp = tl.sum(exp_softcapped, axis=0)
 

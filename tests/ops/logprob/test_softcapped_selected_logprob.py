@@ -439,6 +439,41 @@ def test_softcap50_wide_reference_regression(operator_impl, dtype):
     _assert_backward(backward_from_saved_graph, logits, ids, upstream, softcap=cap)
 
 
+@pytest.mark.parametrize("dtype", _DTYPES)
+@pytest.mark.parametrize("value", ("output", "gradient"))
+def test_cap64_exp_rounding_regression(operator_impl, dtype, value):
+    """Keep the large-cap exponential regression across all strategies and AUTO.
+
+    With BF16 inputs on A6000, fast forward exp shifted row 12's output by
+    1.52587890625e-5 against Native FP32. Use the original seeded inputs and
+    unchanged contract limits, also covering FP16 and FP32 storage. Separate
+    cases ensure an output failure cannot prevent the gradient check.
+    """
+    op, device = operator_impl
+    cap = 64.0
+    generator = torch.Generator().manual_seed(438)
+    logits = (torch.randn((17, 32767), generator=generator) * cap).to(device=device, dtype=dtype)
+    logits.requires_grad_(True)
+    ids = torch.arange(17, device=device) * 1025
+    upstream = torch.randn(17, generator=generator).to(device)
+    output = op(logits, ids, softcap=cap)
+
+    if value == "output":
+        _assert_fp32_accuracy(output, _fp32_reference(logits, ids, cap), "forward_accuracy")
+        for context in (torch.no_grad(), torch.inference_mode()):
+            with context:
+                _assert_bitwise(op(logits, ids, softcap=cap), output.detach())
+    else:
+        gradient = torch.autograd.grad(output, logits, grad_outputs=upstream, retain_graph=True)[0]
+        _assert_fp32_accuracy(
+            gradient,
+            _fp32_backward_reference(logits, ids, upstream, softcap=cap),
+            "gradient_accuracy",
+        )
+        repeated = torch.autograd.grad(output, logits, grad_outputs=upstream)[0]
+        _assert_bitwise(repeated, gradient)
+
+
 @pytest.mark.parametrize("softcap", (0.0, -1.0, float("nan"), float("inf"), 1e-50, 100.0))
 def test_operator_rejects_unsafe_softcap(operator_impl, softcap):
     """Public Ops reject unsafe caps before dispatching to a private launcher."""

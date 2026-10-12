@@ -46,7 +46,7 @@ def _trace_row(
         q = tl.div_rn(x, CAP)
         t = libdevice.tanh(q)
         s = CAP * t
-        e = tl.where(mask, tl.exp(s), 0.0)
+        e = tl.where(mask, libdevice.exp(s), 0.0)
         partial = tl.sum(e, axis=0)
         total = total + partial
         tl.store(quotient_ptr + row * V + offsets, q, mask=mask)

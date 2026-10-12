@@ -59,6 +59,15 @@ targets; they do not redefine the shared contract's reference or tolerances.
 Native reductions can still differ with batching, so reference accuracy and
 Triton's bitwise training/inference and batch invariance are separate checks.
 
+Both Triton forward kernels use `libdevice.exp` with FP32 inputs and outputs.
+On A6000, the fast `tl.exp` approximation caused a BF16, `softcap=64` case
+to differ from Native FP32 by `1.52587890625e-5`, exceeding the `1e-5` forward
+limit. Changing only these forward exponentials to `libdevice.exp` removed
+that discrepancy in the focused experiment. Division, tile reduction order,
+`tl.log` and backward's probability `tl.exp` are unchanged. The generic
+`triton.language.extra.libdevice` import also supports ROCm, but accuracy and
+performance need validation on each target backend.
+
 ```python
 from rl_engine.runtime.registry import kernel_registry
 
@@ -304,6 +313,14 @@ at `V=1, 1025, 202048, 262144`, covering saturation and rejecting values outside
 the bounds. Thus the largest tested valid caps vary with V (about 75.6–86.6).
 Native GPU reference checks cover the same 14-cap sweep at `V=1025, 202048`.
 All these checks cover FP16/BF16/FP32 without relaxing the existing tolerances.
+`test_cap64_exp_rounding_regression` retains the failing seed `438` at
+`[17, 32767]` across all three dtypes, four explicit strategies and AUTO.
+Output and gradient accuracy run as separate cases; it also checks
+training/inference equality and repeated backward. The focused A6000 experiment
+passed for BF16 across all five Triton selections, including bitwise agreement
+between whole-batch ROW and split-batch PARALLEL outputs, statistics and gradients.
+The full suite and performance still need revalidation after the exp change;
+this result does not resolve the separate FP64 `softcap=70` target below.
 Two-GPU launch coverage retains caps `30` and `50`.
 Division-stage tests compare with an independently
 rounded FP64 quotient, including `39.5 / 50`. A deterministic wide-row regression
