@@ -82,14 +82,16 @@ def _make_workload(op, logits, token_ids, upstream, mode, *, softcap: float):
     raise ValueError(f"unknown mode: {mode}")
 
 
-def _check_accuracy(native, candidate, logits, token_ids, upstream, *, softcap: float):
+def _check_accuracy(reference_op, candidate, logits, token_ids, upstream, *, softcap: float):
+    """Check Triton against the same native PyTorch Op used as the timing baseline."""
+
     def evaluate(op):
         leaf = logits.detach().requires_grad_(True)
         output = op(leaf, token_ids, softcap=softcap)
         gradient = torch.autograd.grad(output, leaf, grad_outputs=upstream)[0]
         return output.detach(), gradient
 
-    expected, actual = evaluate(native), evaluate(candidate)
+    expected, actual = evaluate(reference_op), evaluate(candidate)
     errors = {}
     for label, judgment, shape, dtype, reference, result in zip(
         ("output", "gradient"),
@@ -208,7 +210,7 @@ def _environment(device, args, triton_version, block_v, target: GPUTargetInfo):
         ),
         "operator": "softcapped_selected_logprob",
         "softcap": args.softcap,
-        "baseline": "eager NativeSoftcappedSelectedLogprobOp on the same GPU; no torch.compile",
+        "baseline": "eager NativeSoftcappedSelectedLogprobOp; FP32 device-tensor division",
         "candidate": "TritonSoftcappedSelectedLogprobOp with automatic forward selection",
         "cache_policy": "reused contiguous inputs, warm selector cache, no explicit eviction",
         "scope": "Public wrappers, including allocation and autograd dispatch; no graph capture",
@@ -231,6 +233,9 @@ def _markdown(report):
         "",
         "Eager NativeSoftcappedSelectedLogprobOp vs TritonSoftcappedSelectedLogprobOp "
         "with automatic strategy selection; no torch.compile or CUDA Graph capture.",
+        "The native Op is both the accuracy reference and the timed baseline. It uses an "
+        "FP32 device-tensor divisor; its creation and transfer are included in forward "
+        "and forward+backward timing. Backward reuses the divisor saved in the prebuilt graph.",
         "Contiguous inputs are reused without explicit cache eviction. Median accelerator-event "
         "latency includes public wrapper allocation and autograd dispatch. Input generation, "
         "accuracy checks and JIT compilation are outside timing; the selector cache is warm. "

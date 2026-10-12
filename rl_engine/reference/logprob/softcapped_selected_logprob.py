@@ -44,24 +44,31 @@ def _validate_inputs(logits: torch.Tensor, token_ids: torch.Tensor, softcap: flo
 
 
 def softcapped_selected_logprob(
-    logits: torch.Tensor, token_ids: torch.Tensor, softcap: float = 30.0
+    logits: torch.Tensor, token_ids: torch.Tensor, softcap: float
 ) -> torch.Tensor:
     """Return one FP32 log-probability per row; PyTorch supplies autograd.
 
     Inputs: logits [M, V] in FP16/BF16/FP32, and int64 token_ids [M] on the
     same device. V must be positive and each token ID must lie in [0, V).
-    Output: selected_logprob [M]. softcap defaults to 30.0 for Gemma; callers
-    may pass another positive scalar within the FP32 exp/sum range.
+    Output: selected_logprob [M]. Callers must explicitly pass a positive
+    softcap within the FP32 exp/sum range. Only the Op's forward supplies the
+    default value of 30.0.
 
-    This reference is exposed by NativeSoftcappedSelectedLogprobOp. Its
-    reduction order is not the Triton kernel's fixed tiled reduction order.
+    This reference is exposed by NativeSoftcappedSelectedLogprobOp. The FP32
+    divisor lives on the input device: CUDA division by a Python scalar uses
+    a rounded reciprocal followed by multiplication instead. A device tensor
+    avoids that optimization without calling Triton from the reference.
+    Native reductions still differ from Triton's fixed tiled reduction order;
+    agreement with the reference uses tolerances, not bitwise equality.
     """
     _validate_inputs(logits, token_ids, softcap)
     softcap = float(softcap)
 
-    # 1. Apply softcap in FP32; the default retains the original arithmetic.
+    # 1. Apply softcap in FP32, without the CPU-scalar reciprocal optimization.
     logits_f = logits.to(torch.float32)
-    softcapped = softcap * torch.tanh(logits_f / softcap)
+    divisor = torch.tensor(softcap, device=logits.device, dtype=torch.float32)
+    scaled_logits = torch.div(logits_f, divisor)
+    softcapped = softcap * torch.tanh(scaled_logits)
 
     # 2. Sum exponentials across each row, then take the natural logarithm.
     # Validation bounds exp(-softcap) and V * exp(softcap) for this FP32 path.

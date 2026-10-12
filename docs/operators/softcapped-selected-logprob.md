@@ -47,6 +47,17 @@ The bounds are checked in log space, using only the scalar and shape metadata.
 For example, both `30` and `50` are accepted at `V=262144`; `100` is not.
 Supporting caps outside this range would require a stable, shifted reduction.
 
+The PyTorch numerical reference creates an FP32 `softcap` tensor on the logits
+device and uses `torch.div(logits.float(), divisor)`. This avoids the CUDA
+Python-scalar division path, which multiplies by a precomputed rounded reciprocal
+([PyTorch implementation](https://github.com/pytorch/pytorch/blob/main/aten/src/ATen/native/cuda/BinaryDivTrueKernel.cu)).
+The reference remains entirely native PyTorch with FP32 intermediates and native
+autograd. Triton retains `tl.div_rn`; it does not adopt reciprocal multiplication
+to reproduce the old reference's rounding. Independent FP64 tests check both
+the mathematical definition and gradients without changing the shared tolerances.
+Native reductions can still differ with batching, so reference accuracy and
+Triton's bitwise training/inference and batch invariance are separate checks.
+
 ```python
 from rl_engine.runtime.registry import kernel_registry
 
@@ -56,7 +67,8 @@ selected_logprob_cap20 = op(logits, token_ids, softcap=20.0)
 ```
 
 Omitting `softcap` uses `30.0`. Both registry-created and directly constructed
-Ops accept another cap at call time:
+Ops accept another cap at call time. The native implementation function requires
+an explicit `softcap`; its default is supplied only by the Op's `forward` method:
 
 ```python
 from rl_engine.reference.logprob.softcapped_selected_logprob import (
@@ -253,12 +265,49 @@ reuse, strategy boundaries and indexing guards. GPU tests skip on CPU hosts;
 a GPU host that cannot load Triton fails rather than silently skipping.
 Nondefault-cap cases cover reference outputs and gradients, all four strategies
 and automatic selection, training/inference equality, batch-split strategy
-changes, and two-GPU launches. The default reference is also compared bitwise
-against the original fixed-30 expression. These GPU checks must pass on the
-target hardware before extending the existing validation claims to new caps.
+changes, and two-GPU launches. The configurable-cap consistency sweep uses
+`1e-6, 1e-3, 0.125, 0.5, 1, 3.7, 10, 17.3, 20, 30, 39.5, 50, 64, 70`;
+it requires bitwise training/`no_grad`/`inference_mode` agreement and repeated
+backward agreement. Triton also compares individual rows against the batch,
+and AUTO is checked while crossing a ROW/PARALLEL boundary with each cap.
+Endpoint tests use `float32.tiny` and a cap `1e-4` below the allowed maximum
+at `V=1, 1025, 202048, 262144`, covering saturation and rejecting values outside
+the bounds. Thus the largest tested valid caps vary with V (about 75.6–86.6).
+Native GPU reference checks cover the same 14-cap sweep at `V=1025, 202048`.
+All these checks cover FP16/BF16/FP32 without relaxing the existing tolerances.
+Two-GPU launch coverage retains caps `30` and `50`.
+Division-stage tests compare with an independently
+rounded FP64 quotient, including `39.5 / 50`. A deterministic wide-row regression
+at `softcap=50`, `V=202048` checks both the revised FP32 reference and FP64.
+Omitted and explicit `softcap=30` calls must agree bitwise. These GPU checks must
+pass on the target hardware before extending validation claims to new caps.
 
-The benchmark compares eager `NativeSoftcappedSelectedLogprobOp` with the public
-Triton automatic wrapper on the same CUDA/ROCm GPU. Defaults cover five shapes
+The A6000 expanded sweep exposed an unresolved FP32 case at `softcap=70`,
+`[M, V]=[17, 32767]`, seed `438`: its error against the FP64 oracle is about
+`1.18e-5`, above the unchanged `1e-5` limit. Its ROW/PARALLEL batch-split bitwise
+checks passed before that accuracy assertion. This is not a completed precision
+qualification for every accepted cap. Capture its intermediate values with:
+
+```bash
+python -m tools.validation.operators.diagnose_softcapped_precision \
+  --output-dir reports/softcapped-precision
+```
+
+This diagnostic records both the native FP32 and Triton paths against FP64.
+The instrumented ROW output and saved statistic must match production bitwise;
+otherwise the trace fails and cannot attribute the production error. Its exit
+status checks instrumentation, not accuracy: the existing pytest assertions
+remain the accuracy gate.
+
+`NativeSoftcappedSelectedLogprobOp` is both the numerical reference and the timed
+PyTorch baseline. The benchmark calls the public Native and automatic Triton
+Ops on the same CUDA/ROCm GPU, without maintaining another PyTorch implementation
+or importing private input-validation helpers. Triton must pass output and
+gradient checks against Native before timing. Native's FP32 device-divisor
+creation and transfer are included in forward and forward+backward timing;
+backward timing reuses the divisor saved in the prebuilt graph. Reports identify
+this division path; earlier scalar-division measurements used a different baseline.
+Defaults cover five shapes
 (`1x1025`, `1x262144`, `16x262144`, `128x262144`, `1024x262144`), all three input
 dtypes and forward/backward/forward+backward: 15 input cases and 45 comparisons.
 Inputs are contiguous and reused without explicit cache eviction. No
@@ -283,7 +332,8 @@ PyTorch-vs-AUTO comparison even when this flag is enabled.
 
 JSON/Markdown reports record the selected strategy, median latency, speedup,
 extra peak allocation, softcap and the hardware/software environment. JSON also retains
-sample standard deviations and accuracy errors. Extra allocation excludes
+sample standard deviations and `accuracy` errors against the native baseline.
+Extra allocation excludes
 inputs and prebuilt graphs. Cases are saved outside timing as they finish;
 interrupted reports remain marked `complete: false`. Speedup is native latency
 divided by Triton latency, so values below 1 expose a slowdown. When run from the

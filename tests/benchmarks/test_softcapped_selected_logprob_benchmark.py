@@ -63,6 +63,19 @@ def test_benchmark_rejects_cpu():
         run_benchmark(args)
 
 
+def test_accuracy_gate_rejects_incorrect_output():
+    """A correct gradient must not hide an output error against the FP32 reference."""
+    reference = NativeSoftcappedSelectedLogprobOp()
+    logits = torch.tensor([[1.0, -2.0, 3.0]])
+    ids, upstream = torch.tensor([0]), torch.tensor([0.5])
+
+    def wrong_output(x, tokens, *, softcap):
+        return reference(x, tokens, softcap=softcap) + 0.1
+
+    with pytest.raises(AssertionError):
+        _check_accuracy(reference, wrong_output, logits, ids, upstream, softcap=50.0)
+
+
 @pytest.mark.parametrize("deviation", (None, 0.1))
 def test_forward_comparison_rotates_providers_and_keeps_round_samples(monkeypatch, deviation):
     """Every provider takes each timing position once, even for one-sample timing."""
@@ -257,6 +270,12 @@ def test_report_preserves_incomplete_status_and_slowdowns(tmp_path, compare_stra
     assert "Softcap: 50.0" in markdown
     assert "automatic strategy selection" in markdown
     assert "no torch.compile or CUDA Graph capture" in markdown
+    assert (
+        "Eager NativeSoftcappedSelectedLogprobOp vs TritonSoftcappedSelectedLogprobOp" in markdown
+    )
+    assert "FP32 device-tensor divisor" in markdown
+    assert "creation and transfer are included in forward and forward+backward timing" in markdown
+    assert "Backward reuses the divisor saved in the prebuilt graph" in markdown
     if compare_strategies:
         assert "Forward dispatch check" in markdown
         assert "2.000x" in markdown
@@ -286,6 +305,9 @@ def test_public_auto_benchmark_gpu_smoke(tmp_path, dtype, softcap):
     )
     report = run_benchmark(args)
     assert report["environment"]["softcap"] == softcap
+    assert report["environment"]["baseline"] == (
+        "eager NativeSoftcappedSelectedLogprobOp; FP32 device-tensor division"
+    )
     assert report["case_plan"]["softcap"] == softcap
     assert report["complete"]
     assert json.loads((tmp_path / "results.json").read_text()) == report
