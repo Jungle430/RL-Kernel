@@ -1,6 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 RL-Kernel Contributors
-"""Forward/backward reference accuracy and direct CUDA/ROCm kernel checks."""
+"""FP32 contract accuracy, bitwise invariance and CUDA/ROCm integration checks.
+
+Independent FP64 mathematical checks live in the companion *_math.py file.
+They have their own test targets and do not define the WS1 accuracy reference.
+"""
 
 import math
 from functools import partial
@@ -60,7 +64,14 @@ def test_bitwise_comparison_distinguishes_signed_zero(dtype):
         _assert_bitwise(positive, negative)
 
 
-def _assert_contract(actual, expected, judgment):
+def _assert_fp32_accuracy(actual, expected, judgment):
+    """Apply the unchanged WS1 logprob limits to an unrounded FP32 reference.
+
+    Forward outputs are FP32 and use its 1e-5 absolute limit. Gradients use
+    their output dtype's contract row. Promote only for the comparison;
+    never round the FP32 reference to the candidate's lower-precision dtype.
+    """
+    assert expected.dtype == torch.float32, "The WS1 reference must compute in FP32."
     tolerance = resolve_tolerance(
         _CONTRACT, judgment=judgment, op_class="logprob", dtype=actual.dtype
     )
@@ -115,23 +126,29 @@ def forward_impl(request):
     return partial(_triton_forward, forward_impl=impl), "cuda"
 
 
-def _fp64_reference(logits, token_ids, softcap=30.0):
-    # Use stable FP64 log_softmax on the already-quantized input, rather than
-    # repeating the candidate's explicit exp -> sum -> log implementation.
-    softcapped = softcap * torch.tanh(logits.detach().cpu().to(torch.float64) / softcap)
-    log_probs = torch.log_softmax(softcapped, dim=-1)
-    return log_probs.gather(-1, token_ids.cpu()[:, None]).squeeze(-1)
+def _fp32_reference(logits, token_ids, softcap=30.0):
+    """Evaluate Native in FP32 on the same device and already-quantized inputs."""
+    with torch.no_grad(), torch.autocast(device_type=logits.device.type, enabled=False):
+        return NativeSoftcappedSelectedLogprobOp()(
+            logits.detach().float(), token_ids, softcap=softcap
+        )
+
+
+def _fp32_backward_reference(logits, token_ids, upstream, *, softcap=30.0):
+    """Keep the reference gradient in FP32, including for FP16/BF16 candidates."""
+    with torch.enable_grad(), torch.autocast(device_type=logits.device.type, enabled=False):
+        return _native_backward(logits.float(), token_ids, upstream.float(), softcap=softcap)
 
 
 def _assert_forward(op, logits, token_ids, *, softcap=30.0):
     before = logits.clone()
     token_ids_before = token_ids.clone()
     actual = op(logits, token_ids)
-    expected = _fp64_reference(logits, token_ids, softcap)
+    expected = _fp32_reference(logits, token_ids, softcap)
     assert actual.shape == logits.shape[:1]
     assert actual.dtype == torch.float32
     assert actual.device == logits.device
-    _assert_contract(actual, expected, "forward_accuracy")
+    _assert_fp32_accuracy(actual, expected, "forward_accuracy")
     assert torch.equal(logits, before)
     assert torch.equal(token_ids, token_ids_before)
     return actual
@@ -141,7 +158,7 @@ def _assert_forward(op, logits, token_ids, *, softcap=30.0):
 @pytest.mark.parametrize(
     "shape", [(0, 7), (3, 1), (3, 7), (2, 1023), (2, 1024), (3, 1025), (2, 262144)]
 )
-def test_forward_against_fp64(forward_impl, dtype, shape):
+def test_forward_against_native_fp32(forward_impl, dtype, shape):
     op, device = forward_impl
     generator = torch.Generator().manual_seed(415)
     logits = (torch.randn(shape, generator=generator) * 30.0).to(device=device, dtype=dtype)
@@ -166,7 +183,7 @@ def test_uniform_and_saturated_rows(forward_impl, dtype):
     actual = _assert_forward(op, logits, token_ids)
     # Any uniform row has probability 1 / V, regardless of its score.
     expected_uniform = torch.full((3,), -math.log(1025), device=device)
-    _assert_contract(actual[:3], expected_uniform, "forward_accuracy")
+    _assert_fp32_accuracy(actual[:3], expected_uniform, "forward_accuracy")
     assert torch.isfinite(actual).all()
 
 
@@ -222,19 +239,11 @@ def _assert_backward(op, logits, token_ids, grad_selected_logprob, *, softcap=30
     grad_before = grad_selected_logprob.clone()
     actual = op(logits, token_ids, grad_selected_logprob)
 
-    # Independent FP64 autograd reference through stable log_softmax; do not
-    # repeat the manually implemented (selected - p) derivative formula.
-    leaf = logits.detach().cpu().to(torch.float64).requires_grad_(True)
-    softcapped = softcap * torch.tanh(leaf / softcap)
-    log_probs = torch.log_softmax(softcapped, dim=-1)
-    selected_logprob = log_probs.gather(-1, token_ids.cpu()[:, None]).squeeze(-1)
-    (expected,) = torch.autograd.grad(
-        selected_logprob, leaf, grad_outputs=grad_selected_logprob.cpu().to(torch.float64)
-    )
+    expected = _fp32_backward_reference(logits, token_ids, grad_selected_logprob, softcap=softcap)
     assert actual.shape == logits.shape
     assert actual.dtype == logits.dtype
     assert actual.device == logits.device
-    _assert_contract(actual, expected, "gradient_accuracy")
+    _assert_fp32_accuracy(actual, expected, "gradient_accuracy")
     assert torch.equal(logits, before)
     assert torch.equal(token_ids, token_ids_before)
     assert torch.equal(grad_selected_logprob, grad_before)
@@ -295,7 +304,7 @@ def test_softcap_boundary_accuracy_and_inference(operator_impl, boundary, vocab,
     The upper endpoint depends on V. Leave 1e-4 below it so FP32 conversion
     cannot accidentally push the test outside the documented safety margin.
     Include positive/negative saturation and verify rejection just outside each
-    bound. Input quantization is included in the independent FP64 reference.
+    bound. The FP32 reference consumes the same already-quantized inputs.
     """
     default_op, device = operator_impl
     limits = torch.finfo(torch.float32)
@@ -363,7 +372,7 @@ def test_configurable_softcap_saturation(forward_impl, softcap, dtype):
     ids = torch.tensor([0, 1024, 1024], device=device)
     output = _assert_forward(op, logits, ids, softcap=softcap)
     assert torch.isfinite(output).all()
-    _assert_contract(output[:2], torch.full((2,), -math.log(1025)), "forward_accuracy")
+    _assert_fp32_accuracy(output[:2], torch.full((2,), -math.log(1025)), "forward_accuracy")
 
 
 @pytest.mark.parametrize("dtype", _DTYPES)
@@ -383,40 +392,12 @@ def test_default_softcap_matches_explicit_30(dtype):
         _assert_bitwise(gradient, expected_grad)
 
 
-@pytest.mark.parametrize("device", ("cpu", "cuda"))
-@pytest.mark.parametrize("softcap", (*_SOFTCAPS, 73.0))
-def test_native_division_matches_rounded_fp64_operands(device, softcap, monkeypatch):
-    """Catch reciprocal multiplication before tanh can hide the quotient error.
-
-    In particular, CUDA scalar division of 39.5 by 50 rounds differently from
-    dividing the two FP32 operands directly. Observe the actual tanh input and
-    compare with an independently computed FP64 quotient rounded to FP32.
-    """
-    if device == "cuda" and not torch.cuda.is_available():
-        pytest.skip("A CUDA or ROCm GPU is required")
-    logits = torch.tensor([[39.5, -39.5, 0.0, 65.25, -127.0]], device=device)
-    ids = torch.tensor([0], device=device)
-    tanh = torch.tanh
-    quotients = []
-
-    def observe_quotient(value):
-        quotients.append(value.detach().cpu())
-        return tanh(value)
-
-    monkeypatch.setattr(torch, "tanh", observe_quotient)
-    NativeSoftcappedSelectedLogprobOp()(logits, ids, softcap=softcap)
-    divisor_fp32 = torch.tensor(softcap, dtype=torch.float32)
-    expected = (logits.cpu().double() / divisor_fp32.double()).float()
-    assert len(quotients) == 1
-    _assert_bitwise(quotients[0], expected)
-
-
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="A CUDA or ROCm GPU is required")
 @pytest.mark.parametrize("dtype", _DTYPES)
 @pytest.mark.parametrize("softcap", _SOFTCAPS)
 @pytest.mark.parametrize("vocab", (1025, 202048))
 def test_native_gpu_reference_accuracy_and_inference(dtype, softcap, vocab):
-    """Qualify the CUDA/ROCm reference independently of the Triton implementation."""
+    """Check native GPU autograd and inference; FP64 qualification is separate."""
     generator = torch.Generator().manual_seed(463)
     logits = (torch.randn((3, vocab), generator=generator) * softcap).to(device="cuda", dtype=dtype)
     logits[1, vocab // 2] = 39.5
@@ -437,8 +418,8 @@ def test_softcap50_wide_reference_regression(operator_impl, dtype):
     """Reproduce the wide-row scalar-division mismatch without allocating 4097 rows.
 
     This deterministic FP32 case failed the old PyTorch/Triton output comparison
-    on A6000 at the selected 39.5 logit. Check the revised FP32 reference and the
-    independent FP64 oracle; do not relax either output or gradient tolerances.
+    on A6000 at the selected 39.5 logit. Check against the revised FP32
+    reference with unchanged output and gradient contract tolerances.
     """
     op, device = operator_impl
     cap = 50.0
@@ -451,9 +432,6 @@ def test_softcap50_wide_reference_regression(operator_impl, dtype):
     ids = torch.tensor([0, 101024, 202047], device=device)
     upstream = torch.tensor([0.5, -2.0, 1.5], device=device)
     output = _assert_forward(partial(op, softcap=cap), logits, ids, softcap=cap)
-    with torch.no_grad():
-        reference = NativeSoftcappedSelectedLogprobOp()(logits, ids, softcap=cap)
-    _assert_contract(output, reference, "forward_accuracy")
 
     def backward_from_saved_graph(x, token_ids, gradient):
         return torch.autograd.grad(output, x, grad_outputs=gradient)[0]
@@ -562,9 +540,11 @@ def test_configurable_softcap_auto_switch_preserves_bits(softcap, dtype, monkeyp
     ]
     for index in range(3):
         _assert_bitwise(torch.cat([part[index] for part in parts]), whole[index])
-    _assert_contract(whole[0], _fp64_reference(logits, ids, softcap), "forward_accuracy")
-    _assert_contract(
-        whole[2], _native_backward(logits, ids, upstream, softcap=softcap), "gradient_accuracy"
+    _assert_fp32_accuracy(whole[0], _fp32_reference(logits, ids, softcap), "forward_accuracy")
+    _assert_fp32_accuracy(
+        whole[2],
+        _fp32_backward_reference(logits, ids, upstream, softcap=softcap),
+        "gradient_accuracy",
     )
 
 
@@ -572,7 +552,7 @@ def test_configurable_softcap_auto_switch_preserves_bits(softcap, dtype, monkeyp
 @pytest.mark.parametrize(
     "shape", [(0, 7), (3, 1), (3, 7), (2, 1023), (2, 1024), (3, 1025), (2, 262144)]
 )
-def test_backward_against_fp64_autograd(backward_impl, dtype, shape):
+def test_backward_against_native_fp32_autograd(backward_impl, dtype, shape):
     op, device = backward_impl
     generator = torch.Generator().manual_seed(418)
     logits = (torch.randn(shape, generator=generator) * 15).to(device=device, dtype=dtype)
@@ -689,20 +669,15 @@ def test_operator_autograd_and_inference(operator_impl, dtype, layout):
     output = op(logits, token_ids)
     assert output.requires_grad and output.grad_fn is not None
     assert output.shape == (n_rows,) and output.dtype == torch.float32
-    _assert_contract(output, _fp64_reference(logits, token_ids), "forward_accuracy")
+    _assert_fp32_accuracy(output, _fp32_reference(logits, token_ids), "forward_accuracy")
     (grad_base,) = torch.autograd.grad(output, base, grad_outputs=upstream)
 
-    # Start FP64 at the operator boundary, using the already-rounded logits.
-    reference_logits = logits.detach().cpu().to(torch.float64).requires_grad_(True)
-    log_probs = torch.log_softmax(30.0 * torch.tanh(reference_logits / 30.0), dim=-1)
-    selected = log_probs.gather(-1, token_ids.cpu()[:, None]).squeeze(-1)
-    (expected_grad,) = torch.autograd.grad(
-        selected, reference_logits, grad_outputs=upstream.cpu().to(torch.float64)
-    )
+    # Start at the operator boundary, retaining quantized inputs and FP32 gradients.
+    expected_grad = _fp32_backward_reference(logits, token_ids, upstream)
     if layout == "transpose":
         expected_grad = expected_grad.t()
     assert grad_base.shape == base.shape and grad_base.dtype == dtype
-    _assert_contract(grad_base, expected_grad, "gradient_accuracy")
+    _assert_fp32_accuracy(grad_base, expected_grad, "gradient_accuracy")
 
     # The Op must use the same forward arithmetic with or without graph recording.
     with torch.no_grad():
@@ -758,10 +733,12 @@ def test_triton_noncurrent_device_forward_backward(dtype, vocab, forward_impl, s
         assert gradient.device == direct_gradient.device == device
         assert gradient.dtype == direct_gradient.dtype == dtype
         _assert_bitwise(gradient, direct_gradient)
-        _assert_contract(output, _fp64_reference(logits, token_ids, softcap), "forward_accuracy")
-        _assert_contract(
+        _assert_fp32_accuracy(
+            output, _fp32_reference(logits, token_ids, softcap), "forward_accuracy"
+        )
+        _assert_fp32_accuracy(
             gradient,
-            _native_backward(logits, token_ids, upstream, softcap=softcap),
+            _fp32_backward_reference(logits, token_ids, upstream, softcap=softcap),
             "gradient_accuracy",
         )
 
@@ -796,17 +773,17 @@ def test_triton_saved_log_sum_exp_and_repeated_backward(dtype, shape, forward_im
     assert log_sum_exp.shape == logits.shape[:1]
     assert log_sum_exp.dtype == torch.float32 and log_sum_exp.device == logits.device
     assert log_sum_exp.numel() * log_sum_exp.element_size() == 4 * shape[0]
-    expected_lse = torch.logsumexp(
-        30.0 * torch.tanh(logits.detach().cpu().to(torch.float64) / 30.0), dim=-1
-    )
-    _assert_contract(log_sum_exp, expected_lse, "forward_accuracy")
+    divisor = torch.tensor(30.0, device=logits.device, dtype=torch.float32)
+    scores = 30.0 * torch.tanh(torch.div(logits.detach().float(), divisor))
+    expected_lse = scores.exp().sum(dim=-1).log()
+    _assert_fp32_accuracy(log_sum_exp, expected_lse, "forward_accuracy")
     saved_before = log_sum_exp.clone()
 
     def backward_from_saved_graph(x, token_ids, upstream):
         return torch.autograd.grad(output, x, grad_outputs=upstream, retain_graph=True)[0]
 
     # Different upstream gradients must reuse, rather than overwrite, the same
-    # forward statistics. Compare both backward calls with independent FP64 autograd.
+    # forward statistics. Compare both backward calls with Native FP32 autograd.
     for _ in range(2):
         upstream = torch.randn(shape[0], generator=generator).to(device="cuda")
         _assert_backward(backward_from_saved_graph, logits, ids, upstream)
@@ -926,8 +903,10 @@ def test_triton_pipeline_matches_its_unhinted_family(dtype, vocab, accumulate, s
         logits, ids, upstream, actual[1], softcap=30.0
     )
     _assert_bitwise(grad_actual, grad_expected)
-    _assert_contract(actual[0], _fp64_reference(logits, ids), "forward_accuracy")
-    _assert_contract(grad_actual, _native_backward(logits, ids, upstream), "gradient_accuracy")
+    _assert_fp32_accuracy(actual[0], _fp32_reference(logits, ids), "forward_accuracy")
+    _assert_fp32_accuracy(
+        grad_actual, _fp32_backward_reference(logits, ids, upstream), "gradient_accuracy"
+    )
 
 
 def _evaluate_triton_with_statistics(op, logits, token_ids, upstream):
@@ -1307,11 +1286,9 @@ def test_triton_row_offsets_across_int32_boundary(dtype):
             enable_fp_fusion=False,
         )
         expected = (
-            _native_backward(x.cpu(), ids.cpu(), upstream.cpu())
-            if backward
-            else _fp64_reference(x, ids)
+            _fp32_backward_reference(x, ids, upstream) if backward else _fp32_reference(x, ids)
         )
-        _assert_contract(
+        _assert_fp32_accuracy(
             output[:3], expected, "gradient_accuracy" if backward else "forward_accuracy"
         )
         assert torch.equal(output[3:], torch.full_like(output[3:], -123.0))

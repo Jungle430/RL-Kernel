@@ -82,7 +82,8 @@ def run_trace(out: Path) -> None:
     Instrumentation is diagnostic only. Its output and LSE must match the
     production ROW kernel before its stages can explain a production failure.
     The JSON reports precision failures without turning this into a replacement
-    for pytest; callers must run the unchanged accuracy assertions separately.
+    for pytest; callers must run the FP32 acceptance and independent FP64
+    mathematical test layers separately. Their numerical limits are unchanged.
     """
     if not torch.cuda.is_available():
         raise RuntimeError("A CUDA or ROCm GPU is required for the precision trace.")

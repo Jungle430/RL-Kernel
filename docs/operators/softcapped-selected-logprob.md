@@ -53,8 +53,9 @@ Python-scalar division path, which multiplies by a precomputed rounded reciproca
 ([PyTorch implementation](https://github.com/pytorch/pytorch/blob/main/aten/src/ATen/native/cuda/BinaryDivTrueKernel.cu)).
 The reference remains entirely native PyTorch with FP32 intermediates and native
 autograd. Triton retains `tl.div_rn`; it does not adopt reciprocal multiplication
-to reproduce the old reference's rounding. Independent FP64 tests check both
-the mathematical definition and gradients without changing the shared tolerances.
+to reproduce the old reference's rounding. WS1 accuracy compares with this FP32
+reference. Independent FP64 mathematical tests have separate, explicitly stated
+targets; they do not redefine the shared contract's reference or tolerances.
 Native reductions can still differ with batching, so reference accuracy and
 Triton's bitwise training/inference and batch invariance are separate checks.
 
@@ -231,6 +232,11 @@ uv run --no-sync python -m pytest \
 uv run --no-sync python tools/validation/operators/check_operator.py --op softcapped_selected_logprob \
   --candidate triton --device cuda --dtype bf16 --batch 2 --seq 16 --vocab 262144
 
+# Additional mathematical checks, reported separately from FP32 acceptance.
+# The known cap=70 discrepancy remains an ordinary failing assertion here.
+uv run --no-sync python -m pytest \
+  tests/ops/logprob/test_softcapped_selected_logprob_math.py -q -ra
+
 # Inspect the benchmark plan without a GPU.
 uv run --no-sync python benchmarks/operators/logprob/benchmark_softcapped_selected_logprob.py --list-cases
 
@@ -259,10 +265,33 @@ uv run --no-sync python benchmarks/operators/logprob/benchmark_softcapped_select
   --output-dir reports/softcapped-selected-logprob-cap20
 ```
 
-Operator tests cover an independent FP64 reference, random upstream gradients,
-the shared `logprob` tolerance contract, batch/layout invariance, saved-tensor
-reuse, strategy boundaries and indexing guards. GPU tests skip on CPU hosts;
-a GPU host that cannot load Triton fails rather than silently skipping.
+Validation has three layers:
+
+| Layer | Comparison and requirement | Location |
+| --- | --- | --- |
+| FP32 reference accuracy | Compare outputs and gradients with `NativeSoftcappedSelectedLogprobOp` on the same device. Promote the already-quantized inputs and upstreams to FP32, and keep reference gradients in FP32. Use the unchanged WS1 `logprob` tolerances. | `tests/ops/logprob/test_softcapped_selected_logprob.py` and the shared operator harness |
+| Bitwise invariance | Compare training, `no_grad`, `inference_mode`, repeated backward, batch/chunk/layout changes and supported AUTO strategy switches. Require identical bytes within each dtype. | `tests/ops/logprob/test_softcapped_selected_logprob.py` |
+| Independent FP64 mathematics | Evaluate stable FP64 `log_softmax` and its autograd gradients on the same quantized inputs, without calling the Native or Triton implementation. Check both Native and the public Triton strategies. | `tests/ops/logprob/test_softcapped_selected_logprob_math.py` |
+
+The direct FP32 tests retain the existing tolerance selection: forward FP32
+outputs use `atol=1e-5, rtol=0`; gradients use their output dtype's contract row
+(FP32 `1e-5`, FP16 `5e-3`, BF16 `5e-2`, all with `rtol=0`). The FP32 reference
+is not rounded to FP16/BF16 before comparison. The shared harness retains its
+own contract selection by case dtype. Neither path permits private tolerance
+relaxation. See the [FP32 reference definition](../contracts/ws1-numerical-precision-standard.md#3-definition-of-the-fp32-reference).
+
+The extra FP64 tests preserve the earlier numerical targets: forward absolute
+error at most `1e-5`; gradient absolute error at most `1e-5`, `5e-3` or `5e-2`
+for FP32, FP16 or BF16 output respectively, with zero relative tolerance.
+These are test-specific mathematical goals, not a project-wide FP64 contract.
+They retain FP64 oracle values during comparison and do not borrow the WS1
+resolver. Passing FP32 agreement does not automatically pass these stricter
+checks. Running the whole test directory includes both files; the extra checks
+are not skipped or marked `xfail` to obtain a green result.
+
+Random upstream gradients, saved-tensor reuse, strategy boundaries and indexing
+guards remain covered. GPU tests skip on CPU hosts; a GPU host that cannot load
+Triton fails rather than silently skipping.
 Nondefault-cap cases cover reference outputs and gradients, all four strategies
 and automatic selection, training/inference equality, batch-split strategy
 changes, and two-GPU launches. The configurable-cap consistency sweep uses
@@ -282,11 +311,16 @@ at `softcap=50`, `V=202048` checks both the revised FP32 reference and FP64.
 Omitted and explicit `softcap=30` calls must agree bitwise. These GPU checks must
 pass on the target hardware before extending validation claims to new caps.
 
-The A6000 expanded sweep exposed an unresolved FP32 case at `softcap=70`,
+The A6000 expanded sweep exposed an extra FP64-target failure at `softcap=70`,
 `[M, V]=[17, 32767]`, seed `438`: its error against the FP64 oracle is about
-`1.18e-5`, above the unchanged `1e-5` limit. Its ROW/PARALLEL batch-split bitwise
-checks passed before that accuracy assertion. This is not a completed precision
-qualification for every accepted cap. Capture its intermediate values with:
+`1.18e-5`, above the unchanged extra `1e-5` limit. Native also shows the discrepancy.
+The ROW/PARALLEL batch-split bitwise checks passed, and the observed Triton/Native
+forward difference stayed below the FP32 contract limit. The original AUTO
+test now checks FP32 agreement; `test_fp64_math_cap70_rounding_regression`
+retains the independent failure with separate output/gradient cases so an
+output failure cannot prevent the gradient check. This reorganization does
+not fix FP64 accuracy or establish precision qualification for every accepted
+cap. Capture its intermediate values with:
 
 ```bash
 python -m tools.validation.operators.diagnose_softcapped_precision \
@@ -296,14 +330,16 @@ python -m tools.validation.operators.diagnose_softcapped_precision \
 This diagnostic records both the native FP32 and Triton paths against FP64.
 The instrumented ROW output and saved statistic must match production bitwise;
 otherwise the trace fails and cannot attribute the production error. Its exit
-status checks instrumentation, not accuracy: the existing pytest assertions
-remain the accuracy gate.
+status checks instrumentation, not accuracy: run the FP32 and FP64 pytest
+layers separately to obtain their respective accuracy results.
 
 `NativeSoftcappedSelectedLogprobOp` is both the numerical reference and the timed
 PyTorch baseline. The benchmark calls the public Native and automatic Triton
 Ops on the same CUDA/ROCm GPU, without maintaining another PyTorch implementation
 or importing private input-validation helpers. Triton must pass output and
-gradient checks against Native before timing. Native's FP32 device-divisor
+gradient checks against Native FP32 before timing. The accuracy check retains
+FP32 reference gradients, while timing still calls both Ops with the original
+FP16/BF16/FP32 inputs. Native's FP32 device-divisor
 creation and transfer are included in forward and forward+backward timing;
 backward timing reuses the divisor saved in the prebuilt graph. Reports identify
 this division path; earlier scalar-division measurements used a different baseline.

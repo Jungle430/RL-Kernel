@@ -83,15 +83,21 @@ def _make_workload(op, logits, token_ids, upstream, mode, *, softcap: float):
 
 
 def _check_accuracy(reference_op, candidate, logits, token_ids, upstream, *, softcap: float):
-    """Check Triton against the same native PyTorch Op used as the timing baseline."""
+    """Check against Native FP32, preserving input quantization and reference gradients.
 
-    def evaluate(op):
-        leaf = logits.detach().requires_grad_(True)
-        output = op(leaf, token_ids, softcap=softcap)
-        gradient = torch.autograd.grad(output, leaf, grad_outputs=upstream)[0]
+    Timing still uses the public Native Op at the original input dtype. Only
+    the untimed accuracy reference promotes inputs and upstreams to FP32.
+    """
+
+    def evaluate(op, values):
+        leaf = values.detach().requires_grad_(True)
+        with torch.autocast(device_type=logits.device.type, enabled=False):
+            output = op(leaf, token_ids, softcap=softcap)
+            gradient = torch.autograd.grad(output, leaf, grad_outputs=upstream.float())[0]
         return output.detach(), gradient
 
-    expected, actual = evaluate(reference_op), evaluate(candidate)
+    expected = evaluate(reference_op, logits.float())
+    actual = evaluate(candidate, logits)
     errors = {}
     for label, judgment, shape, dtype, reference, result in zip(
         ("output", "gradient"),
@@ -106,7 +112,9 @@ def _check_accuracy(reference_op, candidate, logits, token_ids, upstream, *, sof
         tolerance = resolve_tolerance(
             load_contract(), judgment=judgment, op_class="logprob", dtype=dtype
         )
-        torch.testing.assert_close(result, reference, atol=tolerance.atol, rtol=tolerance.rtol)
+        torch.testing.assert_close(
+            result.float(), reference, atol=tolerance.atol, rtol=tolerance.rtol
+        )
         errors[label] = {
             "max_abs_error": (result.float() - reference.float()).abs().max().item(),
             "atol": tolerance.atol,
@@ -236,6 +244,9 @@ def _markdown(report):
         "The native Op is both the accuracy reference and the timed baseline. It uses an "
         "FP32 device-tensor divisor; its creation and transfer are included in forward "
         "and forward+backward timing. Backward reuses the divisor saved in the prebuilt graph.",
+        "Untimed accuracy checks promote the same quantized inputs to FP32 and keep "
+        "Native reference gradients in FP32. Timing uses the original input dtype. "
+        "Independent FP64 mathematical checks are reported by the separate pytest suite.",
         "Contiguous inputs are reused without explicit cache eviction. Median accelerator-event "
         "latency includes public wrapper allocation and autograd dispatch. Input generation, "
         "accuracy checks and JIT compilation are outside timing; the selector cache is warm. "

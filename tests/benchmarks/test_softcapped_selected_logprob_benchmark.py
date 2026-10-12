@@ -76,6 +76,32 @@ def test_accuracy_gate_rejects_incorrect_output():
         _check_accuracy(reference, wrong_output, logits, ids, upstream, softcap=50.0)
 
 
+@pytest.mark.parametrize("dtype", (torch.float16, torch.bfloat16, torch.float32))
+def test_accuracy_reference_keeps_fp32_gradients_and_quantized_inputs(dtype):
+    """The untimed reference must not round its gradient to the candidate dtype."""
+    logits = torch.tensor([[0.1, -1.3, 2.7]], dtype=dtype)
+    ids, upstream = torch.tensor([0]), torch.tensor([0.5])
+    native = NativeSoftcappedSelectedLogprobOp()
+    seen = {}
+
+    def observed_reference(x, tokens, *, softcap):
+        seen["reference_dtype"] = x.dtype
+        torch.testing.assert_close(x, logits.float(), atol=0, rtol=0)
+        x.register_hook(lambda gradient: seen.update(gradient_dtype=gradient.dtype))
+        return native(x, tokens, softcap=softcap)
+
+    def observed_candidate(x, tokens, *, softcap):
+        seen["candidate_dtype"] = x.dtype
+        return native(x, tokens, softcap=softcap)
+
+    _check_accuracy(observed_reference, observed_candidate, logits, ids, upstream, softcap=30.0)
+    assert seen == {
+        "reference_dtype": torch.float32,
+        "gradient_dtype": torch.float32,
+        "candidate_dtype": dtype,
+    }
+
+
 @pytest.mark.parametrize("deviation", (None, 0.1))
 def test_forward_comparison_rotates_providers_and_keeps_round_samples(monkeypatch, deviation):
     """Every provider takes each timing position once, even for one-sample timing."""
