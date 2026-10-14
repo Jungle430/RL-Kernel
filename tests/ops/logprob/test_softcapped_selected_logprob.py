@@ -637,8 +637,14 @@ def test_softcap_range_depends_on_vocabulary(operator_impl):
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="A CUDA or ROCm GPU is required")
 @pytest.mark.parametrize("softcap", _SOFTCAPS)
 @pytest.mark.parametrize("dtype", _DTYPES)
-def test_configurable_softcap_auto_switch_preserves_bits(softcap, dtype, monkeypatch, request):
-    """Exercise a batch-dependent switch with different caps and a small allocation."""
+@pytest.mark.parametrize("value", ("output", "gradient", "invariance"))
+def test_configurable_softcap_auto_switch(softcap, dtype, value, monkeypatch, request):
+    """Check an automatic strategy switch without mixing accuracy and bitwise failures.
+
+    Output accuracy, gradient accuracy and batch-split invariance are separate
+    cases. A reference accuracy failure cannot hide the gradient or bitwise
+    checks. Invariance compares output, both saved statistics and all gradients.
+    """
     from rl_engine.backends.shared.triton.logprob import softcapped_selected_logprob as module
     from rl_engine.backends.shared.triton.logprob.softcapped_selected_logprob import (
         SoftcappedLogprobStrategy,
@@ -678,20 +684,25 @@ def test_configurable_softcap_auto_switch_preserves_bits(softcap, dtype, monkeyp
     )
     op = partial(TritonSoftcappedSelectedLogprobOp(), softcap=softcap)
     whole = _evaluate_triton_with_statistics(op, logits, ids, upstream)
-    parts = [
-        _evaluate_triton_with_statistics(
-            op, logits[start:stop], ids[start:stop], upstream[start:stop]
+    output, _, _, gradient = whole
+    if value == "output":
+        _assert_fp32_accuracy(output, _fp32_reference(logits, ids, softcap), "forward_accuracy")
+    elif value == "gradient":
+        _assert_fp32_accuracy(
+            gradient,
+            _fp32_backward_reference(logits, ids, upstream, softcap=softcap),
+            "gradient_accuracy",
         )
-        for start, stop in ((0, 16), (16, 17))
-    ]
-    for index in range(3):
-        _assert_bitwise(torch.cat([part[index] for part in parts]), whole[index])
-    _assert_fp32_accuracy(whole[0], _fp32_reference(logits, ids, softcap), "forward_accuracy")
-    _assert_fp32_accuracy(
-        whole[2],
-        _fp32_backward_reference(logits, ids, upstream, softcap=softcap),
-        "gradient_accuracy",
-    )
+    else:
+        parts = [
+            _evaluate_triton_with_statistics(
+                op, logits[start:stop], ids[start:stop], upstream[start:stop]
+            )
+            for start, stop in ((0, 16), (16, 17))
+        ]
+        # Compare output, row maximum, shifted log-sum and every gradient value.
+        for index in range(len(whole)):
+            _assert_bitwise(torch.cat([part[index] for part in parts]), whole[index])
 
 
 @pytest.mark.parametrize("dtype", _DTYPES)
