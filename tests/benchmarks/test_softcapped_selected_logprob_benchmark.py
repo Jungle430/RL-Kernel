@@ -333,6 +333,7 @@ def test_report_preserves_incomplete_status_and_slowdowns(tmp_path, compare_stra
         "Eager NativeSoftcappedSelectedLogprobOp vs TritonSoftcappedSelectedLogprobOp" in markdown
     )
     assert "FP32 device-tensor divisor" in markdown
+    assert "FP32 log_softmax" in markdown
     assert "creation and transfer are included in forward and forward+backward timing" in markdown
     assert "Backward reuses the divisor saved in the prebuilt graph" in markdown
     if compare_strategies:

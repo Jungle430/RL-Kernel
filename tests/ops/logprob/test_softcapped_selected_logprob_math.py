@@ -6,8 +6,8 @@ Use stable FP64 log_softmax and autograd on the already-quantized inputs.
 Retain the earlier tests' numerical targets without borrowing WS1's FP32
 reference contract: forward atol=1e-5; gradient atol depends on output dtype.
 These are additional test goals, not a project-wide FP64 accuracy guarantee.
-In particular, the cap=70 regression remains a real failure if it exceeds
-the target; it is neither skipped nor marked as an expected failure.
+The large-cap rounding regressions remain real failures if they exceed the
+target; they are neither skipped nor marked as expected failures.
 """
 
 import math
@@ -61,7 +61,8 @@ def math_impl(request):
 def _fp64_reference(logits, token_ids, upstream, *, softcap):
     """Evaluate the original formula in FP64, without calling either implementation.
 
-    Stable log_softmax avoids duplicating the kernels' exp/sum/log reduction.
+    Evaluate softcap and log_softmax entirely in FP64, independently of the
+    production reference and the kernels' FP32 exp/sum/log reduction.
     Autograd supplies the derivative independently of the Triton formula.
     FP64 starts after input quantization and keeps the oracle outputs in FP64.
     """
@@ -194,28 +195,37 @@ def test_fp64_math_cap50_division_regression(math_impl, dtype):
 
 
 @pytest.mark.parametrize("value", ("output", "gradient"))
-def test_fp64_math_cap70_rounding_regression(math_impl, value):
-    """Keep the known 1.18e-5 output discrepancy visible, without xfail or a wider limit.
+@pytest.mark.parametrize(
+    ("dtype", "softcap"),
+    (
+        pytest.param(torch.float32, 70.0, id="fp32-cap70"),
+        pytest.param(torch.bfloat16, 70.0, id="bf16-cap70"),
+        pytest.param(torch.float32, 64.0, id="fp32-cap64"),
+    ),
+)
+def test_fp64_math_large_cap_rounding_regression(math_impl, value, dtype, softcap):
+    """Retain both old and shifted-path rounding cases without xfail or wider limits.
 
     These are the inputs of the automatic ROW/PARALLEL switch regression.
-    Native also exhibits the discrepancy. Separate parameters ensure the
-    output failure cannot prevent the gradient assertion from running.
+    FP32 cap 70 exposed the old unshifted Native error. The four-way GPU
+    diagnostic found shifted Native/Triton errors just above 1e-5 for BF16
+    cap 70 and FP32 cap 64. Keep them as extra mathematical checks; they do
+    not redefine WS1's FP32 reference. Separate parameters ensure an output
+    failure cannot prevent the gradient assertion from running.
     """
     op, device = math_impl
     generator = torch.Generator().manual_seed(438)
-    logits = (torch.randn((17, 32767), generator=generator) * 70.0).to(device)
+    logits = (torch.randn((17, 32767), generator=generator) * softcap).to(device, dtype)
     ids = torch.arange(17, device=device) * 1025
     upstream = torch.randn(17, generator=generator).to(device)
     leaf = logits.detach().requires_grad_(True)
-    output = op(leaf, ids, softcap=70.0)
+    output = op(leaf, ids, softcap=softcap)
     gradient = torch.autograd.grad(output, leaf, grad_outputs=upstream)[0]
-    expected_output, expected_gradient = _fp64_reference(logits, ids, upstream, softcap=70.0)
+    expected_output, expected_gradient = _fp64_reference(logits, ids, upstream, softcap=softcap)
     if value == "output":
         _assert_fp64_math_accuracy(output, expected_output, atol=_FORWARD_MATH_ATOL)
     else:
-        _assert_fp64_math_accuracy(
-            gradient, expected_gradient, atol=_GRADIENT_MATH_ATOL[torch.float32]
-        )
+        _assert_fp64_math_accuracy(gradient, expected_gradient, atol=_GRADIENT_MATH_ATOL[dtype])
 
 
 @pytest.mark.parametrize("device", ("cpu", "cuda"))

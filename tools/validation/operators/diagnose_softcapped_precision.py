@@ -185,7 +185,9 @@ def run_trace(out: Path) -> None:
     nlse = torch.exp(ns).sum(-1).log()
     ns64, nlse64 = ns.cpu().double(), nlse.cpu().double()
     stages["native_gpu_after_softcap_then_fp64"] = from_scores(ns64)
-    stages["native_gpu_before_final_fp32_subtract"] = selected(ns64) - nlse64
+    # Native now uses log_softmax; retain this old calculation only as a diagnostic.
+    stages["legacy_native_gpu_before_final_fp32_subtract"] = selected(ns64) - nlse64
+    stages["legacy_native_gpu_unshifted_output"] = (selected(ns.cpu()) - nlse.cpu()).double()
 
     checks = {
         "probe_division_matches_native_bits": same_bits(q, nq),
@@ -263,7 +265,7 @@ def run_trace(out: Path) -> None:
                 "triton_row_max": stats64[row, 4].item(),
                 "triton_log_sum_exp_shifted": stats64[row, 1].item(),
                 "triton_reconstructed_lse_fp64": (stats64[row, 4] + stats64[row, 1]).item(),
-                "native_gpu_lse": nlse64[row].item(),
+                "legacy_native_gpu_unshifted_lse": nlse64[row].item(),
             }
         )
     result = {
@@ -274,7 +276,8 @@ def run_trace(out: Path) -> None:
         "notes": (
             "Diagnostic only. FP64 continuation separates cumulative rounding by stage. "
             "This diagnostic does not modify tolerances or production kernels. "
-            "Legacy unshifted traces are counterfactual comparisons, not the current Op."
+            "Native uses FP32 log_softmax. Legacy unshifted traces are "
+            "counterfactual comparisons, not the current Op."
         ),
         "probe_checks": checks,
         "stages": stage_results,

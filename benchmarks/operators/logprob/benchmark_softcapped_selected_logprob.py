@@ -245,7 +245,10 @@ def _environment(device, args, triton_version, block_v, target: GPUTargetInfo):
         ),
         "operator": "softcapped_selected_logprob",
         "softcap": args.softcap,
-        "baseline": "eager NativeSoftcappedSelectedLogprobOp; FP32 device-tensor division",
+        "baseline": (
+            "eager NativeSoftcappedSelectedLogprobOp; "
+            "FP32 device-tensor division; FP32 log_softmax"
+        ),
         "candidate": "TritonSoftcappedSelectedLogprobOp with automatic forward selection",
         "triton_arithmetic": "FP32 whole-row maximum shift; ordered tile sums",
         "cache_policy": "reused contiguous inputs, warm selector cache, no explicit eviction",
@@ -269,8 +272,9 @@ def _markdown(report):
         "",
         "Eager NativeSoftcappedSelectedLogprobOp vs TritonSoftcappedSelectedLogprobOp "
         "with automatic strategy selection; no torch.compile or CUDA Graph capture.",
-        "The native Op is both the accuracy reference and the timed baseline. It uses an "
-        "FP32 device-tensor divisor; its creation and transfer are included in forward "
+        "The native Op is both the accuracy reference and the timed baseline. It uses "
+        "FP32 log_softmax and an FP32 device-tensor divisor; "
+        "its creation and transfer are included in forward "
         "and forward+backward timing. Backward reuses the divisor saved in the prebuilt graph.",
         "Untimed accuracy checks promote the same quantized inputs to FP32 and keep "
         "Native reference gradients in FP32. Timing uses the original input dtype. "

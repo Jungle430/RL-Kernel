@@ -38,13 +38,14 @@ Autograd supports first-order gradients. Native PyTorch supplies its own autogra
 `softcap` is passed per call, independently of the strategy/tuning configuration.
 The same Op can serve calls with different caps. Each autograd invocation keeps
 its own cap for backward; the Op does not store or mutate this value.
-It must be finite and at least `torch.finfo(torch.float32).tiny`. The Native
-reference retains its direct `exp -> sum -> log` calculation. The experimental
-Triton implementation subtracts the row maximum first. Both keep the original
-accepted domain so they can still be compared without changing the reference.
-To avoid overflow or flushing every exponential in a negative saturated Native
-row to zero, they reject cap/vocabulary combinations unless
+It must be finite and at least `torch.finfo(torch.float32).tiny`. Native uses
+FP32 `torch.log_softmax`; Triton explicitly subtracts the row maximum before
+its exponential sum. Both keep the original accepted softcap/vocabulary domain:
+they reject cap/vocabulary combinations unless
 `exp(-c) >= 2 * float32.tiny` and `V * exp(c) <= float32.max / 2`.
+These conservative bounds came from the original unshifted `exp -> sum -> log`
+implementation. They are retained for interface compatibility, not because
+the shifted calculation requires those same bounds.
 The bounds are checked in log space, using only the scalar and shape metadata.
 For example, both `30` and `50` are accepted at `V=262144`; `100` is not.
 Expanding this interface range is outside the current experiment.
@@ -54,7 +55,12 @@ device and uses `torch.div(logits.float(), divisor)`. This avoids the CUDA
 Python-scalar division path, which multiplies by a precomputed rounded reciprocal
 ([PyTorch implementation](https://github.com/pytorch/pytorch/blob/main/aten/src/ATen/native/cuda/BinaryDivTrueKernel.cu)).
 The reference remains entirely native PyTorch with FP32 intermediates and native
-autograd. Triton retains `tl.div_rn`; it does not adopt reciprocal multiplication
+autograd. After softcap, it computes `torch.log_softmax(softcapped, dim=-1)` and
+gathers one token per row. For row maximum `m`, the normalized expression is
+`(selected_score - m) - log(sum(exp(scores - m)))`; it does not first reconstruct
+and round the unshifted log-sum. This is mathematically the same log-probability,
+but its intermediate rounding differs from the earlier reference.
+Triton retains `tl.div_rn`; it does not adopt reciprocal multiplication
 to reproduce the old reference's rounding. WS1 accuracy compares with this FP32
 reference. Independent FP64 mathematical tests have separate, explicitly stated
 targets; they do not redefine the shared contract's reference or tolerances.
@@ -364,7 +370,7 @@ That FP64-finishing candidate has now been replaced by the whole-row maximum
 shift described above. Forward and backward share the maximum and shifted
 log-sum, and production arithmetic is entirely FP32. The nine-row result is
 historical evidence for the previous candidate, not validation of the shifted
-implementation. Native code and all accuracy limits remain unchanged. Full-input
+implementation. Native now uses FP32 `log_softmax`; all accuracy limits remain unchanged. Full-input
 regressions, FP64 checks, and cross-strategy output/statistic/gradient tests must
 run again on a GPU before claiming accuracy or performance improvements.
 
@@ -394,16 +400,31 @@ at `softcap=50`, `V=202048` checks both the revised FP32 reference and FP64.
 Omitted and explicit `softcap=30` calls must agree bitwise. These GPU checks must
 pass on the target hardware before extending validation claims to new caps.
 
-The A6000 expanded sweep exposed an extra FP64-target failure at `softcap=70`,
-`[M, V]=[17, 32767]`, seed `438`: its error against the FP64 oracle is about
-`1.18e-5`, above the unchanged extra `1e-5` limit. Native also shows the discrepancy.
-The ROW/PARALLEL batch-split bitwise checks passed, and the observed Triton/Native
-forward difference stayed below the FP32 contract limit. The original AUTO
-test now checks FP32 agreement; `test_fp64_math_cap70_rounding_regression`
-retains the independent failure with separate output/gradient cases so an
-output failure cannot prevent the gradient check. This reorganization does
-not fix FP64 accuracy or establish precision qualification for every accepted
-cap. Capture its intermediate values with:
+The original unshifted reference had an extra FP64-target failure at `softcap=70`,
+`[M, V]=[17, 32767]`, seed `438`, with an error around `1.18e-5`.
+A four-way diagnostic on RTX 3090 compared the shifted Triton strategies,
+the unshifted Native reference, an FP32 `log_softmax` comparator and independent
+FP64 mathematics across all 42 dtype/cap combinations of this fixture. Each
+Triton strategy agreed with the FP32 `log_softmax` comparator within `1e-5`;
+the maximum difference was `7.62939453125e-6`. All strategy output, saved-statistic
+and gradient byte comparisons, and training/inference output comparisons passed.
+Native now uses that same FP32 `log_softmax` expression. This focused diagnostic
+does not replace the full GPU regression or qualify the large-vocabulary cases.
+
+Both the stable PyTorch comparator and Triton still exceeded the extra FP64
+output target for BF16 cap `70` (row 12, `1.01174e-5`) and FP32 cap `64`
+(row 13, `1.02073e-5`). The two FP32 subtractions can accumulate rounding error
+even after maximum shifting. `test_fp64_math_large_cap_rounding_regression`
+retains these cases and the original FP32 cap `70` case, with output and gradient
+checks separated. No tolerance is widened and no failure is marked `xfail`.
+FP32-reference acceptance and these extra mathematical targets remain distinct.
+The broader CPU suite also exposes additional `log_softmax` rounding discrepancies
+on wide rows. For example, local PyTorch 2.13.0 at `[3, 202048]`, FP32 cap `0.001`
+and seed `463` differs from FP64 by approximately `3.14e-4`. Maximum shifting
+does not guarantee that every backend's reduction satisfies the extra `1e-5`
+target. These failures remain visible in the mathematical suite, and the focused
+GPU results must not be generalized to all widths or backends.
+Capture the FP32 cap `70` intermediate values with:
 
 ```bash
 python -m tools.validation.operators.diagnose_softcapped_precision \
@@ -426,7 +447,10 @@ FP32 reference gradients, while timing still calls both Ops with the original
 FP16/BF16/FP32 inputs. Native's FP32 device-divisor
 creation and transfer are included in forward and forward+backward timing;
 backward timing reuses the divisor saved in the prebuilt graph. Reports identify
-this division path; earlier scalar-division measurements used a different baseline.
+this division path and FP32 `log_softmax`. Earlier scalar-division or unshifted
+exp/sum/log measurements used a different baseline, so their speedups must not
+be presented as measurements against the current reference. The revised baseline
+requires a new performance comparison.
 Defaults cover five shapes
 (`1x1025`, `1x262144`, `16x262144`, `128x262144`, `1024x262144`), all three input
 dtypes and forward/backward/forward+backward: 15 input cases and 45 comparisons.

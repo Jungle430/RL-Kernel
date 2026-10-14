@@ -11,11 +11,12 @@ _SUPPORTED_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 
 
 def _validate_softcap(softcap: float, vocab_size: int) -> None:
-    """Check the scalar and the FP32 exp/sum range for a positive vocabulary width.
+    """Keep the existing softcap domain for a positive vocabulary width.
 
     Rely on type annotations. Require a finite positive FP32-normal cap,
     exp(-softcap) >= 2 * float32.tiny and V * exp(softcap) <= float32.max / 2.
-    The factor-of-two margins keep exponentials and their sum away from limits.
+    These bounds come from the original unshifted exp/sum path. Keep the same
+    accepted inputs when switching to log_softmax; extending the API is separate.
     """
     limits = torch.finfo(torch.float32)
     if not math.isfinite(softcap) or softcap < limits.tiny:
@@ -58,6 +59,8 @@ def softcapped_selected_logprob(
     divisor lives on the input device: CUDA division by a Python scalar uses
     a rounded reciprocal followed by multiplication instead. A device tensor
     avoids that optimization without calling Triton from the reference.
+    FP32 log_softmax normalizes with a row-maximum shift before selecting the
+    requested token, avoiding a separately rounded unshifted log-sum.
     Native reductions still differ from Triton's fixed tiled reduction order;
     agreement with the reference uses tolerances, not bitwise equality.
     """
@@ -70,17 +73,11 @@ def softcapped_selected_logprob(
     scaled_logits = torch.div(logits_f, divisor)
     softcapped = softcap * torch.tanh(scaled_logits)
 
-    # 2. Sum exponentials across each row, then take the natural logarithm.
-    # Validation bounds exp(-softcap) and V * exp(softcap) for this FP32 path.
-    exp_softcapped = torch.exp(softcapped)
-    sum_exp = exp_softcapped.sum(dim=-1)
-    log_sum_exp = torch.log(sum_exp)
+    # 2. Normalize in FP32 with PyTorch's stable log_softmax.
+    log_probs = torch.log_softmax(softcapped, dim=-1)
 
-    # 3. Select one softcapped score per row; [M, 1] becomes [M].
-    selected_softcapped = softcapped.gather(dim=-1, index=token_ids[:, None]).squeeze(-1)
-
-    # 4. log(exp(selected) / sum_exp) = selected - log(sum_exp).
-    selected_logprob = selected_softcapped - log_sum_exp
+    # 3. Select one log-probability per row; [M, 1] becomes [M].
+    selected_logprob = log_probs.gather(dim=-1, index=token_ids[:, None]).squeeze(-1)
     return selected_logprob
 
 
