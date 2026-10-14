@@ -82,11 +82,21 @@ def _make_workload(op, logits, token_ids, upstream, mode, *, softcap: float):
     raise ValueError(f"unknown mode: {mode}")
 
 
-def _check_accuracy(reference_op, candidate, logits, token_ids, upstream, *, softcap: float):
+def _check_accuracy(
+    reference_op,
+    candidate,
+    logits,
+    token_ids,
+    upstream,
+    *,
+    softcap: float,
+    strategy_candidates=(),
+):
     """Check against Native FP32, preserving input quantization and reference gradients.
 
     Timing still uses the public Native Op at the original input dtype. Only
     the untimed accuracy reference promotes inputs and upstreams to FP32.
+    Also require identical output/gradient bytes across all supplied strategies.
     """
 
     def evaluate(op, values):
@@ -120,7 +130,24 @@ def _check_accuracy(reference_op, candidate, logits, token_ids, upstream, *, sof
             "atol": tolerance.atol,
             "rtol": tolerance.rtol,
         }
+    for context in (torch.no_grad(), torch.inference_mode()):
+        with context:
+            inferred = candidate(logits, token_ids, softcap=softcap)
+        _assert_same_bits(inferred, actual[0], "training/inference output")
+    for name, op in strategy_candidates:
+        other = evaluate(op, logits)
+        for label, result, gold in zip(("output", "gradient"), other, actual, strict=True):
+            _assert_same_bits(result, gold, f"{name} {label}")
     return errors
+
+
+def _assert_same_bits(actual, expected, label):
+    """Compare all bytes without rounding; singleton strided views need a copy."""
+    assert actual.shape == expected.shape and actual.dtype == expected.dtype
+    actual = actual.detach().clone(memory_format=torch.contiguous_format).view(torch.uint8)
+    expected = expected.detach().clone(memory_format=torch.contiguous_format).view(torch.uint8)
+    if not torch.equal(actual, expected):
+        raise AssertionError(f"Bitwise mismatch: {label}")
 
 
 def _case_plan(args):
@@ -220,6 +247,7 @@ def _environment(device, args, triton_version, block_v, target: GPUTargetInfo):
         "softcap": args.softcap,
         "baseline": "eager NativeSoftcappedSelectedLogprobOp; FP32 device-tensor division",
         "candidate": "TritonSoftcappedSelectedLogprobOp with automatic forward selection",
+        "triton_arithmetic": "FP32 whole-row maximum shift; ordered tile sums",
         "cache_policy": "reused contiguous inputs, warm selector cache, no explicit eviction",
         "scope": "Public wrappers, including allocation and autograd dispatch; no graph capture",
         "backward": "Random FP32 upstream gradient; prebuilt retained graph; no forward timing",
@@ -255,6 +283,9 @@ def _markdown(report):
         "fresh graph per call. Extra peak allocation excludes inputs and prebuilt graphs.",
         "Speedup = eager PyTorch / Triton; values below 1 mean Triton was slower. Every "
         "reported case passed output and random-upstream gradient checks before timing. "
+        "AUTO outputs also match training/inference bitwise; output and gradient bytes "
+        "match all retained forward strategies. Triton uses an FP32 whole-row maximum "
+        "shift and saves both the maximum and log of the shifted sum for backward. "
         "JSON also contains sample standard deviations and error bounds.",
         "",
         "| Input | Shape | Triton strategy | Mode | Native ms | Triton ms | Speedup | "
@@ -348,6 +379,10 @@ def run_benchmark(args):
         profiler = PerformanceProfiler(device=device, warmup=args.warmup, repeat=args.repeat)
         native = NativeSoftcappedSelectedLogprobOp()
         candidate = TritonSoftcappedSelectedLogprobOp()
+        strategy_candidates = [
+            (strategy.value, TritonSoftcappedSelectedLogprobOp(forward_impl=strategy))
+            for strategy in SoftcappedLogprobStrategy
+        ]
         explicit = []
         if args.compare_strategies and "forward" in args.modes:
             explicit = [
@@ -374,7 +409,13 @@ def run_benchmark(args):
                     shape[0], device=device, generator=generator, dtype=torch.float32
                 )
                 accuracy = _check_accuracy(
-                    native, candidate, logits, ids, upstream, softcap=args.softcap
+                    native,
+                    candidate,
+                    logits,
+                    ids,
+                    upstream,
+                    softcap=args.softcap,
+                    strategy_candidates=strategy_candidates,
                 )
                 explicit_accuracy = {
                     name: _check_accuracy(native, op, logits, ids, upstream, softcap=args.softcap)
@@ -408,6 +449,8 @@ def run_benchmark(args):
                         "mode": mode,
                         "triton_strategy": strategy,
                         "accuracy": accuracy,
+                        "train_inference_bitwise": True,
+                        "strategy_bitwise": [name for name, _ in strategy_candidates],
                         "native": measurements["native"],
                         "triton": measurements["triton"],
                         "speedup": measurements["native"]["median_ms"]

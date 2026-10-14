@@ -20,7 +20,22 @@ from rl_engine.reference.logprob.softcapped_selected_logprob import (
 
 _DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 _CONTRACT = load_contract()
-_SOFTCAPS = (1e-6, 1e-3, 0.125, 0.5, 1.0, 3.7, 10.0, 17.3, 20.0, 30.0, 39.5, 50.0, 64.0, 70.0)
+_SOFTCAPS = (
+    1e-6,
+    1e-3,
+    0.125,
+    0.5,
+    1.0,
+    3.7,
+    10.0,
+    17.3,
+    20.0,
+    30.0,
+    39.5,
+    50.0,
+    64.0,
+    70.0,
+)
 """Sample small caps, non-binary-exact fractions and larger caps within the tested V bounds."""
 
 
@@ -96,7 +111,7 @@ def _triton_forward(logits, token_ids, *, forward_impl="row", softcap=30.0):
     )
 
     launch = _FORWARD_LAUNCHERS[SoftcappedLogprobStrategy(forward_impl)]
-    output, _ = launch(logits, token_ids, softcap)
+    output, _, _ = launch(logits, token_ids, softcap)
     return output
 
 
@@ -108,15 +123,13 @@ def _triton_backward(logits, token_ids, upstream, *, forward_impl="row", softcap
     )
 
     launch = _FORWARD_LAUNCHERS[SoftcappedLogprobStrategy(forward_impl)]
-    _, log_sum_exp = launch(logits, token_ids, softcap)
+    _, row_max, log_sum_exp_shifted = launch(logits, token_ids, softcap)
     return _launch_softcapped_selected_logprob_bwd(
-        logits, token_ids, upstream, log_sum_exp, softcap
+        logits, token_ids, upstream, row_max, log_sum_exp_shifted, softcap
     )
 
 
-@pytest.fixture(
-    params=("pytorch", "triton", "triton_parallel", "triton_row_accumulate", "triton_row_pipelined")
-)
+@pytest.fixture(params=("pytorch", "triton", "triton_parallel", "triton_row_pipelined"))
 def forward_impl(request):
     if request.param == "pytorch":
         return NativeSoftcappedSelectedLogprobOp(), "cpu"
@@ -136,7 +149,10 @@ def _fp32_reference(logits, token_ids, softcap=30.0):
 
 def _fp32_backward_reference(logits, token_ids, upstream, *, softcap=30.0):
     """Keep the reference gradient in FP32, including for FP16/BF16 candidates."""
-    with torch.enable_grad(), torch.autocast(device_type=logits.device.type, enabled=False):
+    with (
+        torch.enable_grad(),
+        torch.autocast(device_type=logits.device.type, enabled=False),
+    ):
         return _native_backward(logits.float(), token_ids, upstream.float(), softcap=softcap)
 
 
@@ -199,7 +215,7 @@ def test_noncontiguous_inputs(forward_impl, dtype):
 
 @pytest.mark.parametrize("dtype", _DTYPES)
 @pytest.mark.parametrize("vocab", (1025, 262144))
-@pytest.mark.parametrize("forward_impl", ("row", "parallel", "row_accumulate", "row_pipelined"))
+@pytest.mark.parametrize("forward_impl", ("row", "parallel", "row_pipelined"))
 def test_triton_row_invariance(dtype, vocab, forward_impl):
     if not torch.cuda.is_available():
         pytest.skip("A CUDA or ROCm GPU is required")
@@ -221,9 +237,7 @@ def test_triton_row_invariance(dtype, vocab, forward_impl):
     _assert_bitwise(changed[1:], together[1:])
 
 
-@pytest.fixture(
-    params=("pytorch", "triton", "triton_parallel", "triton_row_accumulate", "triton_row_pipelined")
-)
+@pytest.fixture(params=("pytorch", "triton", "triton_parallel", "triton_row_pipelined"))
 def backward_impl(request):
     if request.param == "pytorch":
         return _native_backward, "cpu"
@@ -278,7 +292,11 @@ def test_configurable_softcap_accuracy_and_inference(operator_impl, softcap, dty
         backward_from_saved_graph, logits, ids, upstream, softcap=softcap
     )
     _assert_backward(
-        backward_from_saved_graph, logits, ids, torch.zeros_like(upstream), softcap=softcap
+        backward_from_saved_graph,
+        logits,
+        ids,
+        torch.zeros_like(upstream),
+        softcap=softcap,
     )
     repeated_gradient = backward_from_saved_graph(logits, ids, upstream)
     _assert_bitwise(repeated_gradient, expected_gradient)
@@ -409,7 +427,11 @@ def test_native_gpu_reference_accuracy_and_inference(dtype, softcap, vocab):
         with context:
             _assert_bitwise(op(logits, ids), training.detach())
     _assert_backward(
-        partial(_native_backward, softcap=softcap), logits, ids, upstream, softcap=softcap
+        partial(_native_backward, softcap=softcap),
+        logits,
+        ids,
+        upstream,
+        softcap=softcap,
     )
 
 
@@ -474,6 +496,63 @@ def test_cap64_exp_rounding_regression(operator_impl, dtype, value):
         _assert_bitwise(repeated, gradient)
 
 
+@pytest.mark.parametrize(
+    ("dtype", "softcap"),
+    (
+        pytest.param(torch.float16, 64.0, id="fp16-cap64"),
+        pytest.param(torch.float16, 70.0, id="fp16-cap70"),
+        pytest.param(torch.bfloat16, 70.0, id="bf16-cap70"),
+        pytest.param(torch.float32, 64.0, id="fp32-cap64"),
+        pytest.param(torch.float32, 70.0, id="fp32-cap70"),
+    ),
+)
+@pytest.mark.parametrize("value", ("output", "gradient", "invariance"))
+def test_large_cap_wide_benchmark_regression(dtype, softcap, value):
+    """Retain the five H100 benchmark failures with unchanged FP32 contract limits.
+
+    Reproduce the original [1024, 262144] GPU-generated inputs, including RNG
+    draw order for token IDs and upstreams. CPU generation or reducing M before
+    generation would change the fixture. Other GPUs may generate different
+    values; this test checks their accuracy too, without asserting failing rows.
+
+    AUTO is the public implementation that failed the benchmark. Independent
+    output, gradient and invariance cases prevent a forward accuracy failure
+    from hiding the other checks. No xfail or tolerance relaxation is applied.
+    The FP32 reference's large intermediates require several GiB of GPU memory.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("A CUDA or ROCm GPU is required")
+    from rl_engine.backends.shared.triton.logprob.softcapped_selected_logprob import (
+        TritonSoftcappedSelectedLogprobOp,
+    )
+
+    device = torch.device("cuda", torch.cuda.current_device())
+    generator = torch.Generator(device=device).manual_seed(415)
+    shape = (1024, 262144)
+    logits = (
+        30.0 * torch.randn(shape, device=device, dtype=torch.float32, generator=generator)
+    ).to(dtype)
+    ids = torch.randint(shape[1], (shape[0],), device=device, generator=generator)
+    upstream = torch.randn(shape[0], device=device, dtype=torch.float32, generator=generator)
+    op = TritonSoftcappedSelectedLogprobOp()
+
+    if value == "output":
+        with torch.no_grad():
+            output = op(logits, ids, softcap=softcap)
+        _assert_fp32_accuracy(output, _fp32_reference(logits, ids, softcap), "forward_accuracy")
+    elif value == "gradient":
+        logits.requires_grad_(True)
+        output = op(logits, ids, softcap=softcap)
+        gradient = torch.autograd.grad(output, logits, grad_outputs=upstream)[0]
+        expected = _fp32_backward_reference(logits, ids, upstream, softcap=softcap)
+        _assert_fp32_accuracy(gradient, expected, "gradient_accuracy")
+    else:
+        training = op(logits.requires_grad_(True), ids, softcap=softcap)
+        for context in (torch.no_grad(), torch.inference_mode()):
+            with context:
+                _assert_bitwise(op(logits, ids, softcap=softcap), training.detach())
+
+
 @pytest.mark.parametrize("softcap", (0.0, -1.0, float("nan"), float("inf"), 1e-50, 100.0))
 def test_operator_rejects_unsafe_softcap(operator_impl, softcap):
     """Public Ops reject unsafe caps before dispatching to a private launcher."""
@@ -487,18 +566,50 @@ def test_operator_rejects_unsafe_softcap(operator_impl, softcap):
 @pytest.mark.parametrize(
     "logits_shape,logits_dtype,ids_shape,ids_dtype,error,message",
     [
-        pytest.param((7,), torch.float32, (1,), torch.int64, ValueError, "shape", id="logits-rank"),
         pytest.param(
-            (1, 0), torch.float32, (1,), torch.int64, ValueError, "V > 0", id="empty-vocabulary"
+            (7,),
+            torch.float32,
+            (1,),
+            torch.int64,
+            ValueError,
+            "shape",
+            id="logits-rank",
         ),
         pytest.param(
-            (1, 7), torch.int64, (1,), torch.int64, TypeError, "logits.*dtype", id="logits-dtype"
+            (1, 0),
+            torch.float32,
+            (1,),
+            torch.int64,
+            ValueError,
+            "V > 0",
+            id="empty-vocabulary",
         ),
         pytest.param(
-            (1, 7), torch.float32, (2,), torch.int64, ValueError, "token_ids.*shape", id="ids-shape"
+            (1, 7),
+            torch.int64,
+            (1,),
+            torch.int64,
+            TypeError,
+            "logits.*dtype",
+            id="logits-dtype",
         ),
         pytest.param(
-            (1, 7), torch.float32, (1,), torch.float32, TypeError, "int64", id="ids-dtype"
+            (1, 7),
+            torch.float32,
+            (2,),
+            torch.int64,
+            ValueError,
+            "token_ids.*shape",
+            id="ids-shape",
+        ),
+        pytest.param(
+            (1, 7),
+            torch.float32,
+            (1,),
+            torch.float32,
+            TypeError,
+            "int64",
+            id="ids-dtype",
         ),
     ],
 )
@@ -627,7 +738,7 @@ def test_backward_noncontiguous_inputs(backward_impl, dtype):
 
 @pytest.mark.parametrize("dtype", _DTYPES)
 @pytest.mark.parametrize("vocab", (1025, 262144))
-@pytest.mark.parametrize("forward_impl", ("row", "parallel", "row_accumulate", "row_pipelined"))
+@pytest.mark.parametrize("forward_impl", ("row", "parallel", "row_pipelined"))
 def test_triton_backward_row_invariance(dtype, vocab, forward_impl):
     if not torch.cuda.is_available():
         pytest.skip("A CUDA or ROCm GPU is required")
@@ -657,7 +768,6 @@ def test_triton_backward_row_invariance(dtype, vocab, forward_impl):
         "pytorch",
         "triton",
         "triton_parallel",
-        "triton_row_accumulate",
         "triton_row_pipelined",
         "triton_auto",
     )
@@ -675,7 +785,6 @@ def operator_impl(request):
     impl = {
         "triton": SoftcappedLogprobStrategy.ROW,
         "triton_parallel": SoftcappedLogprobStrategy.PARALLEL,
-        "triton_row_accumulate": SoftcappedLogprobStrategy.ROW_ACCUMULATE,
         "triton_row_pipelined": SoftcappedLogprobStrategy.ROW_PIPELINED,
         "triton_auto": None,
     }[request.param]
@@ -727,9 +836,7 @@ def test_operator_autograd_and_inference(operator_impl, dtype, layout):
 
 @pytest.mark.parametrize("dtype", _DTYPES)
 @pytest.mark.parametrize("vocab", (1025, 262144))
-@pytest.mark.parametrize(
-    "forward_impl", (None, "row", "parallel", "row_accumulate", "row_pipelined")
-)
+@pytest.mark.parametrize("forward_impl", (None, "row", "parallel", "row_pipelined"))
 @pytest.mark.parametrize("softcap", (30.0, 50.0))
 def test_triton_noncurrent_device_forward_backward(dtype, vocab, forward_impl, softcap):
     if torch.cuda.device_count() < 2:
@@ -754,13 +861,16 @@ def test_triton_noncurrent_device_forward_backward(dtype, vocab, forward_impl, s
         output = op(logits, token_ids, softcap=softcap)
         assert torch.cuda.current_device() == 0
         assert output.device == device and output.dtype == torch.float32
-        saved_logits, saved_ids, log_sum_exp = output.grad_fn.saved_tensors
-        assert all(value.device == device for value in (saved_logits, saved_ids, log_sum_exp))
+        saved_logits, saved_ids, row_max, log_sum_exp_shifted = output.grad_fn.saved_tensors
+        assert all(
+            value.device == device
+            for value in (saved_logits, saved_ids, row_max, log_sum_exp_shifted)
+        )
 
         # Call backward directly too: autograd may itself select the forward
         # device, which could otherwise hide a missing guard in the launcher.
         direct_gradient = _launch_softcapped_selected_logprob_bwd(
-            logits, token_ids, upstream, log_sum_exp, softcap
+            logits, token_ids, upstream, row_max, log_sum_exp_shifted, softcap
         )
         assert torch.cuda.current_device() == 0
         (gradient,) = torch.autograd.grad(output, logits, grad_outputs=upstream)
@@ -787,8 +897,8 @@ def test_triton_noncurrent_device_forward_backward(dtype, vocab, forward_impl, s
 
 @pytest.mark.parametrize("dtype", _DTYPES)
 @pytest.mark.parametrize("shape", ((0, 7), (3, 1025), (2, 262144)))
-@pytest.mark.parametrize("forward_impl", ("row", "parallel", "row_accumulate", "row_pipelined"))
-def test_triton_saved_log_sum_exp_and_repeated_backward(dtype, shape, forward_impl):
+@pytest.mark.parametrize("forward_impl", ("row", "parallel", "row_pipelined"))
+def test_triton_saved_shifted_statistics_and_repeated_backward(dtype, shape, forward_impl):
     if not torch.cuda.is_available():
         pytest.skip("A CUDA or ROCm GPU is required")
     from rl_engine.backends.shared.triton.logprob.softcapped_selected_logprob import (
@@ -804,15 +914,18 @@ def test_triton_saved_log_sum_exp_and_repeated_backward(dtype, shape, forward_im
     )
     op = TritonSoftcappedSelectedLogprobOp(forward_impl=SoftcappedLogprobStrategy(forward_impl))
     output = op(logits, ids)
-    _, _, log_sum_exp = output.grad_fn.saved_tensors
-    assert log_sum_exp.shape == logits.shape[:1]
-    assert log_sum_exp.dtype == torch.float32 and log_sum_exp.device == logits.device
-    assert log_sum_exp.numel() * log_sum_exp.element_size() == 4 * shape[0]
+    _, _, row_max, log_sum_exp_shifted = output.grad_fn.saved_tensors
+    for statistic in (row_max, log_sum_exp_shifted):
+        assert statistic.shape == logits.shape[:1]
+        assert statistic.dtype == torch.float32 and statistic.device == logits.device
+        assert statistic.numel() * statistic.element_size() == 4 * shape[0]
     divisor = torch.tensor(30.0, device=logits.device, dtype=torch.float32)
     scores = 30.0 * torch.tanh(torch.div(logits.detach().float(), divisor))
-    expected_lse = scores.exp().sum(dim=-1).log()
-    _assert_fp32_accuracy(log_sum_exp, expected_lse, "forward_accuracy")
-    saved_before = log_sum_exp.clone()
+    expected_max = scores.amax(dim=-1)
+    expected_log_sum = (scores - expected_max[:, None]).exp().sum(dim=-1).log()
+    _assert_fp32_accuracy(row_max, expected_max, "forward_accuracy")
+    _assert_fp32_accuracy(log_sum_exp_shifted, expected_log_sum, "forward_accuracy")
+    saved_before = (row_max.clone(), log_sum_exp_shifted.clone())
 
     def backward_from_saved_graph(x, token_ids, upstream):
         return torch.autograd.grad(output, x, grad_outputs=upstream, retain_graph=True)[0]
@@ -822,14 +935,15 @@ def test_triton_saved_log_sum_exp_and_repeated_backward(dtype, shape, forward_im
     for _ in range(2):
         upstream = torch.randn(shape[0], generator=generator).to(device="cuda")
         _assert_backward(backward_from_saved_graph, logits, ids, upstream)
-        _assert_bitwise(log_sum_exp, saved_before)
+        _assert_bitwise(row_max, saved_before[0])
+        _assert_bitwise(log_sum_exp_shifted, saved_before[1])
 
     with torch.inference_mode():
         _assert_bitwise(op(logits, ids), output.detach())
 
 
 @pytest.mark.parametrize("dtype", _DTYPES)
-@pytest.mark.parametrize("forward_impl", ("row", "parallel", "row_accumulate", "row_pipelined"))
+@pytest.mark.parametrize("forward_impl", ("row", "parallel", "row_pipelined"))
 def test_triton_padding_and_strided_layout_invariance(dtype, forward_impl):
     if not torch.cuda.is_available():
         pytest.skip("A CUDA or ROCm GPU is required")
@@ -868,7 +982,8 @@ def test_triton_padding_and_strided_layout_invariance(dtype, forward_impl):
 
 @pytest.mark.parametrize("dtype", _DTYPES)
 @pytest.mark.parametrize(
-    "vocab", (1, 1023, 1024, 1025, 2048, 2049, 3073, 4096, 4097, 5121, 6145, 7169, 262144)
+    "vocab",
+    (1, 1023, 1024, 1025, 2048, 2049, 3073, 4096, 4097, 5121, 6145, 7169, 262144),
 )
 @pytest.mark.parametrize("merge_unroll", (1, 4))
 def test_triton_forward_variants_match_bitwise(dtype, vocab, merge_unroll):
@@ -896,19 +1011,18 @@ def test_triton_forward_variants_match_bitwise(dtype, vocab, merge_unroll):
     for reference, result in zip(expected, actual, strict=True):
         _assert_bitwise(result, reference)
     grad_expected = _launch_softcapped_selected_logprob_bwd(
-        logits, ids, upstream, expected[1], softcap=30.0
+        logits, ids, upstream, expected[1], expected[2], softcap=30.0
     )
     grad_actual = _launch_softcapped_selected_logprob_bwd(
-        logits, ids, upstream, actual[1], softcap=30.0
+        logits, ids, upstream, actual[1], actual[2], softcap=30.0
     )
     _assert_bitwise(grad_actual, grad_expected)
 
 
 @pytest.mark.parametrize("dtype", _DTYPES)
 @pytest.mark.parametrize("vocab", (1, 1025, 2049, 4097, 262144))
-@pytest.mark.parametrize("accumulate", (False, True))
 @pytest.mark.parametrize("stages", (2, 3))
-def test_triton_pipeline_matches_its_unhinted_family(dtype, vocab, accumulate, stages):
+def test_triton_pipeline_matches_its_unhinted_family(dtype, vocab, stages):
     if not torch.cuda.is_available():
         pytest.skip("A CUDA or ROCm GPU is required")
     from rl_engine.backends.shared.triton.logprob.softcapped_selected_logprob import (
@@ -923,33 +1037,87 @@ def test_triton_pipeline_matches_its_unhinted_family(dtype, vocab, accumulate, s
     logits[2].fill_(-3000.0)
     ids = torch.tensor([0, vocab - 1, vocab // 2, vocab - 1, 0], device="cuda")
     upstream = torch.tensor([1.0, -2.0, 0.0, -0.75, 0.25], device="cuda")
-    expected = _launch_softcapped_selected_logprob_fwd(
-        logits, ids, softcap=30.0, accumulate_before_reduce=accumulate
-    )
+    expected = _launch_softcapped_selected_logprob_fwd(logits, ids, softcap=30.0)
     actual = _launch_softcapped_selected_logprob_fwd(
-        logits, ids, softcap=30.0, accumulate_before_reduce=accumulate, pipeline_stages=stages
+        logits, ids, softcap=30.0, pipeline_stages=stages
     )
     for result, reference in zip(actual, expected, strict=True):
         _assert_bitwise(result, reference)
     grad_expected = _launch_softcapped_selected_logprob_bwd(
-        logits, ids, upstream, expected[1], softcap=30.0
+        logits, ids, upstream, expected[1], expected[2], softcap=30.0
     )
     grad_actual = _launch_softcapped_selected_logprob_bwd(
-        logits, ids, upstream, actual[1], softcap=30.0
+        logits, ids, upstream, actual[1], actual[2], softcap=30.0
     )
     _assert_bitwise(grad_actual, grad_expected)
     _assert_fp32_accuracy(actual[0], _fp32_reference(logits, ids), "forward_accuracy")
     _assert_fp32_accuracy(
-        grad_actual, _fp32_backward_reference(logits, ids, upstream), "gradient_accuracy"
+        grad_actual,
+        _fp32_backward_reference(logits, ids, upstream),
+        "gradient_accuracy",
     )
 
 
 def _evaluate_triton_with_statistics(op, logits, token_ids, upstream):
     leaf = logits.detach().requires_grad_(True)
     output = op(leaf, token_ids)
-    _, _, log_sum_exp = output.grad_fn.saved_tensors
+    _, _, row_max, log_sum_exp_shifted = output.grad_fn.saved_tensors
     gradient = torch.autograd.grad(output, leaf, grad_outputs=upstream)[0]
-    return output.detach(), log_sum_exp, gradient
+    return output.detach(), row_max, log_sum_exp_shifted, gradient
+
+
+@pytest.mark.parametrize("dtype", _DTYPES)
+@pytest.mark.parametrize("softcap", (0.125, 30.0, 50.0, 64.0, 70.0))
+def test_shifted_maxima_tails_and_signed_zero_preserve_all_strategy_bits(dtype, softcap):
+    """Exercise negative maxima, tied maxima, signed zeros and a maximum in a tail.
+
+    Validate outputs and all input gradients against Native FP32, then require
+    exact agreement of outputs, both saved statistics and gradients across
+    every public strategy and AUTO. Uniform rows also have a known logprob.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("A CUDA or ROCm GPU is required")
+    from rl_engine.backends.shared.triton.logprob.softcapped_selected_logprob import (
+        SoftcappedLogprobStrategy,
+        TritonSoftcappedSelectedLogprobOp,
+    )
+
+    vocab = 3073
+    logits = torch.full((6, vocab), -3000.0, device="cuda", dtype=dtype)
+    logits[1].fill_(3000.0)
+    logits[2].zero_()
+    logits[2, ::2] = -0.0
+    logits[3, -1] = 3000.0
+    logits[4, 1023:1025] = 3000.0
+    logits[5].fill_(-2.0 * softcap)
+    logits[5, -1] = -0.5 * softcap
+    ids = torch.tensor([0, vocab - 1, 1024, vocab - 1, 1023, 0], device="cuda")
+    upstream = torch.tensor([0.5, -1.0, 2.0, -0.75, 0.0, 1.5], device="cuda")
+    expected_output = _fp32_reference(logits, ids, softcap)
+    expected_gradient = _fp32_backward_reference(logits, ids, upstream, softcap=softcap)
+    divisor = torch.tensor(softcap, device="cuda", dtype=torch.float32)
+    expected_max = (softcap * torch.tanh(torch.div(logits.float(), divisor))).amax(dim=-1)
+    expected_uniform = torch.full((3,), -math.log(vocab), device="cuda", dtype=torch.float32)
+    reference = None
+    for strategy in (*SoftcappedLogprobStrategy, None):
+        op = partial(TritonSoftcappedSelectedLogprobOp(forward_impl=strategy), softcap=softcap)
+        actual = _evaluate_triton_with_statistics(op, logits, ids, upstream)
+        output, row_max, log_sum, gradient = actual
+        _assert_fp32_accuracy(output, expected_output, "forward_accuracy")
+        _assert_fp32_accuracy(gradient, expected_gradient, "gradient_accuracy")
+        _assert_fp32_accuracy(row_max, expected_max, "forward_accuracy")
+        _assert_fp32_accuracy(output[:3], expected_uniform, "forward_accuracy")
+        assert row_max[0] < 0 and row_max[5] < 0
+        assert row_max[2] == 0 and not torch.signbit(row_max[2])
+        assert torch.all((log_sum >= 0) & (log_sum <= math.log(vocab) + 1e-5))
+        if reference is None:
+            reference = actual
+        else:
+            for value, expected in zip(actual, reference, strict=True):
+                _assert_bitwise(value, expected)
+        for context in (torch.no_grad(), torch.inference_mode()):
+            with context:
+                _assert_bitwise(op(logits, ids), output)
 
 
 @pytest.mark.parametrize("dtype", _DTYPES)
@@ -994,6 +1162,36 @@ def test_triton_auto_matches_explicit_row_and_inference(dtype, shape, softcap):
         _assert_bitwise(op(logits, ids), reference[0])
     with torch.inference_mode():
         _assert_bitwise(op(logits, ids), reference[0])
+
+
+@pytest.mark.parametrize("dtype", _DTYPES)
+@pytest.mark.parametrize("softcap", _SOFTCAPS)
+@pytest.mark.parametrize("vocab", (1025, 262145))
+def test_all_strategies_preserve_output_statistics_and_all_gradients(dtype, softcap, vocab):
+    """Every selectable strategy agrees, including wide tails and nondefault caps."""
+    if not torch.cuda.is_available():
+        pytest.skip("A CUDA or ROCm GPU is required")
+    from rl_engine.backends.shared.triton.logprob.softcapped_selected_logprob import (
+        SoftcappedLogprobStrategy,
+        TritonSoftcappedSelectedLogprobOp,
+    )
+
+    generator = torch.Generator().manual_seed(464)
+    logits = (30 * torch.randn((3, vocab), generator=generator)).to(device="cuda", dtype=dtype)
+    ids = torch.tensor([0, vocab // 2, vocab - 1], device="cuda")
+    upstream = torch.tensor([0.5, -2.0, 0.0], device="cuda")
+    expected = None
+    for strategy in (*SoftcappedLogprobStrategy, None):
+        op = partial(TritonSoftcappedSelectedLogprobOp(forward_impl=strategy), softcap=softcap)
+        actual = _evaluate_triton_with_statistics(op, logits, ids, upstream)
+        if expected is None:
+            expected = actual
+        else:
+            for result, reference in zip(actual, expected, strict=True):
+                _assert_bitwise(result, reference)
+        for context in (torch.no_grad(), torch.inference_mode()):
+            with context:
+                _assert_bitwise(op(logits, ids), expected[0])
 
 
 @pytest.mark.parametrize("dtype", _DTYPES)
@@ -1106,7 +1304,7 @@ def test_triton_production_range_boundary_preserves_output_statistics_and_gradie
         _assert_bitwise(result, expected)
     del together, result, expected
     # The whole batch selects ROW; both chunks select PARALLEL. Output, saved
-    # LSE, and gradients must keep the same bytes across this real policy switch.
+    # statistics and gradients must keep the same bytes across this real policy switch.
     for start, stop in ((0, max_rows), (max_rows, n_rows)):
         actual = _evaluate_triton_with_statistics(
             auto, logits[start:stop], ids[start:stop], upstream[start:stop]
@@ -1116,7 +1314,9 @@ def test_triton_production_range_boundary_preserves_output_statistics_and_gradie
         del actual, result, expected
 
 
-def test_triton_explicit_strategy_bypasses_device_lookup_and_auto_validates_first(monkeypatch):
+def test_triton_explicit_strategy_bypasses_device_lookup_and_auto_validates_first(
+    monkeypatch,
+):
     if not torch.cuda.is_available():
         pytest.skip("A CUDA or ROCm GPU is required")
     from rl_engine.backends.shared.triton.logprob import softcapped_selected_logprob as module
@@ -1152,6 +1352,8 @@ def test_triton_parallel_forward_scratch_and_output_bounds(dtype, vocab, merge_u
     from rl_engine.backends.shared.triton.logprob.softcapped_selected_logprob import (
         _BLOCK_V,
         _launch_softcapped_selected_logprob_fwd,
+        _softcapped_selected_logprob_fwd_max_merge_kernel,
+        _softcapped_selected_logprob_fwd_max_partial_kernel,
         _softcapped_selected_logprob_fwd_merge_kernel,
         _softcapped_selected_logprob_fwd_partial_kernel,
     )
@@ -1171,17 +1373,45 @@ def test_triton_parallel_forward_scratch_and_output_bounds(dtype, vocab, merge_u
 
     scratch_storage, scratch = guarded((n_rows, n_tiles))
     output_storage, output = guarded((n_rows,))
-    lse_storage, log_sum_exp = guarded((n_rows,))
+    max_storage, row_max = guarded((n_rows,))
+    lse_storage, log_sum_exp_shifted = guarded((n_rows,))
+    _softcapped_selected_logprob_fwd_max_partial_kernel[(n_rows, n_tiles)](
+        logits,
+        scratch,
+        vocab,
+        n_tiles,
+        _BLOCK_V,
+        SOFTCAP=30.0,
+        num_warps=4,
+        enable_fp_fusion=False,
+    )
+    max_scratch_before = scratch.clone()
+    _softcapped_selected_logprob_fwd_max_merge_kernel[(n_rows,)](
+        scratch, row_max, n_tiles, num_warps=4, enable_fp_fusion=False
+    )
+    _assert_bitwise(scratch, max_scratch_before)
+    row_max_before = row_max.clone()
+    # The sum stage overwrites every entry; no maximum may remain in the scratch.
+    scratch.fill_(float("nan"))
     _softcapped_selected_logprob_fwd_partial_kernel[(n_rows, n_tiles)](
-        logits, scratch, vocab, n_tiles, _BLOCK_V, SOFTCAP=30.0, num_warps=4, enable_fp_fusion=False
+        logits,
+        row_max,
+        scratch,
+        vocab,
+        n_tiles,
+        _BLOCK_V,
+        SOFTCAP=30.0,
+        num_warps=4,
+        enable_fp_fusion=False,
     )
     scratch_before = scratch.clone()
     _softcapped_selected_logprob_fwd_merge_kernel[(n_rows,)](
         logits,
         ids,
+        row_max,
         scratch,
         output,
-        log_sum_exp,
+        log_sum_exp_shifted,
         vocab,
         n_tiles,
         SOFTCAP=30.0,
@@ -1189,13 +1419,17 @@ def test_triton_parallel_forward_scratch_and_output_bounds(dtype, vocab, merge_u
         num_warps=4,
         enable_fp_fusion=False,
     )
-    expected, expected_lse = _launch_softcapped_selected_logprob_fwd(logits, ids, softcap=30.0)
+    expected, expected_max, expected_log_sum = _launch_softcapped_selected_logprob_fwd(
+        logits, ids, softcap=30.0
+    )
     assert torch.isfinite(scratch).all()
     _assert_bitwise(scratch, scratch_before)
-    _assert_bitwise(log_sum_exp, expected_lse)
+    _assert_bitwise(row_max, expected_max)
+    _assert_bitwise(row_max, row_max_before)
+    _assert_bitwise(log_sum_exp_shifted, expected_log_sum)
     _assert_bitwise(output[1:3], expected[1:3])
     assert torch.isnan(output[[0, 3]]).all()
-    for storage in (scratch_storage, output_storage, lse_storage):
+    for storage in (scratch_storage, output_storage, max_storage, lse_storage):
         assert torch.equal(storage[[0, -1]], torch.full((2,), -123.0, device="cuda"))
 
 
@@ -1223,12 +1457,15 @@ def test_triton_backward_tile_coverage_and_output_bounds(dtype, vocab):
     grad_logits.fill_(float("nan"))
 
     def backward_into_guarded_output(x, token_ids, grad_output):
-        _, log_sum_exp = _launch_softcapped_selected_logprob_fwd(x, token_ids, softcap=30.0)
+        _, row_max, log_sum_exp_shifted = _launch_softcapped_selected_logprob_fwd(
+            x, token_ids, softcap=30.0
+        )
         _softcapped_selected_logprob_bwd_kernel[(n_rows, triton.cdiv(vocab, _BLOCK_V))](
             x,
             token_ids,
             grad_output,
-            log_sum_exp,
+            row_max,
+            log_sum_exp_shifted,
             grad_logits,
             vocab,
             BLOCK_V=_BLOCK_V,
@@ -1264,7 +1501,8 @@ def test_triton_row_offsets_across_int32_boundary(dtype):
         ids,
         upstream,
         output,
-        log_sum_exp,
+        row_max,
+        log_sum_exp_shifted,
         vocab: tl.constexpr,
         START_ROW: tl.constexpr,
         BACKWARD: tl.constexpr,
@@ -1277,7 +1515,8 @@ def test_triton_row_offsets_across_int32_boundary(dtype):
                     x - base,
                     ids - START_ROW,
                     upstream - START_ROW,
-                    log_sum_exp - START_ROW,
+                    row_max - START_ROW,
+                    log_sum_exp_shifted - START_ROW,
                     output - base,
                     vocab,
                     BLOCK,
@@ -1288,7 +1527,8 @@ def test_triton_row_offsets_across_int32_boundary(dtype):
                     x - base,
                     ids - START_ROW,
                     output - START_ROW,
-                    log_sum_exp - START_ROW,
+                    row_max - START_ROW,
+                    log_sum_exp_shifted - START_ROW,
                     vocab,
                     BLOCK,
                     SOFTCAP=30.0,
@@ -1300,7 +1540,8 @@ def test_triton_row_offsets_across_int32_boundary(dtype):
     x = (torch.randn((3, vocab), generator=generator) * 15).to(device="cuda", dtype=dtype)
     ids = torch.tensor([0, 1024, vocab - 1], device="cuda")
     upstream = torch.tensor([0.25, -2.0, 1.5], device="cuda")
-    log_sum_exp = torch.full((4,), -123.0, device="cuda", dtype=torch.float32)
+    row_max = torch.full((4,), -123.0, device="cuda", dtype=torch.float32)
+    log_sum_exp_shifted = torch.full((4,), -123.0, device="cuda", dtype=torch.float32)
     for backward in (False, True):
         shape = (4, vocab) if backward else (4,)
         output = torch.full(
@@ -1312,7 +1553,8 @@ def test_triton_row_offsets_across_int32_boundary(dtype):
             ids,
             upstream,
             output,
-            log_sum_exp,
+            row_max,
+            log_sum_exp_shifted,
             vocab,
             START_ROW=start_row,
             BACKWARD=backward,
@@ -1324,7 +1566,10 @@ def test_triton_row_offsets_across_int32_boundary(dtype):
             _fp32_backward_reference(x, ids, upstream) if backward else _fp32_reference(x, ids)
         )
         _assert_fp32_accuracy(
-            output[:3], expected, "gradient_accuracy" if backward else "forward_accuracy"
+            output[:3],
+            expected,
+            "gradient_accuracy" if backward else "forward_accuracy",
         )
         assert torch.equal(output[3:], torch.full_like(output[3:], -123.0))
-        assert torch.equal(log_sum_exp[3:], torch.full_like(log_sum_exp[3:], -123.0))
+        for statistic in (row_max, log_sum_exp_shifted):
+            assert torch.equal(statistic[3:], torch.full_like(statistic[3:], -123.0))

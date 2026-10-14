@@ -76,6 +76,39 @@ def test_accuracy_gate_rejects_incorrect_output():
         _check_accuracy(reference, wrong_output, logits, ids, upstream, softcap=50.0)
 
 
+@pytest.mark.parametrize("mismatch", (None, "output", "gradient"))
+def test_strategy_gate_checks_all_gradient_bytes(mismatch):
+    """Cross-strategy checks cannot stop at identical forward values."""
+    native = NativeSoftcappedSelectedLogprobOp()
+    logits = torch.tensor([[1.0, -2.0, 3.0]])
+    ids, upstream = torch.tensor([0]), torch.tensor([0.5])
+
+    def alternative(x, tokens, *, softcap):
+        output = native(x, tokens, softcap=softcap)
+        if mismatch == "output":
+            return output + 0.1
+        if mismatch == "gradient":
+            return output.detach() + 0.5 * (output - output.detach())
+        return output
+
+    def check():
+        return _check_accuracy(
+            native,
+            native,
+            logits,
+            ids,
+            upstream,
+            softcap=50.0,
+            strategy_candidates=(("alternative", alternative),),
+        )
+
+    if mismatch is None:
+        check()
+    else:
+        with pytest.raises(AssertionError, match=f"Bitwise mismatch: alternative {mismatch}"):
+            check()
+
+
 @pytest.mark.parametrize("dtype", (torch.float16, torch.bfloat16, torch.float32))
 def test_accuracy_reference_keeps_fp32_gradients_and_quantized_inputs(dtype):
     """The untimed reference must not round its gradient to the candidate dtype."""
@@ -341,6 +374,8 @@ def test_public_auto_benchmark_gpu_smoke(tmp_path, dtype, softcap):
     assert report["environment"]["operator"] == "softcapped_selected_logprob"
     for row in report["results"]:
         assert row["triton_strategy"] == "row"
+        assert row["train_inference_bitwise"]
+        assert set(row["strategy_bitwise"]) == {"row", "parallel", "row_pipelined"}
         assert row["speedup"] > 0
         assert row["native"]["std_ms"] is not None
         assert row["triton"]["std_ms"] is not None

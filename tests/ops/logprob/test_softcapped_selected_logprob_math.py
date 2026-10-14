@@ -37,7 +37,6 @@ _GRADIENT_MATH_ATOL = {
         "native_gpu",
         "row",
         "parallel",
-        "row_accumulate",
         "row_pipelined",
         "auto",
     )

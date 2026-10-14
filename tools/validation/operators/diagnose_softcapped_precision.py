@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 RL-Kernel Contributors
-"""Trace the softcap=70 failure without changing production math or tolerances."""
+"""Compare shifted and legacy ROW arithmetic with Native FP32 and independent FP64."""
 
 import argparse
 import json
@@ -34,10 +34,21 @@ def _trace_row(
     V: tl.constexpr,
     CAP: tl.constexpr,
     BLOCK: tl.constexpr,
+    SHIFTED: tl.constexpr,
 ):
     """Instrument the existing ROW arithmetic; compare its output with production."""
     row = tl.program_id(0).to(tl.int64)
     cols = tl.arange(0, BLOCK)
+    row_max = tl.full((), 0.0, tl.float32)
+    if SHIFTED:
+        row_max = tl.full((), float("-inf"), tl.float32)
+        for start in range(0, V, BLOCK):
+            offsets = start + cols
+            mask = offsets < V
+            x = tl.load(x_ptr + row * V + offsets, mask=mask, other=0.0).to(tl.float32)
+            s = CAP * libdevice.tanh(tl.div_rn(x, CAP))
+            row_max = tl.maximum(row_max, tl.max(tl.where(mask, s, float("-inf")), axis=0))
+        row_max = tl.where(row_max == 0.0, 0.0, row_max)
     total = tl.full((), 0.0, tl.float32)
     for start in range(0, V, BLOCK):
         offsets = start + cols
@@ -46,7 +57,7 @@ def _trace_row(
         q = tl.div_rn(x, CAP)
         t = libdevice.tanh(q)
         s = CAP * t
-        e = tl.where(mask, libdevice.exp(s), 0.0)
+        e = tl.where(mask, libdevice.exp(s - row_max), 0.0)
         partial = tl.sum(e, axis=0)
         total = total + partial
         tl.store(quotient_ptr + row * V + offsets, q, mask=mask)
@@ -58,10 +69,19 @@ def _trace_row(
     token = tl.load(ids_ptr + row).to(tl.int64)
     selected_x = tl.load(x_ptr + row * V + token).to(tl.float32)
     selected = CAP * libdevice.tanh(tl.div_rn(selected_x, CAP))
-    tl.store(stats_ptr + row * 4, total)
-    tl.store(stats_ptr + row * 4 + 1, lse)
-    tl.store(stats_ptr + row * 4 + 2, selected)
-    tl.store(stats_ptr + row * 4 + 3, selected - lse)
+    selected_shifted = selected - row_max
+    output = selected_shifted - lse
+    tl.store(stats_ptr + row * 7, total)
+    tl.store(stats_ptr + row * 7 + 1, lse)
+    tl.store(stats_ptr + row * 7 + 2, selected)
+    tl.store(stats_ptr + row * 7 + 3, output)
+    tl.store(stats_ptr + row * 7 + 4, row_max)
+    tl.store(stats_ptr + row * 7 + 5, selected_shifted)
+    # Diagnostic counterfactual only; production contains no FP64 finishing code.
+    output_f64_finish = (
+        selected.to(tl.float64) - row_max.to(tl.float64) - libdevice.log(total.to(tl.float64))
+    ).to(tl.float32)
+    tl.store(stats_ptr + row * 7 + 6, output_f64_finish)
 
 
 def same_bits(a, b):
@@ -79,7 +99,7 @@ def same_bits(a, b):
 def run_trace(out: Path) -> None:
     """Reproduce the fixed FP32 failure and save cumulative rounding diagnostics.
 
-    Instrumentation is diagnostic only. Its output and LSE must match the
+    Instrumentation is diagnostic only. Its output, maximum and shifted log-sum must match the
     production ROW kernel before its stages can explain a production failure.
     The JSON reports precision failures without turning this into a replacement
     for pytest; callers must run the FP32 acceptance and independent FP64
@@ -93,10 +113,16 @@ def run_trace(out: Path) -> None:
     cpu_x = torch.randn((17, 32767), generator=generator) * cap
     ids_cpu = torch.arange(17) * 1025
     x, ids = cpu_x.cuda(), ids_cpu.cuda()
-    torch.save({"logits": cpu_x, "token_ids": ids_cpu, "softcap": cap}, out / "failure-input.pt")
+    torch.save(
+        {"logits": cpu_x, "token_ids": ids_cpu, "softcap": cap},
+        out / "failure-input.pt",
+    )
     scores64 = cap * torch.tanh(cpu_x.double() / cap)
     expected = torch.log_softmax(scores64, dim=-1).gather(1, ids_cpu[:, None]).squeeze(1)
-    stages = {"fp64_math": expected, "fp64_rounded_once_to_fp32": expected.float().double()}
+    stages = {
+        "fp64_math": expected,
+        "fp64_rounded_once_to_fp32": expected.float().double(),
+    }
 
     def selected(scores):
         return scores.gather(1, ids_cpu[:, None]).squeeze(1)
@@ -106,7 +132,7 @@ def run_trace(out: Path) -> None:
 
     q, t, s, e = [torch.empty_like(x) for _ in range(4)]
     tiles = torch.empty((17, triton.cdiv(x.shape[1], 1024)), device=x.device)
-    stats = torch.empty((17, 4), device=x.device)
+    stats = torch.empty((17, 7), device=x.device)
     with torch.cuda.device(x.device):
         _trace_row[(17,)](
             x,
@@ -120,22 +146,34 @@ def run_trace(out: Path) -> None:
             V=x.shape[1],
             CAP=cap,
             BLOCK=1024,
+            SHIFTED=True,
             num_warps=4,
             enable_fp_fusion=False,
         )
     q64, t64, s64, e64 = [v.cpu().double() for v in (q, t, s, e)]
     stats64 = stats.cpu().double()
     selected32 = stats64[:, 2]
+    selected_shifted64 = selected32 - stats64[:, 4]
+    rounded_selected_shifted64 = stats64[:, 5]
     stages.update(
         {
             "after_fp32_division_then_fp64": from_scores(cap * torch.tanh(q64)),
             "after_fp32_tanh_then_fp64": from_scores(cap * t64),
             "after_fp32_softcap_then_fp64": from_scores(s64),
-            "after_fp32_exp_then_fp64_sum_log_subtract": selected32 - e64.sum(-1).log(),
-            "after_fp32_tile_reduction_then_fp64": selected32 - tiles.cpu().double().sum(-1).log(),
-            "after_fp32_row_sum_then_fp64": selected32 - stats64[:, 0].log(),
-            "after_fp32_log_then_fp64_subtract": selected32 - stats64[:, 1],
-            "after_fp32_subtract": stats64[:, 3],
+            "after_fp32_shift_then_fp64": (
+                rounded_selected_shifted64
+                - torch.logsumexp((s - stats[:, 4, None]).cpu().double(), dim=-1)
+            ),
+            "after_fp32_exp_then_fp64_sum_log_subtract": rounded_selected_shifted64
+            - e64.sum(-1).log(),
+            "after_fp32_tile_reduction_then_fp64": rounded_selected_shifted64
+            - tiles.cpu().double().sum(-1).log(),
+            "after_fp32_row_sum_then_fp64": rounded_selected_shifted64 - stats64[:, 0].log(),
+            "after_fp32_log_then_fp64_subtract": rounded_selected_shifted64 - stats64[:, 1],
+            "shifted_fp32_output": stats64[:, 3],
+            "shifted_fp64_finish_counterfactual": stats64[:, 6],
+            "after_fp32_row_sum_with_fp64_shift_and_finish": selected_shifted64
+            - stats64[:, 0].log(),
         }
     )
     native = NativeSoftcappedSelectedLogprobOp()
@@ -158,25 +196,53 @@ def run_trace(out: Path) -> None:
         ),
     }
     for strategy in SoftcappedLogprobStrategy:
-        output, lse = _FORWARD_LAUNCHERS[strategy](x, ids, cap)
+        output, row_max, lse = _FORWARD_LAUNCHERS[strategy](x, ids, cap)
         stages["production_" + strategy.value] = output.cpu().double()
         if strategy == SoftcappedLogprobStrategy.ROW:
             checks["probe_output_matches_production_row_bits"] = same_bits(output, stats[:, 3])
             checks["probe_lse_matches_production_row_bits"] = same_bits(lse, stats[:, 1])
+            checks["probe_max_matches_production_row_bits"] = same_bits(row_max, stats[:, 4])
         op = TritonSoftcappedSelectedLogprobOp(forward_impl=strategy)
         training = op(x.detach().requires_grad_(True), ids, softcap=cap)
         with torch.inference_mode():
             inference = op(x, ids, softcap=cap)
         checks[strategy.value + "_training_inference_bits"] = same_bits(training, inference)
 
+    # Reuse instrument buffers only after shifted stages/checks have been recorded.
+    legacy_stats = torch.empty_like(stats)
+    with torch.cuda.device(x.device):
+        _trace_row[(17,)](
+            x,
+            ids,
+            q,
+            t,
+            s,
+            e,
+            tiles,
+            legacy_stats,
+            V=x.shape[1],
+            CAP=cap,
+            BLOCK=1024,
+            SHIFTED=False,
+            num_warps=4,
+            enable_fp_fusion=False,
+        )
+    stages["legacy_unshifted_fp32_output"] = legacy_stats[:, 3].cpu().double()
+    stages["legacy_unshifted_fp64_finish"] = legacy_stats[:, 6].cpu().double()
+
     stage_results = {}
     for name, values in stages.items():
         error = values - expected
+        native_error = values - stages["native_gpu"]
         stage_results[name] = {
             "values": values.tolist(),
             "signed_errors_vs_fp64": error.tolist(),
             "max_abs_error_vs_fp64": error.abs().max().item(),
             "rows_exceeding_1e_5": (error.abs() > 1e-5).nonzero().flatten().tolist(),
+            "max_abs_error_vs_native_fp32": native_error.abs().max().item(),
+            "rows_exceeding_native_1e_5": (
+                (native_error.abs() > 1e-5).nonzero().flatten().tolist()
+            ),
         }
     details = []
     for row in range(17):
@@ -194,7 +260,9 @@ def run_trace(out: Path) -> None:
                 "triton_selected_softcap": selected32[row].item(),
                 "native_gpu_selected_softcap": selected(ns64)[row].item(),
                 "fp64_lse": torch.logsumexp(scores64[row], dim=0).item(),
-                "triton_lse": stats64[row, 1].item(),
+                "triton_row_max": stats64[row, 4].item(),
+                "triton_log_sum_exp_shifted": stats64[row, 1].item(),
+                "triton_reconstructed_lse_fp64": (stats64[row, 4] + stats64[row, 1]).item(),
                 "native_gpu_lse": nlse64[row].item(),
             }
         )
@@ -205,7 +273,8 @@ def run_trace(out: Path) -> None:
         "seed": 438,
         "notes": (
             "Diagnostic only. FP64 continuation separates cumulative rounding by stage. "
-            "No tolerances or production kernels changed."
+            "This diagnostic does not modify tolerances or production kernels. "
+            "Legacy unshifted traces are counterfactual comparisons, not the current Op."
         ),
         "probe_checks": checks,
         "stages": stage_results,
@@ -226,6 +295,9 @@ def run_trace(out: Path) -> None:
     assert checks[
         "probe_lse_matches_production_row_bits"
     ], "Instrumented LSE differs from production."
+    assert checks[
+        "probe_max_matches_production_row_bits"
+    ], "Instrumented maximum differs from production."
 
 
 def main() -> None:

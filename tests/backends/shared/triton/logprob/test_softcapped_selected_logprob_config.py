@@ -113,14 +113,16 @@ def _install_configs(config, monkeypatch, entries):
 
 
 def test_auto_policy_excludes_explicit_experiments(config):
-    # Accumulation changes rounding order; pipelining did not beat PARALLEL.
-    # Neither experimental strategy is enabled by the default range policy.
-    assert config.SoftcappedLogprobStrategy.ROW_ACCUMULATE not in (
-        config.FORWARD_STRATEGY_CONFIGS.values()
-    )
+    # Pipelining did not beat PARALLEL; it remains explicit-only.
     assert config.SoftcappedLogprobStrategy.ROW_PIPELINED not in (
         config.FORWARD_STRATEGY_CONFIGS.values()
     )
+
+
+def test_different_reduction_order_is_not_selectable(config):
+    """Every retained strategy must share the same output and gradient bytes."""
+    with pytest.raises(ValueError):
+        config.SoftcappedLogprobStrategy("row_accumulate")
 
 
 @pytest.mark.parametrize("dtype,vocab,max_rows", _RANGE_CASES)

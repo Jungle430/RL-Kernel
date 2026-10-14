@@ -38,14 +38,16 @@ Autograd supports first-order gradients. Native PyTorch supplies its own autogra
 `softcap` is passed per call, independently of the strategy/tuning configuration.
 The same Op can serve calls with different caps. Each autograd invocation keeps
 its own cap for backward; the Op does not store or mutate this value.
-It must be finite and at least `torch.finfo(torch.float32).tiny`. Both
-implementations preserve the original direct `exp -> sum -> log` calculation.
-To avoid overflow or flushing every exponential in a negative saturated row to
-zero, they reject cap/vocabulary combinations unless
+It must be finite and at least `torch.finfo(torch.float32).tiny`. The Native
+reference retains its direct `exp -> sum -> log` calculation. The experimental
+Triton implementation subtracts the row maximum first. Both keep the original
+accepted domain so they can still be compared without changing the reference.
+To avoid overflow or flushing every exponential in a negative saturated Native
+row to zero, they reject cap/vocabulary combinations unless
 `exp(-c) >= 2 * float32.tiny` and `V * exp(c) <= float32.max / 2`.
 The bounds are checked in log space, using only the scalar and shape metadata.
 For example, both `30` and `50` are accepted at `V=262144`; `100` is not.
-Supporting caps outside this range would require a stable, shifted reduction.
+Expanding this interface range is outside the current experiment.
 
 The PyTorch numerical reference creates an FP32 `softcap` tensor on the logits
 device and uses `torch.div(logits.float(), divisor)`. This avoids the CUDA
@@ -59,12 +61,14 @@ targets; they do not redefine the shared contract's reference or tolerances.
 Native reductions can still differ with batching, so reference accuracy and
 Triton's bitwise training/inference and batch invariance are separate checks.
 
-Both Triton forward kernels use `libdevice.exp` with FP32 inputs and outputs.
+Triton forward uses `libdevice.exp` with FP32 inputs and outputs.
 On A6000, the fast `tl.exp` approximation caused a BF16, `softcap=64` case
 to differ from Native FP32 by `1.52587890625e-5`, exceeding the `1e-5` forward
 limit. Changing only these forward exponentials to `libdevice.exp` removed
-that discrepancy in the focused experiment. Division, tile reduction order,
-`tl.log` and backward's probability `tl.exp` are unchanged. The generic
+that discrepancy in the focused experiment. The current candidate evaluates
+`exp(score - row_max)` and finishes entirely in FP32. Division and tile-sum
+order are unchanged. The saved logarithm uses `tl.log`; backward computes
+`tl.exp((score - row_max) - log_sum_exp_shifted)`. The generic
 `triton.language.extra.libdevice` import also supports ROCm, but accuracy and
 performance need validation on each target backend.
 
@@ -103,34 +107,58 @@ directly so they cannot silently measure a native fallback.
 
 ## Triton implementation
 
-All softcap, exponential, reduction and backward arithmetic uses FP32. Vocabulary
-tiles contain 1024 elements and use four warps, with FP fusion disabled. The
+Softcap, maxima, shifted exponentials, reductions, logarithms, final subtraction
+and backward arithmetic use FP32. For each row, first compute its maximum
+`m = max(scores)`, then evaluate:
+
+```python
+sum_exp_shifted = sum(exp(scores - m))
+selected_logprob = (selected_score - m) - log(sum_exp_shifted)
+```
+
+The maximum is shared by every tile in that row. It does not change while
+accumulating tile sums. The final expression subtracts the maximum first;
+it never reconstructs and rounds `m + log(sum_exp_shifted)` before subtraction.
+This removes large exponentials and avoids subtracting two large nearly equal
+unshifted values, but does not eliminate FP32 rounding error.
+
+Vocabulary tiles contain 1024 elements and use four warps, with FP fusion disabled. The
 vocabulary width and softcap are compile-time constants; partial tiles are masked.
-Different caps may compile separate kernels. The default `30.0` retains the
-original arithmetic and tile-reduction order.
+Different caps may compile separate kernels. Masked columns contribute negative
+infinity to the maximum and zero to the sum. A zero maximum is canonicalized to
+positive zero. The original tile-sum order is retained for every cap.
 
-- `ROW`: one program processes each row, reducing each tile and accumulating
-  its sum in ascending vocabulary order.
-- `PARALLEL`: separate programs compute row/tile sums. A second kernel merges
-  them in the same order as ROW. Temporary storage is
-  `4 * M * ceil(V / 1024)` bytes and is released after forward.
+- `ROW`: one program scans the entire row for its maximum, then scans again,
+  reducing each shifted tile and accumulating its sum in ascending tile order.
+- `ROW_PIPELINED`: the same two scans and arithmetic with a three-stage loop
+  pipeline hint.
+- `PARALLEL`: four kernels compute tile maxima, merge row maxima, compute
+  shifted tile sums, and merge sums in the same order as ROW. The maxima and
+  sums reuse one `4 * M * ceil(V / 1024)`-byte temporary buffer. All four launches
+  use the same stream, so a stage finishes before the next consumes its output.
 
-Both paths save one FP32 `log_sum_exp` per row (`4 * M` bytes) and use the same
+All paths save FP32 `row_max` and `log_sum_exp_shifted` per row (`8 * M` bytes) and use the same
 backward kernel. Backward processes disjoint row/vocabulary tiles, reusing the
 saved statistics without repeating the reduction. It casts gradients only on
 store. Neither path materializes a full softcapped or probability tensor.
 The cap bounds scores to `[-c, c]`; host validation checks the FP32 range above.
 Autograd saves the cap used by each forward call, so later calls with a different
 cap do not change that graph's backward. Direct backward-launcher callers must
-pass the same cap used to compute the saved `log_sum_exp`.
+pass the same cap used to compute both saved statistics.
 
-ROW and PARALLEL preserve the same arithmetic order so changing the strategy
-with batch size does not change the bits on the same tested device. Tests check
+ROW, ROW_PIPELINED and PARALLEL are designed to preserve the same arithmetic
+order when changing strategy with batch size. The shifted candidate still
+requires GPU validation of this property. Tests check
 outputs, saved statistics and gradients, as well as forward equality with
 and without gradient recording. This is operator-level coverage, not full-model
 training/rollout, tensor-parallel or cross-device equivalence.
 
 ## Automatic strategy selection
+
+The current policy retains earlier unshifted-kernel timing decisions. Maximum
+scanning and the two extra PARALLEL launches change the cost; the shifted
+implementation needs fresh benchmark comparisons before this policy can be
+considered tuned for it.
 
 ```python
 from rl_engine.backends.shared.triton.logprob.softcapped_selected_logprob import (
@@ -222,11 +250,10 @@ extrapolation and nondefault caps still require GPU regression and performance
 checks. The compact comparison below covers those gaps before treating this
 candidate policy as validated. Performance on other hardware is unverified.
 
-Two explicit experimental strategies remain available: `ROW_PIPELINED` requests
-three loop stages with ROW arithmetic; `ROW_ACCUMULATE` accumulates a vector
-before reducing once, changing rounding order. Neither is selected by the
-automatic map. In particular, mixing ROW_ACCUMULATE into a batch-dependent map
-would require resolving its different numerical results.
+The explicit `ROW_PIPELINED` experiment requests three loop stages with ROW
+arithmetic. It is not selected by the automatic map. `ROW_ACCUMULATE` was removed:
+its vector-before-reduction grouping can change saved statistics and gradients.
+Every remaining selectable strategy is subject to the same byte-equality tests.
 
 ## Tests and benchmark
 
@@ -301,7 +328,7 @@ are not skipped or marked `xfail` to obtain a green result.
 Random upstream gradients, saved-tensor reuse, strategy boundaries and indexing
 guards remain covered. GPU tests skip on CPU hosts; a GPU host that cannot load
 Triton fails rather than silently skipping.
-Nondefault-cap cases cover reference outputs and gradients, all four strategies
+Nondefault-cap cases cover reference outputs and gradients, all three strategies
 and automatic selection, training/inference equality, batch-split strategy
 changes, and two-GPU launches. The configurable-cap consistency sweep uses
 `1e-6, 1e-3, 0.125, 0.5, 1, 3.7, 10, 17.3, 20, 30, 39.5, 50, 64, 70`;
@@ -314,13 +341,52 @@ the bounds. Thus the largest tested valid caps vary with V (about 75.6–86.6).
 Native GPU reference checks cover the same 14-cap sweep at `V=1025, 202048`.
 All these checks cover FP16/BF16/FP32 without relaxing the existing tolerances.
 `test_cap64_exp_rounding_regression` retains the failing seed `438` at
-`[17, 32767]` across all three dtypes, four explicit strategies and AUTO.
+`[17, 32767]` across all three dtypes, the three retained strategies and AUTO.
 Output and gradient accuracy run as separate cases; it also checks
 training/inference equality and repeated backward. The focused A6000 experiment
-passed for BF16 across all five Triton selections, including bitwise agreement
+passed for BF16 across the five then-available Triton selections, including bitwise agreement
 between whole-batch ROW and split-batch PARALLEL outputs, statistics and gradients.
-The full suite and performance still need revalidation after the exp change;
-this result does not resolve the separate FP64 `softcap=70` target below.
+The subsequent H100 run passed the existing FP32-reference and bitwise suites,
+but the expanded benchmark found five further FP32-reference failures at
+`[1024, 262144]`: FP16/FP32 with cap `64`, and FP16/BF16/FP32 with cap `70`.
+Their maximum output error was `1.52587890625e-5`, above the unchanged `1e-5`
+limit. The benchmark did not time these failing cases. These FP32 acceptance
+failures are separate from the FP64 target below.
+
+The captured-row diagnostic on RTX 4090 reproduced the original production
+partials, sum, log and output bitwise. Using the same FP32 sum but computing
+`FP32(FP64(selected_score) - log(FP64(sum_exp)))` removed all nine failing rows
+against both the saved H100 Native output and local Native output. Just replacing
+FP32 `tl.log` with FP32 `libdevice.log` did not fix them; rounding the FP64 log
+back to FP32 before subtraction also retained failures.
+
+That FP64-finishing candidate has now been replaced by the whole-row maximum
+shift described above. Forward and backward share the maximum and shifted
+log-sum, and production arithmetic is entirely FP32. The nine-row result is
+historical evidence for the previous candidate, not validation of the shifted
+implementation. Native code and all accuracy limits remain unchanged. Full-input
+regressions, FP64 checks, and cross-strategy output/statistic/gradient tests must
+run again on a GPU before claiming accuracy or performance improvements.
+
+Additional tests cover fully negative rows, saturated uniform rows, signed
+zeros, a maximum in the final partial tile, and tied maxima across tile
+boundaries. They compare all three strategies and AUTO, including saved
+statistics and training/inference output bytes.
+
+`test_large_cap_wide_benchmark_regression` retains all five combinations with
+independent output-accuracy, gradient-accuracy and training/inference bitwise
+checks (15 cases). It uses the benchmark's GPU generator, seed `415`, full
+`[1024, 262144]` draw, scale `30`, and original token-ID/upstream draw order.
+Do not substitute CPU generation or a smaller initial draw when reproducing
+the H100 failures. To debug on another GPU, capture the exact affected input
+rows first and verify that their isolated outputs match the original batch.
+These regressions do not use `xfail` or wider tolerances. Run them with:
+
+```bash
+python -m pytest tests/ops/logprob/test_softcapped_selected_logprob.py \
+  -k large_cap_wide_benchmark_regression -q -rs
+```
+
 Two-GPU launch coverage retains caps `30` and `50`.
 Division-stage tests compare with an independently
 rounded FP64 quotient, including `39.5 / 50`. A deterministic wide-row regression
@@ -344,8 +410,9 @@ python -m tools.validation.operators.diagnose_softcapped_precision \
   --output-dir reports/softcapped-precision
 ```
 
-This diagnostic records both the native FP32 and Triton paths against FP64.
-The instrumented ROW output and saved statistic must match production bitwise;
+This diagnostic records Native FP32, shifted Triton and legacy unshifted
+arithmetic against FP64, with FP64 continuation from each rounding stage.
+The instrumented ROW output and both saved statistics must match production bitwise;
 otherwise the trace fails and cannot attribute the production error. Its exit
 status checks instrumentation, not accuracy: run the FP32 and FP64 pytest
 layers separately to obtain their respective accuracy results.
@@ -368,6 +435,10 @@ Inputs are contiguous and reused without explicit cache eviction. No
 
 It reuses `PerformanceProfiler` accelerator-event timing and checks output and
 random-upstream gradient accuracy before timing, even with `--modes forward`.
+The untimed gate also compares AUTO output/gradient bytes with ROW, ROW_PIPELINED
+and PARALLEL, and checks AUTO training/inference equality. JSON records these
+checks as `strategy_bitwise` and `train_inference_bitwise`; a mismatch stops the
+case before timing. It does not time the extra strategies unless requested.
 Forward runs under `no_grad`; backward uses a prebuilt retained graph;
 forward+backward constructs a fresh graph per call. Compilation and input
 preparation are outside timing. Timed wrappers include allocation and dispatch
