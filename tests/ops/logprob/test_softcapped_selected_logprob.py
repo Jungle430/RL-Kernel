@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 RL-Kernel Contributors
-"""FP32 contract accuracy, bitwise invariance and CUDA/ROCm integration checks.
+"""Separately collected FP32 accuracy and bitwise consistency checks.
 
 Independent FP64 mathematical checks live in the companion *_math.py file.
 They have their own test targets and do not define the WS1 accuracy reference.
@@ -20,6 +20,16 @@ from rl_engine.reference.logprob.softcapped_selected_logprob import (
 
 _DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 _CONTRACT = load_contract()
+_CHECKS = (
+    pytest.param("accuracy", marks=pytest.mark.softcap_accuracy),
+    pytest.param("consistency", marks=pytest.mark.softcap_consistency),
+)
+"""Separate pytest items: an accuracy failure never suppresses a consistency check."""
+_VALUE_CHECKS = (
+    pytest.param("output", marks=pytest.mark.softcap_accuracy),
+    pytest.param("gradient", marks=pytest.mark.softcap_accuracy),
+    pytest.param("invariance", marks=pytest.mark.softcap_consistency),
+)
 _SOFTCAPS = (
     1e-6,
     1e-3,
@@ -54,6 +64,7 @@ def _assert_bitwise(actual, expected):
     assert torch.equal(actual_bytes, expected_bytes)
 
 
+@pytest.mark.softcap_consistency
 @pytest.mark.parametrize("dtype", _DTYPES)
 @pytest.mark.parametrize("shape", ((0, 7), (1, 1), (3, 1), (1, 7), (3, 7)))
 def test_bitwise_comparison_handles_strided_and_degenerate_shapes(dtype, shape):
@@ -69,6 +80,7 @@ def test_bitwise_comparison_handles_strided_and_degenerate_shapes(dtype, shape):
             _assert_bitwise(actual, expected)
 
 
+@pytest.mark.softcap_consistency
 @pytest.mark.parametrize("dtype", _DTYPES)
 def test_bitwise_comparison_distinguishes_signed_zero(dtype):
     positive = torch.tensor([0.0], dtype=dtype)
@@ -156,20 +168,23 @@ def _fp32_backward_reference(logits, token_ids, upstream, *, softcap=30.0):
         return _native_backward(logits.float(), token_ids, upstream.float(), softcap=softcap)
 
 
-def _assert_forward(op, logits, token_ids, *, softcap=30.0):
+def _assert_forward(op, logits, token_ids, *, softcap=30.0, accuracy=True):
+    """Check the interface; only accuracy items consult independent Native FP32."""
     before = logits.clone()
     token_ids_before = token_ids.clone()
     actual = op(logits, token_ids)
-    expected = _fp32_reference(logits, token_ids, softcap)
     assert actual.shape == logits.shape[:1]
     assert actual.dtype == torch.float32
     assert actual.device == logits.device
-    _assert_fp32_accuracy(actual, expected, "forward_accuracy")
+    if accuracy:
+        expected = _fp32_reference(logits, token_ids, softcap)
+        _assert_fp32_accuracy(actual, expected, "forward_accuracy")
     assert torch.equal(logits, before)
     assert torch.equal(token_ids, token_ids_before)
     return actual
 
 
+@pytest.mark.softcap_accuracy
 @pytest.mark.parametrize("dtype", _DTYPES)
 @pytest.mark.parametrize(
     "shape", [(0, 7), (3, 1), (3, 7), (2, 1023), (2, 1024), (3, 1025), (2, 262144)]
@@ -185,6 +200,7 @@ def test_forward_against_native_fp32(forward_impl, dtype, shape):
     _assert_forward(op, logits, token_ids)
 
 
+@pytest.mark.softcap_accuracy
 @pytest.mark.parametrize("dtype", _DTYPES)
 def test_uniform_and_saturated_rows(forward_impl, dtype):
     op, device = forward_impl
@@ -203,6 +219,7 @@ def test_uniform_and_saturated_rows(forward_impl, dtype):
     assert torch.isfinite(actual).all()
 
 
+@pytest.mark.softcap_accuracy
 @pytest.mark.parametrize("dtype", _DTYPES)
 def test_noncontiguous_inputs(forward_impl, dtype):
     op, device = forward_impl
@@ -213,6 +230,7 @@ def test_noncontiguous_inputs(forward_impl, dtype):
     _assert_forward(op, logits, token_ids)
 
 
+@pytest.mark.softcap_consistency
 @pytest.mark.parametrize("dtype", _DTYPES)
 @pytest.mark.parametrize("vocab", (1025, 262144))
 @pytest.mark.parametrize("forward_impl", ("row", "parallel", "row_pipelined"))
@@ -247,27 +265,32 @@ def backward_impl(request):
     return partial(_triton_backward, forward_impl=impl), "cuda"
 
 
-def _assert_backward(op, logits, token_ids, grad_selected_logprob, *, softcap=30.0):
+def _assert_backward(op, logits, token_ids, grad_selected_logprob, *, softcap=30.0, accuracy=True):
+    """Check gradient metadata/purity, optionally comparing with Native autograd."""
     before = logits.clone()
     token_ids_before = token_ids.clone()
     grad_before = grad_selected_logprob.clone()
     actual = op(logits, token_ids, grad_selected_logprob)
 
-    expected = _fp32_backward_reference(logits, token_ids, grad_selected_logprob, softcap=softcap)
     assert actual.shape == logits.shape
     assert actual.dtype == logits.dtype
     assert actual.device == logits.device
-    _assert_fp32_accuracy(actual, expected, "gradient_accuracy")
+    if accuracy:
+        expected = _fp32_backward_reference(
+            logits, token_ids, grad_selected_logprob, softcap=softcap
+        )
+        _assert_fp32_accuracy(actual, expected, "gradient_accuracy")
     assert torch.equal(logits, before)
     assert torch.equal(token_ids, token_ids_before)
     assert torch.equal(grad_selected_logprob, grad_before)
     return actual
 
 
+@pytest.mark.parametrize("check", _CHECKS)
 @pytest.mark.parametrize("softcap", _SOFTCAPS)
 @pytest.mark.parametrize("dtype", _DTYPES)
 @pytest.mark.parametrize("shape", ((0, 7), (3, 1), (3, 1025)))
-def test_configurable_softcap_accuracy_and_inference(operator_impl, softcap, dtype, shape):
+def test_configurable_softcap_accuracy_and_inference(operator_impl, softcap, dtype, shape, check):
     """Every strategy must use the same cap in forward, saved state and backward."""
     default_op, device = operator_impl
     op = partial(default_op, softcap=softcap)
@@ -279,17 +302,23 @@ def test_configurable_softcap_accuracy_and_inference(operator_impl, softcap, dty
     logits = storage[:, ::2].detach().requires_grad_(True)
     ids = torch.tensor([0, shape[1] // 2, shape[1] - 1][: shape[0]], device=device).long()
     upstream = torch.randn(shape[0] * 2, generator=generator).to(device)[::2]
-    output = _assert_forward(op, logits, ids, softcap=softcap)
-    for context in (torch.no_grad(), torch.inference_mode()):
-        with context:
-            _assert_bitwise(op(logits, ids), output.detach())
-            _assert_bitwise(default_op.forward(logits, ids, softcap=softcap), output.detach())
+    output = _assert_forward(op, logits, ids, softcap=softcap, accuracy=check == "accuracy")
+    if check == "consistency":
+        for context in (torch.no_grad(), torch.inference_mode()):
+            with context:
+                _assert_bitwise(op(logits, ids), output.detach())
+                _assert_bitwise(default_op.forward(logits, ids, softcap=softcap), output.detach())
 
     def backward_from_saved_graph(x, token_ids, gradient):
         return torch.autograd.grad(output, x, grad_outputs=gradient, retain_graph=True)[0]
 
     expected_gradient = _assert_backward(
-        backward_from_saved_graph, logits, ids, upstream, softcap=softcap
+        backward_from_saved_graph,
+        logits,
+        ids,
+        upstream,
+        softcap=softcap,
+        accuracy=check == "accuracy",
     )
     _assert_backward(
         backward_from_saved_graph,
@@ -297,12 +326,14 @@ def test_configurable_softcap_accuracy_and_inference(operator_impl, softcap, dty
         ids,
         torch.zeros_like(upstream),
         softcap=softcap,
+        accuracy=check == "accuracy",
     )
-    repeated_gradient = backward_from_saved_graph(logits, ids, upstream)
-    _assert_bitwise(repeated_gradient, expected_gradient)
+    if check == "consistency":
+        repeated_gradient = backward_from_saved_graph(logits, ids, upstream)
+        _assert_bitwise(repeated_gradient, expected_gradient)
 
     # Only Triton promises batch invariance; native reductions may change bits.
-    if device == "cuda" and shape[0] > 0:
+    if check == "consistency" and device == "cuda" and shape[0] > 0:
         for row in range(shape[0]):
             single = logits[row : row + 1].detach().requires_grad_(True)
             single_output = op(single, ids[row : row + 1])
@@ -313,10 +344,11 @@ def test_configurable_softcap_accuracy_and_inference(operator_impl, softcap, dty
             _assert_bitwise(single_gradient, expected_gradient[row : row + 1])
 
 
+@pytest.mark.parametrize("check", _CHECKS)
 @pytest.mark.parametrize("boundary", ("minimum", "near_maximum"))
 @pytest.mark.parametrize("vocab", (1, 1025, 202048, 262144))
 @pytest.mark.parametrize("dtype", _DTYPES)
-def test_softcap_boundary_accuracy_and_inference(operator_impl, boundary, vocab, dtype):
+def test_softcap_boundary_accuracy_and_inference(operator_impl, boundary, vocab, dtype, check):
     """Cover the supported cap endpoints, not only commonly used model values.
 
     The upper endpoint depends on V. Leave 1e-4 below it so FP32 conversion
@@ -340,20 +372,30 @@ def test_softcap_boundary_accuracy_and_inference(operator_impl, boundary, vocab,
     ids = torch.tensor([vocab // 2, 0, vocab - 1], device=device)
     upstream = torch.tensor([0.5, -0.5, 0.0], device=device)
     op = partial(default_op, softcap=softcap)
-    output = _assert_forward(op, logits, ids, softcap=softcap)
-    for context in (torch.no_grad(), torch.inference_mode()):
-        with context:
-            _assert_bitwise(op(logits, ids), output.detach())
+    output = _assert_forward(op, logits, ids, softcap=softcap, accuracy=check == "accuracy")
+    if check == "consistency":
+        for context in (torch.no_grad(), torch.inference_mode()):
+            with context:
+                _assert_bitwise(op(logits, ids), output.detach())
 
     def backward_from_saved_graph(x, token_ids, gradient):
         return torch.autograd.grad(output, x, grad_outputs=gradient, retain_graph=True)[0]
 
-    gradient = _assert_backward(backward_from_saved_graph, logits, ids, upstream, softcap=softcap)
-    _assert_bitwise(backward_from_saved_graph(logits, ids, upstream), gradient)
+    gradient = _assert_backward(
+        backward_from_saved_graph,
+        logits,
+        ids,
+        upstream,
+        softcap=softcap,
+        accuracy=check == "accuracy",
+    )
+    if check == "consistency":
+        _assert_bitwise(backward_from_saved_graph(logits, ids, upstream), gradient)
     with pytest.raises(ValueError, match="softcap"):
         default_op(logits, ids, softcap=invalid)
 
 
+@pytest.mark.softcap_accuracy
 def test_same_operator_keeps_softcap_per_graph(operator_impl):
     """A later call with another cap must not change an outstanding graph or the default."""
     op, device = operator_impl
@@ -379,6 +421,7 @@ def test_same_operator_keeps_softcap_per_graph(operator_impl):
         )
 
 
+@pytest.mark.softcap_accuracy
 @pytest.mark.parametrize("softcap", _SOFTCAPS)
 @pytest.mark.parametrize("dtype", _DTYPES)
 def test_configurable_softcap_saturation(forward_impl, softcap, dtype):
@@ -393,6 +436,7 @@ def test_configurable_softcap_saturation(forward_impl, softcap, dtype):
     _assert_fp32_accuracy(output[:2], torch.full((2,), -math.log(1025)), "forward_accuracy")
 
 
+@pytest.mark.softcap_consistency
 @pytest.mark.parametrize("dtype", _DTYPES)
 def test_default_softcap_matches_explicit_30(dtype):
     """Changing the divisor representation must not change the default cap value."""
@@ -410,11 +454,12 @@ def test_default_softcap_matches_explicit_30(dtype):
         _assert_bitwise(gradient, expected_grad)
 
 
+@pytest.mark.parametrize("check", _CHECKS)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="A CUDA or ROCm GPU is required")
 @pytest.mark.parametrize("dtype", _DTYPES)
 @pytest.mark.parametrize("softcap", _SOFTCAPS)
 @pytest.mark.parametrize("vocab", (1025, 202048))
-def test_native_gpu_reference_accuracy_and_inference(dtype, softcap, vocab):
+def test_native_gpu_reference_accuracy_and_inference(dtype, softcap, vocab, check):
     """Check native GPU autograd and inference; FP64 qualification is separate."""
     generator = torch.Generator().manual_seed(463)
     logits = (torch.randn((3, vocab), generator=generator) * softcap).to(device="cuda", dtype=dtype)
@@ -422,19 +467,24 @@ def test_native_gpu_reference_accuracy_and_inference(dtype, softcap, vocab):
     ids = torch.tensor([0, vocab // 2, vocab - 1], device="cuda")
     upstream = torch.tensor([0.5, -2.0, 1.5], device="cuda")
     op = partial(NativeSoftcappedSelectedLogprobOp(), softcap=softcap)
-    training = _assert_forward(op, logits.requires_grad_(True), ids, softcap=softcap)
-    for context in (torch.no_grad(), torch.inference_mode()):
-        with context:
-            _assert_bitwise(op(logits, ids), training.detach())
+    training = _assert_forward(
+        op, logits.requires_grad_(True), ids, softcap=softcap, accuracy=check == "accuracy"
+    )
+    if check == "consistency":
+        for context in (torch.no_grad(), torch.inference_mode()):
+            with context:
+                _assert_bitwise(op(logits, ids), training.detach())
     _assert_backward(
         partial(_native_backward, softcap=softcap),
         logits,
         ids,
         upstream,
         softcap=softcap,
+        accuracy=check == "accuracy",
     )
 
 
+@pytest.mark.softcap_accuracy
 @pytest.mark.parametrize("dtype", (torch.float16, torch.float32))
 def test_softcap50_wide_reference_regression(operator_impl, dtype):
     """Reproduce the wide-row scalar-division mismatch without allocating 4097 rows.
@@ -461,9 +511,10 @@ def test_softcap50_wide_reference_regression(operator_impl, dtype):
     _assert_backward(backward_from_saved_graph, logits, ids, upstream, softcap=cap)
 
 
+@pytest.mark.parametrize("check", _CHECKS)
 @pytest.mark.parametrize("dtype", _DTYPES)
 @pytest.mark.parametrize("value", ("output", "gradient"))
-def test_cap64_exp_rounding_regression(operator_impl, dtype, value):
+def test_cap64_exp_rounding_regression(operator_impl, dtype, value, check):
     """Keep the large-cap exponential regression across all strategies and AUTO.
 
     With BF16 inputs on A6000, fast forward exp shifted row 12's output by
@@ -481,19 +532,23 @@ def test_cap64_exp_rounding_regression(operator_impl, dtype, value):
     output = op(logits, ids, softcap=cap)
 
     if value == "output":
-        _assert_fp32_accuracy(output, _fp32_reference(logits, ids, cap), "forward_accuracy")
-        for context in (torch.no_grad(), torch.inference_mode()):
-            with context:
-                _assert_bitwise(op(logits, ids, softcap=cap), output.detach())
+        if check == "accuracy":
+            _assert_fp32_accuracy(output, _fp32_reference(logits, ids, cap), "forward_accuracy")
+        else:
+            for context in (torch.no_grad(), torch.inference_mode()):
+                with context:
+                    _assert_bitwise(op(logits, ids, softcap=cap), output.detach())
     else:
         gradient = torch.autograd.grad(output, logits, grad_outputs=upstream, retain_graph=True)[0]
-        _assert_fp32_accuracy(
-            gradient,
-            _fp32_backward_reference(logits, ids, upstream, softcap=cap),
-            "gradient_accuracy",
-        )
-        repeated = torch.autograd.grad(output, logits, grad_outputs=upstream)[0]
-        _assert_bitwise(repeated, gradient)
+        if check == "accuracy":
+            _assert_fp32_accuracy(
+                gradient,
+                _fp32_backward_reference(logits, ids, upstream, softcap=cap),
+                "gradient_accuracy",
+            )
+        else:
+            repeated = torch.autograd.grad(output, logits, grad_outputs=upstream)[0]
+            _assert_bitwise(repeated, gradient)
 
 
 @pytest.mark.parametrize(
@@ -506,7 +561,7 @@ def test_cap64_exp_rounding_regression(operator_impl, dtype, value):
         pytest.param(torch.float32, 70.0, id="fp32-cap70"),
     ),
 )
-@pytest.mark.parametrize("value", ("output", "gradient", "invariance"))
+@pytest.mark.parametrize("value", _VALUE_CHECKS)
 def test_large_cap_wide_benchmark_regression(dtype, softcap, value):
     """Retain the five H100 benchmark failures with unchanged FP32 contract limits.
 
@@ -553,6 +608,7 @@ def test_large_cap_wide_benchmark_regression(dtype, softcap, value):
                 _assert_bitwise(op(logits, ids, softcap=softcap), training.detach())
 
 
+@pytest.mark.softcap_accuracy
 @pytest.mark.parametrize("softcap", (0.0, -1.0, float("nan"), float("inf"), 1e-50, 100.0))
 def test_operator_rejects_unsafe_softcap(operator_impl, softcap):
     """Public Ops reject unsafe caps before dispatching to a private launcher."""
@@ -563,6 +619,7 @@ def test_operator_rejects_unsafe_softcap(operator_impl, softcap):
         op(logits, ids, softcap=softcap)
 
 
+@pytest.mark.softcap_accuracy
 @pytest.mark.parametrize(
     "logits_shape,logits_dtype,ids_shape,ids_dtype,error,message",
     [
@@ -624,6 +681,7 @@ def test_operator_rejects_invalid_input_metadata(
         op(logits, ids)
 
 
+@pytest.mark.softcap_accuracy
 def test_softcap_range_depends_on_vocabulary(operator_impl):
     """A valid scalar can still overflow the row sum for a sufficiently large V."""
     op, device = operator_impl
@@ -637,7 +695,7 @@ def test_softcap_range_depends_on_vocabulary(operator_impl):
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="A CUDA or ROCm GPU is required")
 @pytest.mark.parametrize("softcap", _SOFTCAPS)
 @pytest.mark.parametrize("dtype", _DTYPES)
-@pytest.mark.parametrize("value", ("output", "gradient", "invariance"))
+@pytest.mark.parametrize("value", _VALUE_CHECKS)
 def test_configurable_softcap_auto_switch(softcap, dtype, value, monkeypatch, request):
     """Check an automatic strategy switch without mixing accuracy and bitwise failures.
 
@@ -705,6 +763,7 @@ def test_configurable_softcap_auto_switch(softcap, dtype, value, monkeypatch, re
             _assert_bitwise(torch.cat([part[index] for part in parts]), whole[index])
 
 
+@pytest.mark.softcap_accuracy
 @pytest.mark.parametrize("dtype", _DTYPES)
 @pytest.mark.parametrize(
     "shape", [(0, 7), (3, 1), (3, 7), (2, 1023), (2, 1024), (3, 1025), (2, 262144)]
@@ -719,6 +778,7 @@ def test_backward_against_native_fp32_autograd(backward_impl, dtype, shape):
     _assert_backward(op, logits, token_ids, grad_selected_logprob)
 
 
+@pytest.mark.softcap_accuracy
 @pytest.mark.parametrize("dtype", _DTYPES)
 def test_backward_saturation_and_zero_upstream(backward_impl, dtype):
     op, device = backward_impl
@@ -735,6 +795,7 @@ def test_backward_saturation_and_zero_upstream(backward_impl, dtype):
     assert actual[3, 512] < 0 and actual[3, 0] > 0
 
 
+@pytest.mark.softcap_accuracy
 @pytest.mark.parametrize("dtype", _DTYPES)
 def test_backward_noncontiguous_inputs(backward_impl, dtype):
     op, device = backward_impl
@@ -747,6 +808,7 @@ def test_backward_noncontiguous_inputs(backward_impl, dtype):
     _assert_backward(op, logits, token_ids, grad_selected_logprob)
 
 
+@pytest.mark.softcap_consistency
 @pytest.mark.parametrize("dtype", _DTYPES)
 @pytest.mark.parametrize("vocab", (1025, 262144))
 @pytest.mark.parametrize("forward_impl", ("row", "parallel", "row_pipelined"))
@@ -802,9 +864,10 @@ def operator_impl(request):
     return TritonSoftcappedSelectedLogprobOp(forward_impl=impl), "cuda"
 
 
+@pytest.mark.parametrize("check", _CHECKS)
 @pytest.mark.parametrize("dtype", _DTYPES)
 @pytest.mark.parametrize("layout", ("contiguous", "transpose", "empty"))
-def test_operator_autograd_and_inference(operator_impl, dtype, layout):
+def test_operator_autograd_and_inference(operator_impl, dtype, layout, check):
     op, device = operator_impl
     shape = {"contiguous": (3, 1025), "transpose": (1025, 3), "empty": (0, 7)}[layout]
     generator = torch.Generator().manual_seed(421)
@@ -824,32 +887,35 @@ def test_operator_autograd_and_inference(operator_impl, dtype, layout):
     output = op(logits, token_ids)
     assert output.requires_grad and output.grad_fn is not None
     assert output.shape == (n_rows,) and output.dtype == torch.float32
-    _assert_fp32_accuracy(output, _fp32_reference(logits, token_ids), "forward_accuracy")
+    if check == "accuracy":
+        _assert_fp32_accuracy(output, _fp32_reference(logits, token_ids), "forward_accuracy")
     (grad_base,) = torch.autograd.grad(output, base, grad_outputs=upstream)
 
-    # Start at the operator boundary, retaining quantized inputs and FP32 gradients.
-    expected_grad = _fp32_backward_reference(logits, token_ids, upstream)
-    if layout == "transpose":
-        expected_grad = expected_grad.t()
     assert grad_base.shape == base.shape and grad_base.dtype == dtype
-    _assert_fp32_accuracy(grad_base, expected_grad, "gradient_accuracy")
+    if check == "accuracy":
+        # Start at the operator boundary, retaining quantized inputs and FP32 gradients.
+        expected_grad = _fp32_backward_reference(logits, token_ids, upstream)
+        if layout == "transpose":
+            expected_grad = expected_grad.t()
+        _assert_fp32_accuracy(grad_base, expected_grad, "gradient_accuracy")
+    else:
+        # The Op must use the same arithmetic with or without graph recording.
+        with torch.no_grad():
+            no_grad_output = op(logits, token_ids)
+        with torch.inference_mode():
+            inference_output = op(logits, token_ids)
+        detached_output = op(logits.detach(), token_ids)
+        for actual in (no_grad_output, inference_output, detached_output):
+            assert not actual.requires_grad
+            _assert_bitwise(actual, output.detach())
 
-    # The Op must use the same forward arithmetic with or without graph recording.
-    with torch.no_grad():
-        no_grad_output = op(logits, token_ids)
-    with torch.inference_mode():
-        inference_output = op(logits, token_ids)
-    detached_output = op(logits.detach(), token_ids)
-    for actual in (no_grad_output, inference_output, detached_output):
-        assert not actual.requires_grad
-        _assert_bitwise(actual, output.detach())
 
-
+@pytest.mark.parametrize("check", _CHECKS)
 @pytest.mark.parametrize("dtype", _DTYPES)
 @pytest.mark.parametrize("vocab", (1025, 262144))
 @pytest.mark.parametrize("forward_impl", (None, "row", "parallel", "row_pipelined"))
 @pytest.mark.parametrize("softcap", (30.0, 50.0))
-def test_triton_noncurrent_device_forward_backward(dtype, vocab, forward_impl, softcap):
+def test_triton_noncurrent_device_forward_backward(dtype, vocab, forward_impl, softcap, check):
     if torch.cuda.device_count() < 2:
         pytest.skip("Two CUDA or ROCm GPUs are required for the noncurrent-device regression")
     from rl_engine.backends.shared.triton.logprob.softcapped_selected_logprob import (
@@ -888,28 +954,32 @@ def test_triton_noncurrent_device_forward_backward(dtype, vocab, forward_impl, s
         assert torch.cuda.current_device() == 0
         assert gradient.device == direct_gradient.device == device
         assert gradient.dtype == direct_gradient.dtype == dtype
-        _assert_bitwise(gradient, direct_gradient)
-        _assert_fp32_accuracy(
-            output, _fp32_reference(logits, token_ids, softcap), "forward_accuracy"
-        )
-        _assert_fp32_accuracy(
-            gradient,
-            _fp32_backward_reference(logits, token_ids, upstream, softcap=softcap),
-            "gradient_accuracy",
-        )
+        if check == "consistency":
+            _assert_bitwise(gradient, direct_gradient)
+        else:
+            _assert_fp32_accuracy(
+                output, _fp32_reference(logits, token_ids, softcap), "forward_accuracy"
+            )
+            _assert_fp32_accuracy(
+                gradient,
+                _fp32_backward_reference(logits, token_ids, upstream, softcap=softcap),
+                "gradient_accuracy",
+            )
 
-        for context in (torch.no_grad(), torch.inference_mode()):
-            with context:
-                inference_output = op(logits, token_ids, softcap=softcap)
-            assert torch.cuda.current_device() == 0
-            assert inference_output.device == device
-            _assert_bitwise(inference_output, output.detach())
+        if check == "consistency":
+            for context in (torch.no_grad(), torch.inference_mode()):
+                with context:
+                    inference_output = op(logits, token_ids, softcap=softcap)
+                assert torch.cuda.current_device() == 0
+                assert inference_output.device == device
+                _assert_bitwise(inference_output, output.detach())
 
 
+@pytest.mark.parametrize("check", _CHECKS)
 @pytest.mark.parametrize("dtype", _DTYPES)
 @pytest.mark.parametrize("shape", ((0, 7), (3, 1025), (2, 262144)))
 @pytest.mark.parametrize("forward_impl", ("row", "parallel", "row_pipelined"))
-def test_triton_saved_shifted_statistics_and_repeated_backward(dtype, shape, forward_impl):
+def test_triton_saved_shifted_statistics_and_repeated_backward(dtype, shape, forward_impl, check):
     if not torch.cuda.is_available():
         pytest.skip("A CUDA or ROCm GPU is required")
     from rl_engine.backends.shared.triton.logprob.softcapped_selected_logprob import (
@@ -930,12 +1000,13 @@ def test_triton_saved_shifted_statistics_and_repeated_backward(dtype, shape, for
         assert statistic.shape == logits.shape[:1]
         assert statistic.dtype == torch.float32 and statistic.device == logits.device
         assert statistic.numel() * statistic.element_size() == 4 * shape[0]
-    divisor = torch.tensor(30.0, device=logits.device, dtype=torch.float32)
-    scores = 30.0 * torch.tanh(torch.div(logits.detach().float(), divisor))
-    expected_max = scores.amax(dim=-1)
-    expected_log_sum = (scores - expected_max[:, None]).exp().sum(dim=-1).log()
-    _assert_fp32_accuracy(row_max, expected_max, "forward_accuracy")
-    _assert_fp32_accuracy(log_sum_exp_shifted, expected_log_sum, "forward_accuracy")
+    if check == "accuracy":
+        divisor = torch.tensor(30.0, device=logits.device, dtype=torch.float32)
+        scores = 30.0 * torch.tanh(torch.div(logits.detach().float(), divisor))
+        expected_max = scores.amax(dim=-1)
+        expected_log_sum = (scores - expected_max[:, None]).exp().sum(dim=-1).log()
+        _assert_fp32_accuracy(row_max, expected_max, "forward_accuracy")
+        _assert_fp32_accuracy(log_sum_exp_shifted, expected_log_sum, "forward_accuracy")
     saved_before = (row_max.clone(), log_sum_exp_shifted.clone())
 
     def backward_from_saved_graph(x, token_ids, upstream):
@@ -945,14 +1016,19 @@ def test_triton_saved_shifted_statistics_and_repeated_backward(dtype, shape, for
     # forward statistics. Compare both backward calls with Native FP32 autograd.
     for _ in range(2):
         upstream = torch.randn(shape[0], generator=generator).to(device="cuda")
-        _assert_backward(backward_from_saved_graph, logits, ids, upstream)
-        _assert_bitwise(row_max, saved_before[0])
-        _assert_bitwise(log_sum_exp_shifted, saved_before[1])
+        _assert_backward(
+            backward_from_saved_graph, logits, ids, upstream, accuracy=check == "accuracy"
+        )
+        if check == "consistency":
+            _assert_bitwise(row_max, saved_before[0])
+            _assert_bitwise(log_sum_exp_shifted, saved_before[1])
 
-    with torch.inference_mode():
-        _assert_bitwise(op(logits, ids), output.detach())
+    if check == "consistency":
+        with torch.inference_mode():
+            _assert_bitwise(op(logits, ids), output.detach())
 
 
+@pytest.mark.softcap_consistency
 @pytest.mark.parametrize("dtype", _DTYPES)
 @pytest.mark.parametrize("forward_impl", ("row", "parallel", "row_pipelined"))
 def test_triton_padding_and_strided_layout_invariance(dtype, forward_impl):
@@ -991,6 +1067,7 @@ def test_triton_padding_and_strided_layout_invariance(dtype, forward_impl):
         view[:3].fill_(-3000.0)
 
 
+@pytest.mark.softcap_consistency
 @pytest.mark.parametrize("dtype", _DTYPES)
 @pytest.mark.parametrize(
     "vocab",
@@ -1030,10 +1107,11 @@ def test_triton_forward_variants_match_bitwise(dtype, vocab, merge_unroll):
     _assert_bitwise(grad_actual, grad_expected)
 
 
+@pytest.mark.parametrize("check", _CHECKS)
 @pytest.mark.parametrize("dtype", _DTYPES)
 @pytest.mark.parametrize("vocab", (1, 1025, 2049, 4097, 262144))
 @pytest.mark.parametrize("stages", (2, 3))
-def test_triton_pipeline_matches_its_unhinted_family(dtype, vocab, stages):
+def test_triton_pipeline_matches_its_unhinted_family(dtype, vocab, stages, check):
     if not torch.cuda.is_available():
         pytest.skip("A CUDA or ROCm GPU is required")
     from rl_engine.backends.shared.triton.logprob.softcapped_selected_logprob import (
@@ -1052,21 +1130,24 @@ def test_triton_pipeline_matches_its_unhinted_family(dtype, vocab, stages):
     actual = _launch_softcapped_selected_logprob_fwd(
         logits, ids, softcap=30.0, pipeline_stages=stages
     )
-    for result, reference in zip(actual, expected, strict=True):
-        _assert_bitwise(result, reference)
+    if check == "consistency":
+        for result, reference in zip(actual, expected, strict=True):
+            _assert_bitwise(result, reference)
     grad_expected = _launch_softcapped_selected_logprob_bwd(
         logits, ids, upstream, expected[1], expected[2], softcap=30.0
     )
     grad_actual = _launch_softcapped_selected_logprob_bwd(
         logits, ids, upstream, actual[1], actual[2], softcap=30.0
     )
-    _assert_bitwise(grad_actual, grad_expected)
-    _assert_fp32_accuracy(actual[0], _fp32_reference(logits, ids), "forward_accuracy")
-    _assert_fp32_accuracy(
-        grad_actual,
-        _fp32_backward_reference(logits, ids, upstream),
-        "gradient_accuracy",
-    )
+    if check == "consistency":
+        _assert_bitwise(grad_actual, grad_expected)
+    else:
+        _assert_fp32_accuracy(actual[0], _fp32_reference(logits, ids), "forward_accuracy")
+        _assert_fp32_accuracy(
+            grad_actual,
+            _fp32_backward_reference(logits, ids, upstream),
+            "gradient_accuracy",
+        )
 
 
 def _evaluate_triton_with_statistics(op, logits, token_ids, upstream):
@@ -1077,9 +1158,10 @@ def _evaluate_triton_with_statistics(op, logits, token_ids, upstream):
     return output.detach(), row_max, log_sum_exp_shifted, gradient
 
 
+@pytest.mark.parametrize("check", _CHECKS)
 @pytest.mark.parametrize("dtype", _DTYPES)
 @pytest.mark.parametrize("softcap", (0.125, 30.0, 50.0, 64.0, 70.0))
-def test_shifted_maxima_tails_and_signed_zero_preserve_all_strategy_bits(dtype, softcap):
+def test_shifted_maxima_tails_and_signed_zero_preserve_all_strategy_bits(dtype, softcap, check):
     """Exercise negative maxima, tied maxima, signed zeros and a maximum in a tail.
 
     Validate outputs and all input gradients against Native FP32, then require
@@ -1104,33 +1186,37 @@ def test_shifted_maxima_tails_and_signed_zero_preserve_all_strategy_bits(dtype, 
     logits[5, -1] = -0.5 * softcap
     ids = torch.tensor([0, vocab - 1, 1024, vocab - 1, 1023, 0], device="cuda")
     upstream = torch.tensor([0.5, -1.0, 2.0, -0.75, 0.0, 1.5], device="cuda")
-    expected_output = _fp32_reference(logits, ids, softcap)
-    expected_gradient = _fp32_backward_reference(logits, ids, upstream, softcap=softcap)
-    divisor = torch.tensor(softcap, device="cuda", dtype=torch.float32)
-    expected_max = (softcap * torch.tanh(torch.div(logits.float(), divisor))).amax(dim=-1)
-    expected_uniform = torch.full((3,), -math.log(vocab), device="cuda", dtype=torch.float32)
+    if check == "accuracy":
+        expected_output = _fp32_reference(logits, ids, softcap)
+        expected_gradient = _fp32_backward_reference(logits, ids, upstream, softcap=softcap)
+        divisor = torch.tensor(softcap, device="cuda", dtype=torch.float32)
+        expected_max = (softcap * torch.tanh(torch.div(logits.float(), divisor))).amax(dim=-1)
+        expected_uniform = torch.full((3,), -math.log(vocab), device="cuda", dtype=torch.float32)
     reference = None
     for strategy in (*SoftcappedLogprobStrategy, None):
         op = partial(TritonSoftcappedSelectedLogprobOp(forward_impl=strategy), softcap=softcap)
         actual = _evaluate_triton_with_statistics(op, logits, ids, upstream)
         output, row_max, log_sum, gradient = actual
-        _assert_fp32_accuracy(output, expected_output, "forward_accuracy")
-        _assert_fp32_accuracy(gradient, expected_gradient, "gradient_accuracy")
-        _assert_fp32_accuracy(row_max, expected_max, "forward_accuracy")
-        _assert_fp32_accuracy(output[:3], expected_uniform, "forward_accuracy")
+        if check == "accuracy":
+            _assert_fp32_accuracy(output, expected_output, "forward_accuracy")
+            _assert_fp32_accuracy(gradient, expected_gradient, "gradient_accuracy")
+            _assert_fp32_accuracy(row_max, expected_max, "forward_accuracy")
+            _assert_fp32_accuracy(output[:3], expected_uniform, "forward_accuracy")
         assert row_max[0] < 0 and row_max[5] < 0
         assert row_max[2] == 0 and not torch.signbit(row_max[2])
         assert torch.all((log_sum >= 0) & (log_sum <= math.log(vocab) + 1e-5))
-        if reference is None:
-            reference = actual
-        else:
-            for value, expected in zip(actual, reference, strict=True):
-                _assert_bitwise(value, expected)
-        for context in (torch.no_grad(), torch.inference_mode()):
-            with context:
-                _assert_bitwise(op(logits, ids), output)
+        if check == "consistency":
+            if reference is None:
+                reference = actual
+            else:
+                for value, expected in zip(actual, reference, strict=True):
+                    _assert_bitwise(value, expected)
+            for context in (torch.no_grad(), torch.inference_mode()):
+                with context:
+                    _assert_bitwise(op(logits, ids), output)
 
 
+@pytest.mark.softcap_consistency
 @pytest.mark.parametrize("dtype", _DTYPES)
 @pytest.mark.parametrize(
     "shape,softcap",
@@ -1175,6 +1261,7 @@ def test_triton_auto_matches_explicit_row_and_inference(dtype, shape, softcap):
         _assert_bitwise(op(logits, ids), reference[0])
 
 
+@pytest.mark.softcap_consistency
 @pytest.mark.parametrize("dtype", _DTYPES)
 @pytest.mark.parametrize("softcap", _SOFTCAPS)
 @pytest.mark.parametrize("vocab", (1025, 262145))
@@ -1205,6 +1292,7 @@ def test_all_strategies_preserve_output_statistics_and_all_gradients(dtype, soft
                 _assert_bitwise(op(logits, ids), expected[0])
 
 
+@pytest.mark.softcap_consistency
 @pytest.mark.parametrize("dtype", _DTYPES)
 def test_triton_auto_batch_split_switches_strategy_without_changing_bits(
     dtype, monkeypatch, request
@@ -1272,6 +1360,7 @@ def test_triton_auto_batch_split_switches_strategy_without_changing_bits(
         _assert_bitwise(result, expected)
 
 
+@pytest.mark.softcap_consistency
 @pytest.mark.parametrize("dtype", _DTYPES)
 @pytest.mark.parametrize("vocab", (31745, 32768, 32769))
 def test_triton_production_range_boundary_preserves_output_statistics_and_gradients(dtype, vocab):
@@ -1325,6 +1414,7 @@ def test_triton_production_range_boundary_preserves_output_statistics_and_gradie
         del actual, result, expected
 
 
+@pytest.mark.softcap_accuracy
 def test_triton_explicit_strategy_bypasses_device_lookup_and_auto_validates_first(
     monkeypatch,
 ):
@@ -1352,6 +1442,7 @@ def test_triton_explicit_strategy_bypasses_device_lookup_and_auto_validates_firs
         module.TritonSoftcappedSelectedLogprobOp()(logits, ids, softcap=0.0)
 
 
+@pytest.mark.softcap_accuracy
 @pytest.mark.parametrize("dtype", _DTYPES)
 @pytest.mark.parametrize("vocab", (2048, 2049, 3073, 4097, 5121, 6145))
 @pytest.mark.parametrize("merge_unroll", (1, 4))
@@ -1444,6 +1535,7 @@ def test_triton_parallel_forward_scratch_and_output_bounds(dtype, vocab, merge_u
         assert torch.equal(storage[[0, -1]], torch.full((2,), -123.0, device="cuda"))
 
 
+@pytest.mark.softcap_accuracy
 @pytest.mark.parametrize("dtype", _DTYPES)
 @pytest.mark.parametrize("vocab", (2048, 2049))
 def test_triton_backward_tile_coverage_and_output_bounds(dtype, vocab):
@@ -1493,6 +1585,7 @@ def test_triton_backward_tile_coverage_and_output_bounds(dtype, vocab):
         assert torch.equal(guard, torch.full_like(guard, -123.0))
 
 
+@pytest.mark.softcap_accuracy
 @pytest.mark.parametrize("dtype", _DTYPES)
 def test_triton_row_offsets_across_int32_boundary(dtype):
     if not torch.cuda.is_available():

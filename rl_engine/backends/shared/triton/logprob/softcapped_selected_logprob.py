@@ -239,6 +239,34 @@ def _validate_softcap(softcap: float, vocab_size: int) -> None:
 
 
 @triton.jit
+def _ordered_tile_sum(values):
+    """Sum one 1024-element FP32 tile with an explicit arithmetic tree.
+
+    Fold eight adjacent values left to right in each of 128 groups. Within
+    each 32-group section, pair the lower and upper halves at distances
+    16, 8, 4, 2, 1. Finally combine the four sections as (s0+s2)+(s1+s3).
+    Every addition rounds in FP32. These are logical groups, independent of
+    physical warp size. Scheduling may change; the addition pairs may not.
+
+    This spells out the CUDA tree observed in the captured row-939 diagnostic
+    instead of relying on the compiler's choice for a 1024-wide tl.sum.
+    A pure PyTorch test reference implements the same declared arithmetic.
+    """
+    tl.static_assert(values.shape[0] == 1024)
+    groups = tl.arange(0, 128) * 8
+    subtotal = tl.gather(values, groups, axis=0)
+    for offset in tl.static_range(1, 8):
+        subtotal = subtotal + tl.gather(values, groups + offset, axis=0)
+    subtotal = tl.sum(tl.reshape(subtotal, (4, 2, 16)), axis=1)
+    subtotal = tl.sum(tl.reshape(subtotal, (4, 2, 8)), axis=1)
+    subtotal = tl.sum(tl.reshape(subtotal, (4, 2, 4)), axis=1)
+    subtotal = tl.sum(tl.reshape(subtotal, (4, 2, 2)), axis=1)
+    subtotal = tl.sum(tl.reshape(subtotal, (4, 2, 1)), axis=1)
+    subtotal = tl.sum(tl.reshape(subtotal, (2, 2)), axis=0)
+    return tl.sum(subtotal, axis=0)
+
+
+@triton.jit
 def _softcapped_selected_logprob_fwd_kernel(
     logits_ptr,
     token_ids_ptr,
@@ -283,7 +311,7 @@ def _softcapped_selected_logprob_fwd_kernel(
         exp_softcapped = libdevice.exp(softcapped - row_max)
         # Padded lanes never contribute to the sum, including all-negative rows.
         exp_softcapped = tl.where(mask, exp_softcapped, 0.0)
-        tile_sum_exp = tl.sum(exp_softcapped, axis=0)
+        tile_sum_exp = _ordered_tile_sum(exp_softcapped)
         sum_exp = sum_exp + tile_sum_exp
 
     log_sum_exp_shifted = tl.log(sum_exp)
@@ -360,13 +388,13 @@ def _softcapped_selected_logprob_fwd_partial_kernel(
     mask = vocab_offsets < vocab_size
     row_max = tl.load(row_max_ptr + row)
 
-    # Keep the original 1024-element tile arithmetic and reduction order.
+    # Share the explicit 1024-element addition tree with ROW and ROW_PIPELINED.
     logits = tl.load(logits_ptr + row_start + vocab_offsets, mask=mask, other=0.0).to(tl.float32)  # noqa: E501 # fmt: skip
     scaled_logits = tl.div_rn(logits, SOFTCAP)
     softcapped = SOFTCAP * libdevice.tanh(scaled_logits)
     exp_softcapped = libdevice.exp(softcapped - row_max)
     exp_softcapped = tl.where(mask, exp_softcapped, 0.0)
-    tile_sum_exp = tl.sum(exp_softcapped, axis=0)
+    tile_sum_exp = _ordered_tile_sum(exp_softcapped)
 
     # Each program owns exactly one entry in the [M, n_tiles] scratch array.
     tl.store(partial_sum_exp_ptr + row * n_tiles + tile, tile_sum_exp)

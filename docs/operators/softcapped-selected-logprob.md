@@ -132,7 +132,23 @@ Vocabulary tiles contain 1024 elements and use four warps, with FP fusion disabl
 vocabulary width and softcap are compile-time constants; partial tiles are masked.
 Different caps may compile separate kernels. Masked columns contribute negative
 infinity to the maximum and zero to the sum. A zero maximum is canonicalized to
-positive zero. The original tile-sum order is retained for every cap.
+positive zero. `_ordered_tile_sum` declares the same addition pairs for every cap:
+
+1. Split a tile into 128 groups of eight adjacent FP32 values. Accumulate each
+   group left to right, starting from its first value.
+2. Split those 128 subtotals into four sections of 32. In each section, add
+   the lower half to the upper half at distances `16, 8, 4, 2, 1`.
+3. Merge the four section totals as `(s0 + s2) + (s1 + s3)`.
+4. Starting from FP32 positive zero, add tile totals in ascending vocabulary
+   order. Pad the final tile with positive zeros.
+
+Every addition rounds in FP32. The Triton helper spells out these pairs;
+its remaining `tl.sum` operations each reduce exactly two operands. These
+are logical groups, not assumptions about a backend's physical warp size.
+This tree reproduced all 256 captured tile sums from the row-939 diagnostic
+when replayed on identical FP32 exponentials. That replay verifies the
+reference against one captured case; GPU compilation, strategy invariance
+and performance of the newly explicit kernel tree still require regression.
 
 - `ROW`: one program scans the entire row for its maximum, then scans again,
   reducing each shifted tile and accumulating its sum in ascending tile order.
@@ -266,7 +282,6 @@ Every remaining selectable strategy is subject to the same byte-equality tests.
 ```bash
 uv sync --extra dev
 uv run --no-sync python -m pytest \
-  tests/ops/logprob/test_softcapped_selected_logprob.py \
   tests/backends/shared/triton/logprob/test_softcapped_selected_logprob_config.py \
   tests/runtime/test_softcapped_selected_logprob_registry.py \
   tests/validation/operators/test_softcapped_selected_logprob_harness.py \
@@ -274,10 +289,15 @@ uv run --no-sync python -m pytest \
 uv run --no-sync python tools/validation/operators/check_operator.py --op softcapped_selected_logprob \
   --candidate triton --device cuda --dtype bf16 --batch 2 --seq 16 --vocab 262144
 
-# Additional mathematical checks, reported separately from FP32 acceptance.
-# The known cap=70 discrepancy remains an ordinary failing assertion here.
+# Run these independently so one layer's failure cannot suppress another.
+# Save each command's exit status as well as its log when running on a server.
 uv run --no-sync python -m pytest \
-  tests/ops/logprob/test_softcapped_selected_logprob_math.py -q -ra
+  tests/ops/logprob/test_softcapped_selected_logprob*.py -m softcap_consistency -q -ra
+uv run --no-sync python -m pytest \
+  tests/ops/logprob/test_softcapped_selected_logprob*.py -m softcap_accuracy -q -ra
+# Additional mathematical checks; known discrepancies remain ordinary failures.
+uv run --no-sync python -m pytest \
+  tests/ops/logprob/test_softcapped_selected_logprob*.py -m softcap_math -q -ra
 
 # Inspect the benchmark plan without a GPU.
 uv run --no-sync python benchmarks/operators/logprob/benchmark_softcapped_selected_logprob.py --list-cases
@@ -309,11 +329,34 @@ uv run --no-sync python benchmarks/operators/logprob/benchmark_softcapped_select
 
 Validation has three layers:
 
-| Layer | Comparison and requirement | Location |
+| Layer / pytest marker | Comparison and requirement | Location |
 | --- | --- | --- |
-| FP32 reference accuracy | Compare outputs and gradients with `NativeSoftcappedSelectedLogprobOp` on the same device. Promote the already-quantized inputs and upstreams to FP32, and keep reference gradients in FP32. Use the unchanged WS1 `logprob` tolerances. | `tests/ops/logprob/test_softcapped_selected_logprob.py` and the shared operator harness |
-| Bitwise invariance | Compare training, `no_grad`, `inference_mode`, repeated backward, batch/chunk/layout changes and supported AUTO strategy switches. Require identical bytes within each dtype. | `tests/ops/logprob/test_softcapped_selected_logprob.py` |
-| Independent FP64 mathematics | Evaluate stable FP64 `log_softmax` and its autograd gradients on the same quantized inputs, without calling the Native or Triton implementation. Check both Native and the public Triton strategies. | `tests/ops/logprob/test_softcapped_selected_logprob_math.py` |
+| Fixed-path consistency / `softcap_consistency` | Compare the declared tile tree with an explicit PyTorch reference. Separately require identical output/statistic/gradient bytes across strategies, training, `no_grad`, `inference_mode`, repeated backward and batch/chunk/layout changes. | `tests/ops/logprob/test_softcapped_selected_logprob_ordered.py` and consistency items in `test_softcapped_selected_logprob.py` |
+| Independent FP32 accuracy and API checks / `softcap_accuracy` | Compare with Native FP32 `log_softmax` and autograd on the same device. Promote already-quantized inputs/upstreams to FP32 and retain FP32 reference gradients. Keep the WS1 `logprob` tolerances. | Accuracy items in `tests/ops/logprob/test_softcapped_selected_logprob.py`; the shared harness separately retains its checks |
+| Independent FP64 mathematics / `softcap_math` | Evaluate stable FP64 `log_softmax` and autograd without calling either implementation. Check Native, public Triton strategies and the ordered PyTorch reference against the unchanged extra mathematical targets. | `tests/ops/logprob/test_softcapped_selected_logprob_math.py` |
+
+Previously mixed accuracy/invariance cases now produce separate pytest items.
+An FP32 comparison failure therefore cannot prevent a matching consistency
+case from running. The original wide-input failures, caps and tolerances are
+retained. Do not interpret success in one layer as success in another.
+
+`tests/helpers/softcapped_ordered_reference.py` is a test-only arithmetic
+specification. It uses eager PyTorch additions to reproduce the tile partition,
+tree, FP32 accumulation and subtraction/cast points. It does not call the
+production validator or kernel and is neither the independent accuracy oracle
+nor the timed PyTorch baseline. Its backward is an explicit analytic expression;
+the operator's backward contains no reduction, and Native autograd remains
+the independent derivative check.
+
+Matching additions alone does not guarantee matching elementary functions:
+native `torch.log` and Triton's `tl.log`, or `torch.exp` and backward `tl.exp`,
+can round differently. The ordered tests first compare tile sums on identical
+FP32 values, independently of `exp` and `tanh`. Full-path checks separately
+compare forward tile partials, then use small, explicitly named GPU probes at
+the log/backward-exp boundaries before comparing subsequent PyTorch arithmetic
+bitwise. Those probes do not establish the intrinsics' mathematical accuracy;
+the independent suites exercise the complete production operation without
+them. The pure PyTorch reference is also checked directly against FP64.
 
 The direct FP32 tests retain the existing tolerance selection: forward FP32
 outputs use `atol=1e-5, rtol=0`; gradients use their output dtype's contract row
@@ -328,7 +371,7 @@ for FP32, FP16 or BF16 output respectively, with zero relative tolerance.
 These are test-specific mathematical goals, not a project-wide FP64 contract.
 They retain FP64 oracle values during comparison and do not borrow the WS1
 resolver. Passing FP32 agreement does not automatically pass these stricter
-checks. Running the whole test directory includes both files; the extra checks
+checks. Running the whole test directory includes all three files; the extra checks
 are not skipped or marked `xfail` to obtain a green result.
 
 Random upstream gradients, saved-tensor reuse, strategy boundaries and indexing

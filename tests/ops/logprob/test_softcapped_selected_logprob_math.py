@@ -19,6 +19,8 @@ from rl_engine.reference.logprob.softcapped_selected_logprob import (
     NativeSoftcappedSelectedLogprobOp,
 )
 
+pytestmark = pytest.mark.softcap_math
+
 _DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 _SOFTCAPS = (1e-6, 1e-3, 0.125, 0.5, 1.0, 3.7, 10.0, 17.3, 20.0, 30.0, 39.5, 50.0, 64.0, 70.0)
 _FORWARD_MATH_ATOL = 1e-5
@@ -96,6 +98,28 @@ def _check_math(op, logits, token_ids, upstream, *, softcap):
     )
     _assert_fp64_math_accuracy(gradient, expected_gradient, atol=_GRADIENT_MATH_ATOL[logits.dtype])
     _assert_fp64_math_accuracy(output, expected_output, atol=_FORWARD_MATH_ATOL)
+
+
+@pytest.mark.parametrize("softcap", _SOFTCAPS)
+@pytest.mark.parametrize("dtype", _DTYPES)
+def test_ordered_pytorch_reference_against_independent_fp64(dtype, softcap):
+    """The same-order reference must not be its own mathematical justification.
+
+    Qualify its forward and explicit analytic backward against independent
+    FP64 log_softmax/autograd. Preserve the same extra mathematical targets;
+    the ordered reference cannot change the formal FP32 acceptance baseline.
+    """
+    from tests.helpers.softcapped_ordered_reference import ordered_backward, ordered_forward
+
+    generator = torch.Generator().manual_seed(467)
+    logits = (softcap * torch.randn((3, 1025), generator=generator)).to(dtype)
+    ids = torch.tensor([0, 512, 1024])
+    upstream = torch.tensor([0.5, -2.0, 0.0])
+    forward = ordered_forward(logits, ids, softcap=softcap)
+    gradient = ordered_backward(forward, ids, upstream, output_dtype=dtype)
+    expected_output, expected_gradient = _fp64_reference(logits, ids, upstream, softcap=softcap)
+    _assert_fp64_math_accuracy(gradient, expected_gradient, atol=_GRADIENT_MATH_ATOL[dtype])
+    _assert_fp64_math_accuracy(forward.output, expected_output, atol=_FORWARD_MATH_ATOL)
 
 
 @pytest.mark.parametrize("softcap", _SOFTCAPS)

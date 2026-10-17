@@ -366,7 +366,7 @@ def test_public_auto_benchmark_gpu_smoke(tmp_path, dtype, softcap):
     report = run_benchmark(args)
     assert report["environment"]["softcap"] == softcap
     assert report["environment"]["baseline"] == (
-        "eager NativeSoftcappedSelectedLogprobOp; FP32 device-tensor division"
+        "eager NativeSoftcappedSelectedLogprobOp; FP32 device-tensor division; FP32 log_softmax"
     )
     assert report["case_plan"]["softcap"] == softcap
     assert report["complete"]

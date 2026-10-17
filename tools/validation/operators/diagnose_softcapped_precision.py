@@ -15,6 +15,7 @@ from rl_engine.backends.shared.triton.logprob.softcapped_selected_logprob import
     _FORWARD_LAUNCHERS,
     SoftcappedLogprobStrategy,
     TritonSoftcappedSelectedLogprobOp,
+    _ordered_tile_sum,
 )
 from rl_engine.reference.logprob.softcapped_selected_logprob import (
     NativeSoftcappedSelectedLogprobOp,
@@ -58,7 +59,11 @@ def _trace_row(
         t = libdevice.tanh(q)
         s = CAP * t
         e = tl.where(mask, libdevice.exp(s - row_max), 0.0)
-        partial = tl.sum(e, axis=0)
+        if SHIFTED:
+            partial = _ordered_tile_sum(e)
+        else:
+            # Historical unshifted path, not the current production tree.
+            partial = tl.sum(e, axis=0)
         total = total + partial
         tl.store(quotient_ptr + row * V + offsets, q, mask=mask)
         tl.store(tanh_ptr + row * V + offsets, t, mask=mask)
