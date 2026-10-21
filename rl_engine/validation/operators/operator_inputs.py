@@ -303,6 +303,7 @@ def _make_softcapped_selected_logprob_inputs(
     return {
         "logits": _floating_tensor((n_rows, vocab), args, dtype, device, 0),
         "token_ids": _token_ids((n_rows,), vocab, args, device),
+        "softcap": 30.0,  # This validation case explicitly uses Gemma's softcap.
     }
 
 

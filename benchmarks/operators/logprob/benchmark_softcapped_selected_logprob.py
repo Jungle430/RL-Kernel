@@ -22,6 +22,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from benchmarks.common.profiler import GPUTargetInfo, PerformanceProfiler  # noqa: E402
 from rl_engine.contracts.numerical import load_contract, resolve_tolerance  # noqa: E402
+from rl_engine.contracts.operators.softcapped_selected_logprob import REDUCTION_CONFIG  # noqa: E402
 from rl_engine.reference.logprob.softcapped_selected_logprob import (  # noqa: E402
     NativeSoftcappedSelectedLogprobOp,
 )
@@ -278,7 +279,8 @@ def _markdown(report):
         "and forward+backward timing. Backward reuses the divisor saved in the prebuilt graph.",
         "Untimed accuracy checks promote the same quantized inputs to FP32 and keep "
         "Native reference gradients in FP32. Timing uses the original input dtype. "
-        "Independent FP64 mathematical checks are reported by the separate pytest suite.",
+        "Independent FP64 mathematical checks are available through the optional "
+        "tools.validation.operators.check_softcapped_math diagnostic.",
         "Contiguous inputs are reused without explicit cache eviction. Median accelerator-event "
         "latency includes public wrapper allocation and autograd dispatch. Input generation, "
         "accuracy checks and JIT compilation are outside timing; the selector cache is warm. "
@@ -339,7 +341,7 @@ def _markdown(report):
 def build_arg_parser():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--device", default="cuda:0")
-    parser.add_argument("--softcap", type=_positive_float, default=30.0)
+    parser.add_argument("--softcap", type=_positive_float, required=True)
     parser.add_argument("--dtypes", nargs="+", choices=DTYPES, default=list(DTYPES))
     parser.add_argument(
         "--shapes", nargs="+", type=_shape, default=list(map(_shape, DEFAULT_SHAPES))
@@ -372,9 +374,9 @@ def run_benchmark(args):
     import triton
 
     from rl_engine.backends.shared.triton.logprob.softcapped_selected_logprob import (
-        _BLOCK_V,
         SoftcappedLogprobStrategy,
         TritonSoftcappedSelectedLogprobOp,
+        select_softcapped_logprob_pipeline_config,
         select_softcapped_logprob_strategy,
         softcapped_logprob_device_key,
     )
@@ -393,7 +395,9 @@ def run_benchmark(args):
                 (strategy.value, TritonSoftcappedSelectedLogprobOp(forward_impl=strategy))
                 for strategy in (SoftcappedLogprobStrategy.ROW, SoftcappedLogprobStrategy.PARALLEL)
             ]
-        env = _environment(device, args, triton.__version__, _BLOCK_V, profiler.gpu_info)
+        env = _environment(
+            device, args, triton.__version__, REDUCTION_CONFIG.tile_size, profiler.gpu_info
+        )
         report = {
             "environment": env,
             "case_plan": _case_plan(args),
@@ -429,6 +433,9 @@ def run_benchmark(args):
                 strategy = select_softcapped_logprob_strategy(
                     softcapped_logprob_device_key(logits.device), logits.dtype, *shape
                 ).value
+                pipeline_config = select_softcapped_logprob_pipeline_config(
+                    softcapped_logprob_device_key(logits.device), logits.dtype, *shape
+                )
                 for mode in args.modes:
                     measurements = {}
                     if explicit and mode == "forward":
@@ -455,6 +462,7 @@ def run_benchmark(args):
                         "accuracy": accuracy,
                         "train_inference_bitwise": True,
                         "strategy_bitwise": [name for name, _ in strategy_candidates],
+                        "row_pipeline_stages": pipeline_config.pipeline_stages,
                         "native": measurements["native"],
                         "triton": measurements["triton"],
                         "speedup": measurements["native"]["median_ms"]

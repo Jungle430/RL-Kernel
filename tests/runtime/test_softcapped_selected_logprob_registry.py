@@ -34,7 +34,7 @@ def test_registry_native_dispatch(platform, monkeypatch):
     op = registry.get_op("softcapped_selected_logprob")
     assert isinstance(op, NativeSoftcappedSelectedLogprobOp)
     logits = torch.tensor([[1.0, 2.0, 3.0]])
-    output = op(logits, torch.tensor([1]))
+    output = op(logits, torch.tensor([1]), softcap=30.0)
     expected = torch.log_softmax(30.0 * torch.tanh(logits.double() / 30.0), dim=-1)[:, 1]
     assert output.shape == (1,) and output.dtype == torch.float32
     assert output.device == logits.device

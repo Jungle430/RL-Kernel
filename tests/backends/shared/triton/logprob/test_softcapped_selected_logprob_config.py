@@ -5,10 +5,17 @@
 import ast
 import sys
 from pathlib import Path
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 
 import pytest
 import torch
+
+from rl_engine.contracts.operators.softcapped_selected_logprob import (
+    REDUCTION_CONFIG,
+    SUPPORTED_DTYPES,
+    TRITON_SUPPORTED_DEVICES,
+    SoftcappedLogprobReductionConfig,
+)
 
 ROW = "row"
 PARALLEL = "parallel"
@@ -23,12 +30,13 @@ _RANGE_CASES = [
 ]
 
 
-def _host_configuration_module():
-    """Execute the real host definitions, stopping before any GPU kernel.
+def _host_validation_and_dispatch_module():
+    """Load production policy, validation and host dispatch when Triton is unavailable.
 
-    The operator keeps configuration beside its kernels. Reading this prefix
-    lets CPU-only development check the production selector without importing
-    Triton stubs, replacing kernels, or duplicating the selection algorithm.
+    Execute the pre-kernel definitions, pipelined resolver and public Op class
+    without Triton/reduction imports. Policy and launchers share one module.
+    Tests replace dispatch before any kernel can run. GPU hosts import the
+    complete operator module instead.
     """
     path = (
         Path(__file__).resolve().parents[5]
@@ -49,12 +57,26 @@ def _host_configuration_module():
             node.names = [name for name in node.names if name.name.split(".")[0] != "triton"]
             if not node.names:
                 continue
-        elif isinstance(node, ast.ImportFrom) and (node.module or "").split(".")[0] == "triton":
+        elif isinstance(node, ast.ImportFrom) and (
+            (node.module or "").split(".")[0] == "triton"
+            or (node.module or "").startswith("rl_engine.backends.shared.triton.reduction")
+        ):
             continue
         body.append(node)
     else:
-        raise AssertionError("Expected a Triton kernel after the host configuration")
-    module = ModuleType("_softcapped_logprob_host_configuration")
+        raise AssertionError("Expected a Triton kernel after host validation")
+    body.extend(
+        node
+        for node in source.body
+        if isinstance(node, (ast.ClassDef, ast.FunctionDef))
+        and node.name
+        in (
+            "_ForwardResult",
+            "_launch_softcapped_selected_logprob_fwd_pipelined",
+            "TritonSoftcappedSelectedLogprobOp",
+        )
+    )
+    module = ModuleType("_softcapped_logprob_host_validation_and_dispatch")
     sys.modules[module.__name__] = module
     try:
         exec(compile(ast.Module(body=body, type_ignores=[]), str(path), "exec"), vars(module))
@@ -65,14 +87,14 @@ def _host_configuration_module():
 
 
 @pytest.fixture(scope="module")
-def config():
+def core():
     if not torch.cuda.is_available():
         try:
             import triton
         except ImportError:
             triton = None
         if triton is None or not hasattr(triton, "jit"):
-            module = _host_configuration_module()
+            module = _host_validation_and_dispatch_module()
             try:
                 yield module
             finally:
@@ -84,18 +106,61 @@ def config():
     yield softcapped_selected_logprob
 
 
+@pytest.fixture(scope="module")
+def config(core):
+    """Use the same module for tuning maps, cached selectors and kernel wrappers."""
+    return core
+
+
+@pytest.mark.parametrize("explicit", (False, True))
+@pytest.mark.parametrize("invalid", ("shape", "ids_shape", "ids_dtype", "softcap"))
+def test_public_input_errors_precede_device_lookup_and_dispatch(
+    core, monkeypatch, explicit, invalid
+):
+    """Reject malformed metadata before auto selection or autograd, even without a GPU."""
+    # Only host validation runs. Accept CPU here so real tensors exercise every
+    # metadata check; neither hardware lookup nor autograd may be reached.
+    monkeypatch.setattr(core, "TRITON_SUPPORTED_DEVICES", ("cpu",))
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("Invalid inputs reached device lookup or autograd dispatch")
+
+    monkeypatch.setattr(core, "softcapped_logprob_device_key", forbidden)
+    monkeypatch.setattr(
+        core,
+        "_SoftcappedSelectedLogprobTritonFunction",
+        SimpleNamespace(apply=forbidden),
+        raising=False,
+    )
+    logits, ids, cap = torch.zeros((1, 4)), torch.tensor([0]), 30.0
+    if invalid == "shape":
+        logits = logits[0]
+    elif invalid == "ids_shape":
+        ids = ids.repeat(2)
+    elif invalid == "ids_dtype":
+        ids = ids.float()
+    else:
+        cap = 0.0
+    strategy = core.SoftcappedLogprobStrategy.ROW if explicit else None
+    op = core.TritonSoftcappedSelectedLogprobOp(forward_impl=strategy)
+    error = TypeError if invalid == "ids_dtype" else ValueError
+    message = {"shape": "shape", "ids_shape": "shape", "ids_dtype": "int64", "softcap": "softcap"}
+    with pytest.raises(error, match=message[invalid]):
+        op(logits, ids, softcap=cap)
+
+
 @pytest.mark.parametrize("softcap", (0.0, -1.0, float("nan"), float("inf"), 1e-50, 100.0))
-def test_softcap_rejects_unsafe_values(config, softcap):
+def test_softcap_rejects_unsafe_values(core, softcap):
     with pytest.raises(ValueError, match="softcap"):
-        config._validate_softcap(softcap, 1)
+        core._validate_softcap(softcap, 1)
 
 
-def test_softcap_range_depends_on_vocabulary(config):
+def test_softcap_range_depends_on_vocabulary(core):
     for cap in (1.0, 17.3, 20.0, 30.0, 50.0):
-        config._validate_softcap(cap, 262144)
-    config._validate_softcap(80.0, 1)
+        core._validate_softcap(cap, 262144)
+    core._validate_softcap(80.0, 1)
     with pytest.raises(ValueError, match="V=32768.*FP32 exp/sum range"):
-        config._validate_softcap(80.0, 32768)
+        core._validate_softcap(80.0, 32768)
 
 
 @pytest.fixture(autouse=True)
@@ -103,13 +168,222 @@ def clear_strategy_cache(config):
     # A test may temporarily replace the map. Cached choices must not escape
     # that configuration or survive a failure during the test.
     config.select_softcapped_logprob_strategy.cache_clear()
+    config.select_softcapped_logprob_pipeline_config.cache_clear()
     yield
     config.select_softcapped_logprob_strategy.cache_clear()
+    config.select_softcapped_logprob_pipeline_config.cache_clear()
 
 
 def _install_configs(config, monkeypatch, entries):
     monkeypatch.setattr(config, "FORWARD_STRATEGY_CONFIGS", entries)
     config.select_softcapped_logprob_strategy.cache_clear()
+
+
+def test_backend_uses_shared_input_and_reduction_contract(core):
+    """The backend does not maintain a second copy of reference metadata."""
+    assert core.REDUCTION_CONFIG is REDUCTION_CONFIG
+    assert core.SUPPORTED_DTYPES is SUPPORTED_DTYPES
+    assert core.TRITON_SUPPORTED_DEVICES is TRITON_SUPPORTED_DEVICES
+
+
+@pytest.fixture
+def pipeline_ranges(config, monkeypatch):
+    """Synthetic ranges exercise selection; they are not measured tuning recommendations."""
+    device = config.SoftcappedLogprobDevice(backend="cuda", gpu_name="test GPU")
+    monkeypatch.setattr(
+        config,
+        "ROW_PIPELINE_CONFIGS",
+        {
+            config.ForwardConfigKey(
+                device=config._DEFAULT_DEVICE,
+                dtype=torch.bfloat16,
+                min_rows=1,
+                max_rows=4,
+                min_tiles=2,
+                max_tiles=4,
+            ): config.RowPipelineConfig(pipeline_stages=2),
+            config.ForwardConfigKey(
+                device=config._DEFAULT_DEVICE,
+                dtype=torch.bfloat16,
+                min_rows=5,
+                max_rows=8,
+                min_tiles=2,
+                max_tiles=None,
+            ): config.RowPipelineConfig(pipeline_stages=4),
+            config.ForwardConfigKey(
+                device=device,
+                dtype=torch.bfloat16,
+                min_rows=2,
+                max_rows=3,
+                min_tiles=2,
+                max_tiles=2,
+            ): config.RowPipelineConfig(pipeline_stages=1),
+        },
+    )
+    return device
+
+
+@pytest.mark.parametrize("stages", (0, -1))
+def test_pipeline_config_rejects_nonpositive_depth(config, stages):
+    with pytest.raises(ValueError, match="pipeline_stages must be positive"):
+        config.RowPipelineConfig(pipeline_stages=stages)
+
+
+@pytest.mark.parametrize(
+    "backend,gpu_name,dtype,rows,vocab,expected_stages",
+    (
+        ("cuda", "test GPU", torch.bfloat16, 1, 1025, 2),
+        ("cuda", "test GPU", torch.bfloat16, 4, 4096, 2),
+        ("cuda", "test GPU", torch.bfloat16, 2, 1025, 1),
+        ("cuda", "test GPU", torch.bfloat16, 3, 2048, 1),
+        ("cuda", "test GPU", torch.bfloat16, 3, 2049, 2),
+        ("cuda", "test GPU", torch.bfloat16, 5, 1025, 4),
+        ("cuda", "test GPU", torch.bfloat16, 8, 1 << 40, 4),
+        ("cuda", "other GPU", torch.bfloat16, 2, 1025, 2),
+        ("rocm", "test GPU", torch.bfloat16, 2, 1025, 2),
+        ("cuda", "test GPU", torch.float16, 2, 1025, None),
+        ("cuda", "test GPU", torch.bfloat16, 0, 1025, None),
+        ("cuda", "test GPU", torch.bfloat16, 1, 1024, None),
+        ("cuda", "test GPU", torch.bfloat16, 4, 4097, None),
+        ("cuda", "test GPU", torch.bfloat16, 9, 1025, None),
+        ("cuda", "test GPU", torch.bfloat16, 1 << 40, 1 << 40, None),
+    ),
+)
+def test_pipeline_ranges_match_shape_dtype_and_device(
+    config, pipeline_ranges, backend, gpu_name, dtype, rows, vocab, expected_stages
+):
+    actual = config.select_softcapped_logprob_pipeline_config(
+        config.SoftcappedLogprobDevice(backend=backend, gpu_name=gpu_name), dtype, rows, vocab
+    )
+    if expected_stages is None:
+        assert actual is config.DEFAULT_ROW_PIPELINE_CONFIG
+    else:
+        assert actual.pipeline_stages == expected_stages
+
+
+@pytest.mark.parametrize("tile_size", (16, 2048))
+def test_pipeline_ranges_use_the_configured_tile_width(
+    config, pipeline_ranges, monkeypatch, tile_size
+):
+    monkeypatch.setattr(
+        config, "REDUCTION_CONFIG", SoftcappedLogprobReductionConfig(tile_size=tile_size)
+    )
+    select = config.select_softcapped_logprob_pipeline_config
+    assert (
+        select(pipeline_ranges, torch.bfloat16, 1, tile_size) is config.DEFAULT_ROW_PIPELINE_CONFIG
+    )
+    assert select(pipeline_ranges, torch.bfloat16, 1, tile_size + 1).pipeline_stages == 2
+
+
+@pytest.mark.parametrize("device_specific", (False, True))
+@pytest.mark.parametrize("reverse_order", (False, True))
+def test_pipeline_overlapping_ranges_fail(config, monkeypatch, device_specific, reverse_order):
+    device = config.SoftcappedLogprobDevice(backend="cuda", gpu_name="test GPU")
+    scope = device if device_specific else config._DEFAULT_DEVICE
+    entries = [
+        (
+            config.ForwardConfigKey(
+                device=scope,
+                dtype=torch.bfloat16,
+                min_rows=1,
+                max_rows=max_rows,
+                min_tiles=2,
+                max_tiles=4,
+            ),
+            config.RowPipelineConfig(pipeline_stages=stages),
+        )
+        for max_rows, stages in ((4, 2), (8, 4))
+    ]
+    monkeypatch.setattr(
+        config, "ROW_PIPELINE_CONFIGS", dict(reversed(entries) if reverse_order else entries)
+    )
+    with pytest.raises(ValueError, match="overlapping row pipeline ranges"):
+        config.select_softcapped_logprob_pipeline_config(device, torch.bfloat16, 4, 1025)
+
+
+def test_pipeline_cache_separates_shapes_and_updates_after_clear(
+    config, pipeline_ranges, monkeypatch
+):
+    select = config.select_softcapped_logprob_pipeline_config
+    for context in (torch.enable_grad(), torch.no_grad(), torch.inference_mode()):
+        with context:
+            assert select(pipeline_ranges, torch.bfloat16, 4, 1025).pipeline_stages == 2
+            assert select(pipeline_ranges, torch.bfloat16, 5, 1025).pipeline_stages == 4
+    assert select.cache_info().misses == 2
+    assert select.cache_info().hits == 4
+    assert select.cache_info().maxsize == 1024
+    monkeypatch.setattr(config, "ROW_PIPELINE_CONFIGS", {})
+    monkeypatch.setattr(
+        config, "DEFAULT_ROW_PIPELINE_CONFIG", config.RowPipelineConfig(pipeline_stages=5)
+    )
+    select.cache_clear()
+    assert select(pipeline_ranges, torch.bfloat16, 4, 1025).pipeline_stages == 5
+
+
+def test_pipelined_launcher_resolves_each_calls_shape(core, pipeline_ranges, monkeypatch):
+    """Exercise real resolution and forwarding while replacing only the GPU launch."""
+    seen = []
+    sentinel = object()
+    monkeypatch.setattr(core, "softcapped_logprob_device_key", lambda device: pipeline_ranges)
+
+    def capture(logits, token_ids, softcap, *, pipeline_stages):
+        seen.append((logits, token_ids, softcap, pipeline_stages))
+        return sentinel
+
+    monkeypatch.setattr(core, "_launch_softcapped_selected_logprob_fwd", capture, raising=False)
+    for rows, stages in ((4, 2), (2, 1), (5, 4)):
+        logits = torch.empty((rows, 1025), dtype=torch.bfloat16)
+        ids = torch.zeros(rows, dtype=torch.int64)
+        result = core._launch_softcapped_selected_logprob_fwd_pipelined(logits, ids, 17.3)
+        assert result is sentinel
+        assert seen[-1][0] is logits and seen[-1][1] is ids
+        assert seen[-1][2:] == (17.3, stages)
+
+
+@pytest.mark.parametrize(
+    "device,hip_version,expected",
+    (
+        ("cuda", None, {"enable_fp_fusion": False, "enable_reflect_ftz": False}),
+        ("cuda", "test-rocm", {"enable_fp_fusion": False, "allow_flush_denorm": False}),
+        ("cpu", "test-rocm", {"enable_fp_fusion": False}),
+        ("xpu", None, {"enable_fp_fusion": False}),
+    ),
+)
+def test_math_options_preserve_subnormals_without_foreign_backend_flags(
+    core, monkeypatch, device, hip_version, expected
+):
+    """Both GPU builds use CUDA devices; a ROCm build alone does not select GPU flags."""
+    compiler = ModuleType("triton.backends.nvidia.compiler")
+
+    class CUDAOptions:
+        enable_reflect_ftz = True
+
+    compiler.CUDAOptions = CUDAOptions
+    monkeypatch.setitem(sys.modules, compiler.__name__, compiler)
+    monkeypatch.setattr(torch.version, "hip", hip_version)
+    assert core._math_launch_options(torch.device(device)) == expected
+
+
+def test_older_cuda_backend_cannot_silently_ignore_subnormal_preservation(core, monkeypatch):
+    """Older compilers must report the missing capability before launching kernels."""
+    compiler = ModuleType("triton.backends.nvidia.compiler")
+    compiler.CUDAOptions = type("CUDAOptions", (), {})
+    monkeypatch.setitem(sys.modules, compiler.__name__, compiler)
+    monkeypatch.setattr(torch.version, "hip", None)
+    with pytest.raises(RuntimeError, match="enable_reflect_ftz.*Upgrade Triton"):
+        core._math_launch_options(torch.device("cuda"))
+
+
+@pytest.mark.parametrize("tile_size", (16, 512, 1024, 2048))
+def test_selector_counts_tiles_using_the_shared_config(config, monkeypatch, tile_size):
+    """A changed arithmetic width must also move the 32-tile policy boundary."""
+    monkeypatch.setattr(
+        config, "REDUCTION_CONFIG", SoftcappedLogprobReductionConfig(tile_size=tile_size)
+    )
+    device = config.SoftcappedLogprobDevice(backend="cuda", gpu_name="unmeasured GPU")
+    select = config.select_softcapped_logprob_strategy
+    assert select(device, torch.float32, 1, 31 * tile_size).value == ROW
+    assert select(device, torch.float32, 1, 31 * tile_size + 1).value == PARALLEL
 
 
 def test_auto_policy_excludes_explicit_experiments(config):
@@ -551,6 +825,19 @@ def test_repeated_metadata_skips_configuration_matching(config, monkeypatch):
     assert config.select_softcapped_logprob_strategy(equivalent_device, *args[1:]) == PARALLEL
     assert len(scans) == first_scans
     assert config.select_softcapped_logprob_strategy.cache_info().hits == 1
+
+
+def test_selector_cache_keeps_alternating_shapes(config):
+    """Decode/prefill shape changes must not evict each other's warm selection."""
+    select = config.select_softcapped_logprob_strategy
+    device = config.SoftcappedLogprobDevice(backend="cuda", gpu_name="test GPU")
+    shapes = ((16, 262144), (4097, 262144))
+    for _ in range(2):
+        for rows, vocab in shapes:
+            select(device, torch.bfloat16, rows, vocab)
+    assert select.cache_info().misses == 2
+    assert select.cache_info().hits == 2
+    assert select.cache_info().maxsize == 1024
 
 
 @pytest.mark.parametrize(

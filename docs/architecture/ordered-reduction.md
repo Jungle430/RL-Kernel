@@ -161,6 +161,42 @@ backend must support the requested operations. Use an integer accumulator to
 count booleans, and a width sufficient for the result. No automatic accumulator
 widening is supplied. FP64 cannot restore bits lost before the input arrived.
 
+## Integration with softcapped selected logprob
+
+The operator computes softcap and shifted exponentials inside its kernels.
+Its tile and merge helpers come from one package entry point:
+
+```python
+from rl_engine.backends.shared.triton.reduction import (
+    sum_partials,
+    sum_tile,
+)
+```
+
+The PyTorch reference package exposes the same names. The convenience functions
+encapsulate operation, seed and defaults; callers do not need generic reducer
+parameters or imports from the implementation module.
+
+| Helper | Role in logprob |
+| --- | --- |
+| `sum_tile` | Reduce the already-computed exponentials in one tile, without writing them to global memory |
+| `sum_partials` | Merge stored tile sums in ascending tile order from zero, matching ROW's accumulation |
+
+`_softcapped_exp_tile_sum` loads one tile, computes FP32 softcap and shifted exp,
+clears padded lanes, and calls `sum_tile`. All three forward strategies use it:
+
+- ROW folds its tile sums from positive zero within one program.
+- ROW_PIPELINED uses the same loop and arithmetic with a pipeline hint.
+- PARALLEL writes each sum to its tile slot, then calls `sum_partials` in a
+  dependent merge kernel. Producer completion order does not affect addition order.
+
+The shared `_store_softcapped_selected_logprob` then finishes the logprob.
+Logprob passes its own `REDUCTION_CONFIG` explicitly, independently of the
+utility's defaults. All schedules keep the same FP32 arithmetic and cast points.
+Its native `log_softmax`/autograd reference remains independent.
+See the [operator documentation](../operators/softcapped-selected-logprob.md)
+for the full forward/backward contract and validation commands.
+
 The six package exports cover loaded tiles, complete vectors and stored partials.
 The generic merge and binary combiners remain in the implementation module.
 Ordinary callers need not assemble or configure those internal stages.

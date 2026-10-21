@@ -32,6 +32,7 @@ def test_shared_accuracy_harness(dtype, backend):
     case = make_operator_case(args, dtype, device)
     assert case.inputs["logits"].shape == (6, 1025)
     assert case.inputs["token_ids"].shape == (6,)
+    assert case.inputs["softcap"] == 30.0
     report = run_operator_suite(
         args.op,
         candidates=[make_candidate(args)],

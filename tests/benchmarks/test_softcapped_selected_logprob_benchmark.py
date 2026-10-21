@@ -58,7 +58,7 @@ def test_workload_timing_and_random_upstream(mode, softcap):
 
 
 def test_benchmark_rejects_cpu():
-    args = build_arg_parser().parse_args(["--device", "cpu"])
+    args = build_arg_parser().parse_args(["--device", "cpu", "--softcap", "30"])
     with pytest.raises(RuntimeError, match="requires an NVIDIA CUDA or AMD ROCm GPU"):
         run_benchmark(args)
 
@@ -187,7 +187,7 @@ def test_benchmark_entry_point_runs_outside_checkout(tmp_path):
     env.pop("PYTHONPATH", None)
     env["RL_KERNEL_LOG_STREAM"] = "stderr"
     result = subprocess.run(
-        [sys.executable, str(script), "--list-cases"],
+        [sys.executable, str(script), "--softcap", "30", "--list-cases"],
         cwd=tmp_path,
         env=env,
         capture_output=True,
@@ -244,7 +244,13 @@ def test_accuracy_gate_rejects_incorrect_gradient(softcap):
 )
 def test_benchmark_rejects_invalid_measurements(arguments):
     with pytest.raises(SystemExit):
-        build_arg_parser().parse_args(arguments)
+        build_arg_parser().parse_args(["--softcap", "30", *arguments])
+
+
+def test_benchmark_requires_explicit_softcap():
+    """Listing cases must not silently select a model's cap either."""
+    with pytest.raises(SystemExit):
+        build_arg_parser().parse_args(["--list-cases"])
 
 
 def test_list_cases_needs_no_gpu_or_report_files(monkeypatch, capsys, tmp_path):
@@ -377,6 +383,7 @@ def test_public_auto_benchmark_gpu_smoke(tmp_path, dtype, softcap):
         assert row["triton_strategy"] == "row"
         assert row["train_inference_bitwise"]
         assert set(row["strategy_bitwise"]) == {"row", "parallel", "row_pipelined"}
+        assert row["row_pipeline_stages"] > 0
         assert row["speedup"] > 0
         assert row["native"]["std_ms"] is not None
         assert row["triton"]["std_ms"] is not None
