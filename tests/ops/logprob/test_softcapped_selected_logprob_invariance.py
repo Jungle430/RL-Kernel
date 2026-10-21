@@ -315,7 +315,7 @@ def test_pipeline_depth_changes_across_batch_split_preserve_bits(dtype, automati
         dict.fromkeys((whole_key, split_key), core.SoftcappedLogprobStrategy.ROW_PIPELINED),
     )
     core.select_softcapped_logprob_strategy.cache_clear()
-    core.select_softcapped_logprob_pipeline_core.cache_clear()
+    core.select_softcapped_logprob_pipeline_config.cache_clear()
     try:
         generator = torch.Generator().manual_seed(431)
         logits = (torch.randn((4, 1025), generator=generator) * 30).to(device="cuda", dtype=dtype)
@@ -356,7 +356,7 @@ def test_pipeline_depth_changes_across_batch_split_preserve_bits(dtype, automati
                 )
     finally:
         core.select_softcapped_logprob_strategy.cache_clear()
-        core.select_softcapped_logprob_pipeline_core.cache_clear()
+        core.select_softcapped_logprob_pipeline_config.cache_clear()
 
 
 @pytest.mark.softcap_consistency

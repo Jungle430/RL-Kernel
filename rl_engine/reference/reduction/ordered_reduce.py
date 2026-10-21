@@ -29,11 +29,7 @@ from typing import Protocol
 
 import torch
 
-from rl_engine.contracts.operators.ordered_reduction import (
-    MAX_GROUP_SIZE,
-    SECTION_COUNT,
-    TILE_SIZE,
-)
+from rl_engine.contracts.operators.ordered_reduction import MAX_GROUP_SIZE, SECTION_COUNT, TILE_SIZE
 
 
 class _Combine(Protocol):
@@ -86,8 +82,9 @@ def ordered_tile_reduce(
     Steps and local names mirror Triton's ordered_tile_reduce. Lowercase sizes
     correspond to its constexpr values. PyTorch additionally accepts leading
     batch dimensions; only the last dimension participates in the tree.
-    index_select corresponds to tl.gather. Each two-entry tl.reduce becomes
-    one combine_fn call on the two slices, without using PyTorch's native sum.
+    index_select corresponds to tl.gather. The two slices select the same
+    halves as Triton's permute/split, followed by one direct combine_fn call.
+    Neither implementation delegates the tree to a native reduction.
     """
     if values.ndim == 0:
         raise ValueError("ordered_tile_reduce requires values with at least one dimension")
@@ -106,7 +103,7 @@ def ordered_tile_reduce(
         subtotal = combine_fn(subtotal, values.index_select(-1, groups + offset))
     n_sections = min(n_groups, section_count)
     section_size = n_groups // n_sections
-    # Reduce within each section; every reduction axis has exactly two entries.
+    # Split each section into lower/upper halves, then combine matching entries.
     for shift in range(section_size.bit_length() - 2, -1, -1):
         subtotal = subtotal.reshape(*values.shape[:-1], n_sections, 2, 1 << shift)
         subtotal = combine_fn(subtotal[..., 0, :], subtotal[..., 1, :])

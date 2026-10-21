@@ -208,8 +208,8 @@ positive zero. `ordered_tile_reduce` with `COMBINE_FN=reduce_add` declares these
 3. Merge section totals as `(s0 + s2) + (s1 + s3)`.
 4. Starting from positive zero, add tile totals in ascending vocabulary order.
 
-Every addition rounds in FP32. Each `tl.reduce` combines exactly two operands
-using `reduce_add`. The groups describe arithmetic, not a physical warp layout. Forward
+Every addition rounds in FP32. Each tree step explicitly selects two operands
+and calls `reduce_add`. The groups describe arithmetic, not a physical warp layout. Forward
 uses four warps with FP fusion disabled; `V` and `softcap` are compile-time
 constants. Changing a cap can compile a separate specialization.
 

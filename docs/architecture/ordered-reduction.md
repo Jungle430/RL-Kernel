@@ -260,9 +260,10 @@ Its last dimension must be nonempty. It does not implement another tree.
 3. Merge section totals using the same halving-distance pairs. Four sections
    produce `(s0 + s2) + (s1 + s3)` for addition.
 
-Every `tl.reduce` operates on exactly two entries along its reduction axis.
-A one-entry stage passes through without adding an identity. The PyTorch
-translation uses explicit pairwise operations instead of native `sum`.
+Each tree step explicitly selects its lower/upper operands and calls the binary
+combiner directly. Triton uses `permute`/`split`; PyTorch selects the same slices.
+A one-entry stage passes through without adding an identity. Neither delegates
+the tree to a native reduction.
 
 Across tiles, serial and parallel schedules both compute
 `(((initial + partial[0]) + partial[1]) + ...)` for addition. This is a left

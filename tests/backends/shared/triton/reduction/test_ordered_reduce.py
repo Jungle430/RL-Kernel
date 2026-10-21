@@ -83,7 +83,7 @@ def test_merge_unroll_preserves_left_fold_and_handles_tails(merge_unroll, dtype,
 @pytest.mark.parametrize("merge_unroll", (0, -1))
 def test_merge_rejects_nonpositive_unroll(merge_unroll):
     """Reject invalid loop steps before generating a merge kernel."""
-    from triton.compiler.errors import CompilationError
+    from triton.compiler.errors import CompilationError, CompileTimeAssertionFailure
 
     from rl_engine.backends.shared.triton.reduction.ordered_reduce import reduce_add
     from tests.helpers.ordered_reduce_kernels import ordered_reduce_merge_probe
@@ -91,7 +91,7 @@ def test_merge_rejects_nonpositive_unroll(merge_unroll):
     partials = torch.ones((1, 1), device="cuda")
     initials = torch.zeros(1, device="cuda")
     actual = torch.empty_like(initials)
-    with pytest.raises(CompilationError, match="merge unroll must be a positive integer"):
+    with pytest.raises(CompilationError) as error_info:
         ordered_reduce_merge_probe[(1,)](
             partials,
             initials,
@@ -101,6 +101,13 @@ def test_merge_rejects_nonpositive_unroll(merge_unroll):
             COMBINE_FN=reduce_add,
             num_warps=4,
         )
+    # Nested JIT calls wrap the assertion with their own source locations.
+    # Require the actual static assertion, not merely any compilation failure.
+    error = error_info.value
+    while error.__cause__ is not None:
+        error = error.__cause__
+    assert isinstance(error, CompileTimeAssertionFailure)
+    assert error.error_message == "merge unroll must be a positive integer"
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="A CUDA or ROCm GPU is required")

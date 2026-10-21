@@ -32,11 +32,7 @@ Independent accuracy and GPU conformance tests remain necessary.
 import triton
 import triton.language as tl
 
-from rl_engine.contracts.operators.ordered_reduction import (
-    MAX_GROUP_SIZE,
-    SECTION_COUNT,
-    TILE_SIZE,
-)
+from rl_engine.contracts.operators.ordered_reduction import MAX_GROUP_SIZE, SECTION_COUNT, TILE_SIZE
 
 
 @triton.jit
@@ -100,7 +96,7 @@ def ordered_tile_reduce(
            Four sections retain combine(combine(s0, s2), combine(s1, s3)).
            A single entry at either stage passes through without a combine.
 
-    Every tl.reduce operates on exactly two entries along its reduction axis.
+    Every tree step calls COMBINE_FN directly on explicit left/right operands.
     No seed, dtype conversion or merge across separate tiles is added here.
     The same BLOCK_SIZE, MAX_GROUP_SIZE and SECTION_COUNT determine the same
     operand tree. Bitwise conformance also requires identical inputs, combiner,
@@ -138,17 +134,20 @@ def ordered_tile_reduce(
         subtotal = COMBINE_FN(subtotal, tl.gather(values, groups + offset, axis=0))
     N_SECTIONS: tl.constexpr = min(N_GROUPS, SECTION_COUNT)
     SECTION_SIZE: tl.constexpr = N_GROUPS // N_SECTIONS
-    # Reduce within each section; every reduction axis has exactly two entries.
+    # Split each section into lower/upper halves, then combine matching entries.
+    # split needs the two-entry axis last; permute only rearranges the operands.
+    # Call the JIT combiner directly: tl.reduce does not unwrap a constexpr
+    # function argument in Triton 3.7.1.
     for shift in tl.static_range(SECTION_SIZE.bit_length() - 2, -1, -1):
-        subtotal = tl.reduce(
-            tl.reshape(subtotal, (N_SECTIONS, 2, 1 << shift)),
-            axis=1,
-            combine_fn=COMBINE_FN,
-        )
+        pairs = tl.reshape(subtotal, (N_SECTIONS, 2, 1 << shift))
+        left, right = tl.split(tl.permute(pairs, (0, 2, 1)))
+        subtotal = COMBINE_FN(left, right)
     subtotal = tl.reshape(subtotal, (N_SECTIONS,))
     # Merge section totals by halving distance: four sections pair 0+2, 1+3.
     for shift in tl.static_range(N_SECTIONS.bit_length() - 2, -1, -1):
-        subtotal = tl.reduce(tl.reshape(subtotal, (2, 1 << shift)), axis=0, combine_fn=COMBINE_FN)
+        pairs = tl.reshape(subtotal, (2, 1 << shift))
+        left, right = tl.split(tl.permute(pairs, (1, 0)))
+        subtotal = COMBINE_FN(left, right)
     return tl.reshape(subtotal, ())
 
 
