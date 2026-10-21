@@ -17,7 +17,6 @@ nav:
     - Operators:
       - operators/README.md
       - operators/activation.md
-      - operators/final-logit-softcap.md
       - operators/attention.md
       - operators/fused-logp.md
       - operators/softcapped-selected-logprob.md

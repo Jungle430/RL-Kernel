@@ -177,12 +177,6 @@ class OpBackend(Enum, metaclass=_KernelEnumMeta):
     ASCEND_SILU = "rl_engine.kernels.ops.ascend.activation.silu.SiLUAscendOp"
     TRITON_SILU = "rl_engine.kernels.ops.triton.activation.swiglu.TritonSiLUOp"
     TRITON_SWIGLU = "rl_engine.kernels.ops.triton.activation.swiglu.TritonSwiGLUOp"
-    TRITON_FINAL_LOGIT_SOFTCAP = (
-        "rl_engine.kernels.ops.triton.activation.final_logit_softcap.TritonFinalLogitSoftcapOp"
-    )
-    PYTORCH_NATIVE_FINAL_LOGIT_SOFTCAP = (
-        "rl_engine.kernels.ops.pytorch.activation.final_logit_softcap.NativeFinalLogitSoftcapOp"
-    )
 
     TRITON_SOFTCAPPED_SELECTED_LOGPROB = (
         "rl_engine.backends.shared.triton.logprob.softcapped_selected_logprob."
@@ -618,10 +612,6 @@ class KernelRegistry:
                     OpBackend.TRITON_SWIGLU,
                     OpBackend.PYTORCH_NATIVE_SWIGLU,
                 ],
-                "final_logit_softcap": [
-                    OpBackend.TRITON_FINAL_LOGIT_SOFTCAP,
-                    OpBackend.PYTORCH_NATIVE_FINAL_LOGIT_SOFTCAP,
-                ],
                 "softcapped_selected_logprob": [
                     OpBackend.TRITON_SOFTCAPPED_SELECTED_LOGPROB,
                     OpBackend.PYTORCH_NATIVE_SOFTCAPPED_SELECTED_LOGPROB,
@@ -673,10 +663,6 @@ class KernelRegistry:
                 "embedding": [OpBackend.PYTORCH_NATIVE_EMBEDDING],
                 "silu": [OpBackend.TRITON_SILU, OpBackend.PYTORCH_NATIVE_SILU],
                 "swiglu": [OpBackend.TRITON_SWIGLU, OpBackend.PYTORCH_NATIVE_SWIGLU],
-                "final_logit_softcap": [
-                    OpBackend.TRITON_FINAL_LOGIT_SOFTCAP,
-                    OpBackend.PYTORCH_NATIVE_FINAL_LOGIT_SOFTCAP,
-                ],
                 "softcapped_selected_logprob": [
                     OpBackend.TRITON_SOFTCAPPED_SELECTED_LOGPROB,
                     OpBackend.PYTORCH_NATIVE_SOFTCAPPED_SELECTED_LOGPROB,
@@ -729,7 +715,6 @@ class KernelRegistry:
                 ],
                 "silu": [OpBackend.TRITON_SILU, OpBackend.PYTORCH_NATIVE_SILU],
                 "swiglu": [OpBackend.TRITON_SWIGLU, OpBackend.PYTORCH_NATIVE_SWIGLU],
-                "final_logit_softcap": [OpBackend.PYTORCH_NATIVE_FINAL_LOGIT_SOFTCAP],
                 "softcapped_selected_logprob": [
                     OpBackend.PYTORCH_NATIVE_SOFTCAPPED_SELECTED_LOGPROB
                 ],
@@ -758,7 +743,6 @@ class KernelRegistry:
                 "embedding": [OpBackend.PYTORCH_NATIVE_EMBEDDING],
                 "silu": [OpBackend.PYTORCH_NATIVE_SILU],
                 "swiglu": [OpBackend.PYTORCH_NATIVE_SWIGLU],
-                "final_logit_softcap": [OpBackend.PYTORCH_NATIVE_FINAL_LOGIT_SOFTCAP],
                 "softcapped_selected_logprob": [
                     OpBackend.PYTORCH_NATIVE_SOFTCAPPED_SELECTED_LOGPROB
                 ],
