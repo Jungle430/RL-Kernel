@@ -7,6 +7,8 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -152,8 +154,10 @@ def test_forward_comparison_rotates_providers_and_keeps_round_samples(monkeypatc
 
     monkeypatch.setattr(benchmark, "_make_workload", workload)
     monkeypatch.setattr(benchmark, "_measure", measure)
-    providers = [(name, name) for name in ("native", "triton", "row", "parallel")]
-    result = benchmark._measure_forward_comparison(None, providers, None, None, None, softcap=20.0)
+    providers = [
+        benchmark._Provider(name, name) for name in ("native", "triton", "row", "parallel")
+    ]
+    result = benchmark._measure_strategy_comparison(None, providers, None, None, None, softcap=20.0)
     assert order == [
         "native",
         "triton",
@@ -236,6 +240,9 @@ def test_accuracy_gate_rejects_incorrect_gradient(softcap):
         ["--shapes", "0x10"],
         ["--shapes", "2x3x4"],
         ["--repeat", "0"],
+        ["--rounds", "0"],
+        ["--pipeline-stages", "0"],
+        ["--pipeline-stages", "-1"],
         ["--softcap", "0"],
         ["--softcap", "-1"],
         ["--softcap", "nan"],
@@ -288,12 +295,19 @@ def test_list_cases_needs_no_gpu_or_report_files(monkeypatch, capsys, tmp_path):
     assert plan["modes"] == ["forward"]
     assert plan["compare_forward_strategies"]
     assert plan["forward_timing_rounds"] == 4
+    assert plan["pipeline_stages"] == [1, 2, 3, 4, 5, 6, 8]
+    assert plan["provider_measurement_count"] == 22
     assert not output_dir.exists()
 
 
 @pytest.mark.parametrize("compare_strategies", (False, True))
 def test_report_preserves_incomplete_status_and_slowdowns(tmp_path, compare_strategies):
-    measurement = {"median_ms": 2.0, "std_ms": 0.1, "peak_extra_mib": 1.0}
+    measurement = {
+        "median_ms": 2.0,
+        "std_ms": 0.1,
+        "peak_extra_mib": 1.0,
+        "round_spread_ratio": 1.1,
+    }
     report = {
         "environment": {
             "gpu": "test GPU",
@@ -322,8 +336,8 @@ def test_report_preserves_incomplete_status_and_slowdowns(tmp_path, compare_stra
     }
     if compare_strategies:
         report["results"][0]["strategy_comparison"] = {
-            "row": measurement,
-            "parallel": dict(measurement, median_ms=1.0),
+            "providers": {"row": measurement, "parallel": dict(measurement, median_ms=1.0)},
+            "best_explicit": "parallel",
             "auto_over_best_explicit": 2.0,
         }
     benchmark._write_report(report, tmp_path)
@@ -343,10 +357,10 @@ def test_report_preserves_incomplete_status_and_slowdowns(tmp_path, compare_stra
     assert "creation and transfer are included in forward and forward+backward timing" in markdown
     assert "Backward reuses the divisor saved in the prebuilt graph" in markdown
     if compare_strategies:
-        assert "Forward dispatch check" in markdown
+        assert "Forward schedule tuning" in markdown
         assert "2.000x" in markdown
     else:
-        assert "Forward dispatch check" not in markdown
+        assert "Forward schedule tuning" not in markdown
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="A CUDA or ROCm GPU is required")
@@ -414,14 +428,168 @@ def test_forward_strategy_comparison_gpu_smoke(tmp_path, dtype):
     assert report["complete"] and len(report["results"]) == 3
     for row in report["results"]:
         assert row["triton_strategy"] == "parallel"
-        if row["mode"] != "forward":
+        if row["mode"] == "backward":
             assert "strategy_comparison" not in row
             continue
         comparison = row["strategy_comparison"]
         assert comparison["auto_over_best_explicit"] > 0
-        for name in ("row", "parallel"):
-            assert set(comparison["accuracy"][name]) == {"output", "gradient"}
-            assert len(comparison[name]["rounds"]) == 4
-            assert comparison[name]["std_ms"] is None
+        names = {
+            "row",
+            "parallel",
+            *{f"row_pipelined_s{s}" for s in benchmark.DEFAULT_PIPELINE_STAGES},
+        }
+        assert set(comparison["providers"]) == names
+        assert row["saved_statistics_bitwise"]
+        for name in names:
+            assert len(comparison["providers"][name]["rounds"]) == 4
+            assert comparison["providers"][name]["std_ms"] is None
         assert len(row["triton"]["rounds"]) == len(row["native"]["rounds"]) == 4
     assert json.loads((tmp_path / "results.json").read_text()) == report
+
+
+@pytest.mark.parametrize("fail", (False, True))
+def test_pipeline_override_restores_rules_and_caches_on_exit(fail):
+    """A candidate cannot leak its depth into AUTO or the next timing round."""
+    original_rules = {"measured-range": "original-config"}
+    original_default = object()
+    cache_clear = Mock()
+    core = SimpleNamespace(
+        ROW_PIPELINE_CONFIGS=original_rules,
+        DEFAULT_ROW_PIPELINE_CONFIG=original_default,
+        RowPipelineConfig=lambda **kwargs: SimpleNamespace(**kwargs),
+        select_softcapped_logprob_pipeline_config=SimpleNamespace(cache_clear=cache_clear),
+    )
+    try:
+        with benchmark._pipeline_depth(core, 8):
+            assert core.ROW_PIPELINE_CONFIGS == {}
+            assert core.DEFAULT_ROW_PIPELINE_CONFIG.pipeline_stages == 8
+            assert cache_clear.call_count == 1
+            if fail:
+                raise RuntimeError("compile failed")
+    except RuntimeError:
+        assert fail
+    assert core.ROW_PIPELINE_CONFIGS is original_rules
+    assert core.DEFAULT_ROW_PIPELINE_CONFIG is original_default
+    assert cache_clear.call_count == 2
+    with benchmark._pipeline_depth(core, None):
+        assert core.ROW_PIPELINE_CONFIGS is original_rules
+        assert core.DEFAULT_ROW_PIPELINE_CONFIG is original_default
+    assert cache_clear.call_count == 2
+
+
+def test_tuning_plan_counts_all_depths_and_deduplicates_candidates():
+    args = build_arg_parser().parse_args(
+        [
+            "--softcap",
+            "30",
+            "--compare-strategies",
+            "--pipeline-stages",
+            "1",
+            "3",
+            "3",
+            "8",
+            "--dtypes",
+            "bf16",
+            "--shapes",
+            "2x1025",
+            "--rounds",
+            "7",
+        ]
+    )
+    plan = benchmark._case_plan(args)
+    assert plan["pipeline_stages"] == [1, 3, 8]
+    assert plan["comparison_providers"] == [
+        "native",
+        "triton",
+        "row",
+        "parallel",
+        "row_pipelined_s1",
+        "row_pipelined_s3",
+        "row_pipelined_s8",
+    ]
+    assert plan["measurement_count"] == 3
+    assert plan["provider_measurement_count"] == 7 + 2 + 7
+    assert plan["forward_timing_rounds"] == 7
+
+
+def test_tuning_config_is_active_during_timing_not_inside_workload(monkeypatch):
+    """The timer sees the public callable directly, while its chosen depth is active."""
+    core = SimpleNamespace(
+        ROW_PIPELINE_CONFIGS={},
+        DEFAULT_ROW_PIPELINE_CONFIG=SimpleNamespace(pipeline_stages=3),
+        RowPipelineConfig=lambda **kwargs: SimpleNamespace(**kwargs),
+        select_softcapped_logprob_pipeline_config=SimpleNamespace(cache_clear=Mock()),
+    )
+    native, pipelined = object(), object()
+    observed = []
+
+    def workload(op, *args, mode, softcap):
+        return op
+
+    def measure(profiler, op):
+        observed.append((op, core.DEFAULT_ROW_PIPELINE_CONFIG.pipeline_stages))
+        return {"median_ms": 1.0, "std_ms": 0.0, "peak_extra_mib": 0.0}
+
+    monkeypatch.setattr(
+        benchmark, "_make_workload", lambda op, x, ids, g, mode, **kw: workload(op, mode=mode, **kw)
+    )
+    monkeypatch.setattr(benchmark, "_measure", measure)
+    benchmark._measure_strategy_comparison(
+        None,
+        [benchmark._Provider("native", native), benchmark._Provider("stage8", pipelined, 8)],
+        None,
+        None,
+        None,
+        softcap=30,
+        core=core,
+        mode="forward_backward",
+        rounds=2,
+    )
+    assert observed == [(native, 3), (pipelined, 8), (pipelined, 8), (native, 3)]
+
+
+@pytest.mark.parametrize("statistic_delta", (0.0, 1.0))
+def test_accuracy_gate_checks_saved_statistics_even_when_outputs_and_gradients_match(
+    statistic_delta,
+):
+    """A hidden saved-state mismatch cannot pass just because this gradient ignores it."""
+
+    class SavedStatistics(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, logits, ids, delta):
+            maximum = logits.max(dim=-1).values + delta
+            ctx.save_for_backward(logits, ids, maximum, torch.zeros_like(maximum))
+            return logits[:, 0].clone()
+
+        @staticmethod
+        def backward(ctx, upstream):
+            gradient = torch.zeros_like(ctx.saved_tensors[0])
+            gradient[:, 0] = upstream
+            return gradient, None, None
+
+    def reference(logits, ids, *, softcap):
+        return logits[:, 0]
+
+    def candidate(logits, ids, *, softcap):
+        return SavedStatistics.apply(logits, ids, 0.0)
+
+    def alternative(logits, ids, *, softcap):
+        return SavedStatistics.apply(logits, ids, statistic_delta)
+
+    def check():
+        return _check_accuracy(
+            reference,
+            candidate,
+            torch.tensor([[1.0, 2.0]]),
+            torch.tensor([0]),
+            torch.tensor([0.5]),
+            softcap=30,
+            strategy_candidates=[("alternative", alternative)],
+            check_saved_statistics=True,
+        )
+
+    if statistic_delta:
+        with pytest.raises(AssertionError, match="alternative row_max"):
+            check()
+    else:
+        check()

@@ -319,8 +319,8 @@ defaults; overlapping matches at the same scope are rejected.
 The pipeline table is deliberately empty pending server benchmarks. Unmatched
 inputs, including shapes beyond measured ranges, use `DEFAULT_ROW_PIPELINE_CONFIG`
 with the provisional depth of 3. This is a candidate, not a measured optimum. Compare
-depths through the row launcher's `pipeline_stages` argument, check output/statistic/
-gradient consistency, then record the measured ranges in `ROW_PIPELINE_CONFIGS`.
+depths with the benchmark's `--compare-strategies --pipeline-stages` sweep, check
+output/statistic/gradient consistency, then record measured ranges in `ROW_PIPELINE_CONFIGS`.
 Changes to this table or its fallback require
 `select_softcapped_logprob_pipeline_config.cache_clear()`. The selector caches 1024
 exact `(device, dtype, M, V)` combinations and ignores gradient mode and input values.
@@ -503,24 +503,45 @@ Forward uses `no_grad`; backward reuses a retained graph; forward+backward build
 a fresh graph per call. Extra peak allocation excludes inputs/prebuilt graphs.
 Small cases can be dominated by host dispatch gaps.
 
-`--compare-strategies --modes forward` optionally compares Native, AUTO, ROW and
-PARALLEL across four rounds with rotated timing order. Reports retain each round,
-the median of round medians, and AUTO latency divided by the fastest explicit
-strategy. This checks dispatch choices; it does not rewrite the policy.
-`ROW_PIPELINED` remains covered by the untimed bitwise gate. Each JSON result records
-`row_pipeline_stages`, the depth selected for that case's pipelined check; it does
-not imply that AUTO chose pipelining or that this depth was timed. Candidate-depth
-performance sweeps are separate from this automatic-policy comparison. For range validation:
+`--compare-strategies` times Native, AUTO, ROW, PARALLEL and ROW_PIPELINED at
+`--pipeline-stages 1 2 3 4 5 6 8` by default. These are 11 providers, including
+seven independently named `row_pipelined_sN` candidates. `--rounds` controls the
+rotated timing rounds (default 4); setting it to the provider count places each
+provider in every position once. Forward and forward+backward compare all
+candidates; backward-only compares Native with AUTO because all strategies
+share the same backward kernel. Reports retain each round's timing position,
+standard deviation and memory, the median of round medians, round max/min, and
+AUTO latency divided by the fastest explicit candidate. Near ties and noisy
+rounds require repeated measurements before changing a dispatch range.
+
+The standalone, single-threaded benchmark temporarily replaces the in-memory
+pipeline table/fallback for each candidate, then restores both and clears the
+selector cache, including on failure. This happens **outside timing**. Timed
+calls still use the public Op, its normal selector, allocations and autograd.
+Warmup fills the cache. AUTO always uses the original policy. Production source
+and arithmetic settings are unchanged; no benchmark result edits the Map.
+
+Every candidate must match AUTO's output, saved maximum, saved shifted log-sum,
+and gradient bytes. Training/no_grad/inference_mode outputs are also compared
+for each candidate. AUTO is checked against independent Native FP32/autograd;
+byte equality then transfers those same accuracy bounds to the other candidates.
+No failing candidate is timed. `row_pipeline_stages` records the unmodified
+shape-selected default; each timing candidate's actual override is recorded
+separately. The plan distinguishes input/mode comparisons (`measurement_count`)
+from provider measurements (`provider_measurement_count`); neither counts
+warmups or individual repetitions. For range validation:
 
 ```bash
 python benchmarks/operators/logprob/benchmark_softcapped_selected_logprob.py \
-  --softcap 30 --compare-strategies --modes forward --warmup 50 --repeat 200 \
+  --softcap 30 --compare-strategies --pipeline-stages 1 2 3 4 5 6 8 \
+  --modes forward --rounds 4 --warmup 10 --repeat 50 \
   --shapes 16x31744 16x31745 16x32768 4096x32768 4097x32768 \
     16x65537 1024x202048 4096x202048 4097x202048 16x2097153 \
   --output-dir reports/softcapped-selected-logprob-ranges
 ```
 
-JSON/Markdown reports include environment, cap, chosen strategy, median latency,
+JSON/Markdown reports include environment, source commit/dirty status, arithmetic
+configuration, cap, chosen strategy, median latency,
 standard deviation, speedup, extra allocation and accuracy errors. Reports are
 saved after each completed case and remain `complete: false` on interruption.
 Speedup is Native latency divided by Triton latency. Default reports go to

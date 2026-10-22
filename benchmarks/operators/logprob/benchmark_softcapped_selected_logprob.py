@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 RL-Kernel Contributors
-"""Compare eager PyTorch and the automatic Triton softcapped selected logprob Op."""
+"""Compare public softcapped logprob Ops and optionally tune forward schedules."""
 
 from __future__ import annotations
 
@@ -11,6 +11,9 @@ import platform
 import statistics
 import subprocess
 import sys
+import time
+from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -30,6 +33,52 @@ from rl_engine.reference.logprob.softcapped_selected_logprob import (  # noqa: E
 DTYPES = {"fp16": torch.float16, "bf16": torch.bfloat16, "fp32": torch.float32}
 MODES = ("forward", "backward", "forward_backward")
 DEFAULT_SHAPES = ("1x1025", "1x262144", "16x262144", "128x262144", "1024x262144")
+DEFAULT_PIPELINE_STAGES = (1, 2, 3, 4, 5, 6, 8)
+
+
+@dataclass(frozen=True)
+class _Provider:
+    """One public Op and an optional benchmark-only pipeline depth override."""
+
+    name: str
+    op: object
+    pipeline_stages: int | None = None
+
+
+@contextmanager
+def _pipeline_depth(core, stages):
+    """Temporarily tune the public pipelined Op outside timed calls.
+
+    This standalone benchmark is single-threaded. Save and restore the table
+    and fallback even on failure; clear the selector cache at both boundaries.
+    The normal public validation, selector and autograd path remain in use.
+    No production rule is changed on disk, and AUTO runs with the original table.
+    """
+    if stages is None:
+        yield
+        return
+    original_rules = core.ROW_PIPELINE_CONFIGS
+    original_default = core.DEFAULT_ROW_PIPELINE_CONFIG
+    config = core.RowPipelineConfig(pipeline_stages=stages)
+    try:
+        core.ROW_PIPELINE_CONFIGS = {}
+        core.DEFAULT_ROW_PIPELINE_CONFIG = config
+        core.select_softcapped_logprob_pipeline_config.cache_clear()
+        yield
+    finally:
+        core.ROW_PIPELINE_CONFIGS = original_rules
+        core.DEFAULT_ROW_PIPELINE_CONFIG = original_default
+        core.select_softcapped_logprob_pipeline_config.cache_clear()
+
+
+def _configured_check_op(core, provider):
+    """Apply a provider's temporary config for untimed correctness calls only."""
+
+    def checked(logits, token_ids, *, softcap):
+        with _pipeline_depth(core, provider.pipeline_stages):
+            return provider.op(logits, token_ids, softcap=softcap)
+
+    return checked
 
 
 def _positive_int(value: str) -> int:
@@ -92,6 +141,7 @@ def _check_accuracy(
     *,
     softcap: float,
     strategy_candidates=(),
+    check_saved_statistics=False,
 ):
     """Check against Native FP32, preserving input quantization and reference gradients.
 
@@ -100,23 +150,27 @@ def _check_accuracy(
     Also require identical output/gradient bytes across all supplied strategies.
     """
 
-    def evaluate(op, values):
+    def evaluate(op, values, *, capture_statistics=False):
         leaf = values.detach().requires_grad_(True)
         with torch.autocast(device_type=logits.device.type, enabled=False):
             output = op(leaf, token_ids, softcap=softcap)
+            saved = ()
+            if capture_statistics:
+                _, _, row_max, log_sum_exp_shifted = output.grad_fn.saved_tensors
+                saved = (row_max.detach(), log_sum_exp_shifted.detach())
             gradient = torch.autograd.grad(output, leaf, grad_outputs=upstream.float())[0]
-        return output.detach(), gradient
+        return output.detach(), gradient, saved
 
     expected = evaluate(reference_op, logits.float())
-    actual = evaluate(candidate, logits)
+    actual = evaluate(candidate, logits, capture_statistics=check_saved_statistics)
     errors = {}
     for label, judgment, shape, dtype, reference, result in zip(
         ("output", "gradient"),
         ("forward_accuracy", "gradient_accuracy"),
         (logits.shape[:1], logits.shape),
         (torch.float32, logits.dtype),
-        expected,
-        actual,
+        expected[:2],
+        actual[:2],
         strict=True,
     ):
         assert result.shape == shape and result.dtype == dtype
@@ -136,9 +190,18 @@ def _check_accuracy(
             inferred = candidate(logits, token_ids, softcap=softcap)
         _assert_same_bits(inferred, actual[0], "training/inference output")
     for name, op in strategy_candidates:
-        other = evaluate(op, logits)
-        for label, result, gold in zip(("output", "gradient"), other, actual, strict=True):
+        other = evaluate(op, logits, capture_statistics=check_saved_statistics)
+        for label, result, gold in zip(("output", "gradient"), other[:2], actual[:2], strict=True):
             _assert_same_bits(result, gold, f"{name} {label}")
+        if check_saved_statistics:
+            for label, result, gold in zip(
+                ("row_max", "log_sum_exp_shifted"), other[2], actual[2], strict=True
+            ):
+                _assert_same_bits(result, gold, f"{name} {label}")
+        for context in (torch.no_grad(), torch.inference_mode()):
+            with context:
+                inferred = op(logits, token_ids, softcap=softcap)
+            _assert_same_bits(inferred, other[0], f"{name} training/inference output")
     return errors
 
 
@@ -152,6 +215,15 @@ def _assert_same_bits(actual, expected, label):
 
 
 def _case_plan(args):
+    stages = list(dict.fromkeys(args.pipeline_stages))
+    explicit_names = ["row", "parallel", *[f"row_pipelined_s{stage}" for stage in stages]]
+    providers = (
+        ["native", "triton", *explicit_names] if args.compare_strategies else ["native", "triton"]
+    )
+    per_case = sum(
+        len(providers) if args.compare_strategies and mode != "backward" else 2
+        for mode in args.modes
+    )
     return {
         "softcap": args.softcap,
         "dtypes": args.dtypes,
@@ -160,7 +232,10 @@ def _case_plan(args):
         "case_count": len(args.dtypes) * len(args.shapes),
         "measurement_count": len(args.dtypes) * len(args.shapes) * len(args.modes),
         "compare_forward_strategies": args.compare_strategies,
-        "forward_timing_rounds": 4 if args.compare_strategies else 1,
+        "forward_timing_rounds": args.rounds if args.compare_strategies else 1,
+        "pipeline_stages": stages if args.compare_strategies else [],
+        "comparison_providers": providers,
+        "provider_measurement_count": len(args.dtypes) * len(args.shapes) * per_case,
     }
 
 
@@ -180,25 +255,44 @@ def _measure(profiler, fn):
     return {"median_ms": median_ms, "std_ms": std_ms, "peak_extra_mib": peak / 1024**2}
 
 
-def _measure_forward_comparison(profiler, providers, logits, ids, upstream, *, softcap):
-    """Rotate four public providers over four rounds, including a warm AUTO selector.
+def _measure_strategy_comparison(
+    profiler,
+    providers,
+    logits,
+    ids,
+    upstream,
+    *,
+    softcap,
+    core=None,
+    mode="forward",
+    rounds=4,
+):
+    """Rotate public providers, including AUTO and each explicit pipeline depth.
 
-    Every provider occupies each timing position once. Report the median of
-    round medians and keep individual samples for checking timing variation.
+    Config changes and graph preparation happen outside timing. Warmup fills
+    the selector cache after each override. Offsets span the provider list;
+    each provider occupies every position when rounds equals provider count.
+    Report all round samples and their median; backward-only uses one shared kernel.
     """
-    samples = {name: [] for name, _ in providers}
-    for start in range(len(providers)):
-        for name, op in providers[start:] + providers[:start]:
-            fn = _make_workload(op, logits, ids, upstream, "forward", softcap=softcap)
-            samples[name].append(_measure(profiler, fn))
+    samples = {provider.name: [] for provider in providers}
+    for round_index in range(rounds):
+        start = (round_index * len(providers) // rounds) % len(providers)
+        for position, provider in enumerate(providers[start:] + providers[:start]):
+            with _pipeline_depth(core, provider.pipeline_stages):
+                fn = _make_workload(provider.op, logits, ids, upstream, mode, softcap=softcap)
+                sample = _measure(profiler, fn)
+                del fn
+            samples[provider.name].append(dict(sample, round=round_index, position=position))
     measurements = {}
-    for name, rounds in samples.items():
-        deviations = [sample["std_ms"] for sample in rounds if sample["std_ms"] is not None]
+    for name, round_samples in samples.items():
+        deviations = [sample["std_ms"] for sample in round_samples if sample["std_ms"] is not None]
         measurements[name] = {
-            "median_ms": statistics.median(sample["median_ms"] for sample in rounds),
+            "median_ms": statistics.median(sample["median_ms"] for sample in round_samples),
             "std_ms": max(deviations) if deviations else None,
-            "peak_extra_mib": max(sample["peak_extra_mib"] for sample in rounds),
-            "rounds": rounds,
+            "peak_extra_mib": max(sample["peak_extra_mib"] for sample in round_samples),
+            "round_spread_ratio": max(sample["median_ms"] for sample in round_samples)
+            / min(sample["median_ms"] for sample in round_samples),
+            "rounds": round_samples,
         }
     return measurements
 
@@ -235,7 +329,11 @@ def _environment(device, args, triton_version, block_v, target: GPUTargetInfo):
         "device": str(device),
         "total_memory_gib": props.total_memory / 1024**3,
         "multiprocessors": props.multi_processor_count,
+        "git_commit": _command_output(["git", "rev-parse", "HEAD"]),
+        "git_status": _command_output(["git", "status", "--short"]),
         "block_v": block_v,
+        "reduction_group_size": REDUCTION_CONFIG.group_size,
+        "reduction_section_count": REDUCTION_CONFIG.section_count,
         "warmup": args.warmup,
         "repeat": args.repeat,
         "seed": args.seed,
@@ -311,28 +409,49 @@ def _markdown(report):
         lines.extend(
             [
                 "",
-                "## Forward dispatch check",
+                "## Forward schedule tuning",
                 "",
-                "Four rounds rotate PyTorch, AUTO, explicit ROW and explicit PARALLEL. "
+                "Configured rounds rotate PyTorch, AUTO, ROW, PARALLEL and explicit "
+                "ROW_PIPELINED depths for forward and, when requested, forward+backward. "
                 "Values are medians of round medians; JSON retains every round, its sample "
                 "standard deviation and peak allocation. Aggregate std_ms is the maximum "
                 "within-round deviation, not a confidence interval. All providers pass "
-                "reference output/gradient checks before timing.",
+                "reference output/gradient checks before timing. Saved maximum/log-sum, "
+                "outputs and gradients must match AUTO bitwise at every depth; each "
+                "candidate also passes training/no_grad/inference_mode checks. Pipeline "
+                "overrides and cache resets happen outside timed calls and are restored "
+                "before AUTO. Backward-only timing uses the shared automatic Op.",
                 "AUTO / best explicit compares public-call latency, including AUTO dispatch; "
                 "values above 1 expose overhead or a slower choice. Near ties need repeated "
                 "measurements; this check does not automatically rewrite the policy.",
                 "",
-                "| Input | Shape | AUTO choice | ROW ms | PARALLEL ms | AUTO ms | "
-                "AUTO / best explicit |",
-                "| --- | --- | --- | ---: | ---: | ---: | ---: |",
+                "| Input | Shape | Mode | Provider | ms | PyTorch / provider | Round max/min |",
+                "| --- | --- | --- | --- | ---: | ---: | ---: |",
+            ]
+        )
+        for row in comparisons:
+            comparison = row["strategy_comparison"]
+            for name, measurement in comparison["providers"].items():
+                lines.append(
+                    f"| {row['dtype']} | {'x'.join(map(str, row['shape']))} | {row['mode']} | "
+                    f"{name} | {measurement['median_ms']:.6f} | "
+                    f"{row['native']['median_ms'] / measurement['median_ms']:.2f}x | "
+                    f"{measurement['round_spread_ratio']:.3f}x |"
+                )
+        lines.extend(
+            [
+                "",
+                "Best observed candidates are timing observations, not accepted policy rules.",
+                "",
+                "| Input | Shape | Mode | AUTO choice | Best explicit | AUTO / best explicit |",
+                "| --- | --- | --- | --- | --- | ---: |",
             ]
         )
         for row in comparisons:
             comparison = row["strategy_comparison"]
             lines.append(
-                f"| {row['dtype']} | {'x'.join(map(str, row['shape']))} | "
-                f"{row['triton_strategy']} | {comparison['row']['median_ms']:.6f} | "
-                f"{comparison['parallel']['median_ms']:.6f} | {row['triton']['median_ms']:.6f} | "
+                f"| {row['dtype']} | {'x'.join(map(str, row['shape']))} | {row['mode']} | "
+                f"{row['triton_strategy']} | {comparison['best_explicit']} | "
                 f"{comparison['auto_over_best_explicit']:.3f}x |"
             )
     return "\n".join(lines) + "\n"
@@ -353,8 +472,16 @@ def build_arg_parser():
     parser.add_argument(
         "--compare-strategies",
         action="store_true",
-        help="Add explicit ROW/PARALLEL to forward timing, using four rotated rounds",
+        help="Time ROW, PARALLEL and candidate ROW_PIPELINED depths in forward/forward+backward",
     )
+    parser.add_argument(
+        "--pipeline-stages",
+        nargs="+",
+        type=_positive_int,
+        default=list(DEFAULT_PIPELINE_STAGES),
+        help="Candidate depths for --compare-strategies (default: 1 2 3 4 5 6 8)",
+    )
+    parser.add_argument("--rounds", type=_positive_int, default=4, help="Rotated comparison rounds")
     parser.add_argument(
         "--list-cases", action="store_true", help="Print the plan without a GPU run"
     )
@@ -373,6 +500,7 @@ def run_benchmark(args):
     # Delay GPU imports so --help and --list-cases also work on CPU-only hosts.
     import triton
 
+    from rl_engine.backends.shared.triton.logprob import softcapped_selected_logprob as core
     from rl_engine.backends.shared.triton.logprob.softcapped_selected_logprob import (
         SoftcappedLogprobStrategy,
         TritonSoftcappedSelectedLogprobOp,
@@ -390,11 +518,26 @@ def run_benchmark(args):
             for strategy in SoftcappedLogprobStrategy
         ]
         explicit = []
-        if args.compare_strategies and "forward" in args.modes:
+        if args.compare_strategies and any(mode != "backward" for mode in args.modes):
             explicit = [
-                (strategy.value, TritonSoftcappedSelectedLogprobOp(forward_impl=strategy))
+                _Provider(strategy.value, TritonSoftcappedSelectedLogprobOp(forward_impl=strategy))
                 for strategy in (SoftcappedLogprobStrategy.ROW, SoftcappedLogprobStrategy.PARALLEL)
             ]
+            explicit.extend(
+                _Provider(
+                    name=f"row_pipelined_s{stage}",
+                    op=TritonSoftcappedSelectedLogprobOp(
+                        forward_impl=SoftcappedLogprobStrategy.ROW_PIPELINED
+                    ),
+                    pipeline_stages=stage,
+                )
+                for stage in dict.fromkeys(args.pipeline_stages)
+            )
+            strategy_candidates.extend(
+                (provider.name, _configured_check_op(core, provider))
+                for provider in explicit
+                if provider.pipeline_stages is not None
+            )
         env = _environment(
             device, args, triton.__version__, REDUCTION_CONFIG.tile_size, profiler.gpu_info
         )
@@ -405,9 +548,17 @@ def run_benchmark(args):
             "results": [],
         }
         _write_report(report, args.output_dir)
+        case_number = 0
+        started = time.perf_counter()
         for dtype_name in args.dtypes:
             for shape in args.shapes:
-                print(f"Checking {dtype_name} {shape} before timing...", flush=True)
+                case_started = time.perf_counter()
+                case_number += 1
+                print(
+                    f"Case {case_number}/{report['case_plan']['case_count']}: "
+                    f"checking {dtype_name} {shape}, softcap={args.softcap}...",
+                    flush=True,
+                )
                 generator = torch.Generator(device=device).manual_seed(args.seed)
                 logits = (30.0 * torch.randn(shape, device=device, generator=generator)).to(
                     DTYPES[dtype_name]
@@ -424,11 +575,8 @@ def run_benchmark(args):
                     upstream,
                     softcap=args.softcap,
                     strategy_candidates=strategy_candidates,
+                    check_saved_statistics=True,
                 )
-                explicit_accuracy = {
-                    name: _check_accuracy(native, op, logits, ids, upstream, softcap=args.softcap)
-                    for name, op in explicit
-                }
                 # Descriptive metadata only: the timed Op still selects its strategy itself.
                 strategy = select_softcapped_logprob_strategy(
                     softcapped_logprob_device_key(logits.device), logits.dtype, *shape
@@ -438,14 +586,25 @@ def run_benchmark(args):
                 )
                 for mode in args.modes:
                     measurements = {}
-                    if explicit and mode == "forward":
-                        measurements = _measure_forward_comparison(
+                    if explicit and mode != "backward":
+                        print(
+                            f"  {mode}: {len(explicit) + 2} providers, {args.rounds} rounds",
+                            flush=True,
+                        )
+                        measurements = _measure_strategy_comparison(
                             profiler,
-                            [("native", native), ("triton", candidate), *explicit],
+                            [
+                                _Provider("native", native),
+                                _Provider("triton", candidate),
+                                *explicit,
+                            ],
                             logits,
                             ids,
                             upstream,
                             softcap=args.softcap,
+                            core=core,
+                            mode=mode,
+                            rounds=args.rounds,
                         )
                     else:
                         for name, op in (("native", native), ("triton", candidate)):
@@ -462,22 +621,28 @@ def run_benchmark(args):
                         "accuracy": accuracy,
                         "train_inference_bitwise": True,
                         "strategy_bitwise": [name for name, _ in strategy_candidates],
+                        "saved_statistics_bitwise": True,
                         "row_pipeline_stages": pipeline_config.pipeline_stages,
                         "native": measurements["native"],
                         "triton": measurements["triton"],
                         "speedup": measurements["native"]["median_ms"]
                         / measurements["triton"]["median_ms"],
                     }
-                    if explicit and mode == "forward":
-                        row["strategy_comparison"] = {
-                            name: measurements[name] for name, _ in explicit
-                        }
-                        row["strategy_comparison"]["accuracy"] = explicit_accuracy
-                        row["strategy_comparison"]["auto_over_best_explicit"] = measurements[
-                            "triton"
-                        ]["median_ms"] / min(
-                            measurements[name]["median_ms"] for name, _ in explicit
+                    if explicit and mode != "backward":
+                        best = min(
+                            explicit, key=lambda provider: measurements[provider.name]["median_ms"]
                         )
+                        row["strategy_comparison"] = {
+                            "providers": {
+                                provider.name: measurements[provider.name] for provider in explicit
+                            },
+                            "pipeline_stages": {
+                                provider.name: provider.pipeline_stages for provider in explicit
+                            },
+                            "best_explicit": best.name,
+                            "auto_over_best_explicit": measurements["triton"]["median_ms"]
+                            / measurements[best.name]["median_ms"],
+                        }
                     report["results"].append(row)
                     # Retain completed cases on interruption; disk I/O is outside timing.
                     _write_report(report, args.output_dir)
@@ -485,7 +650,19 @@ def run_benchmark(args):
                         f"{dtype_name} {shape} {mode} ({strategy}): {row['speedup']:.2f}x",
                         flush=True,
                     )
+                    if "strategy_comparison" in row:
+                        comparison = row["strategy_comparison"]
+                        print(
+                            f"  best observed: {comparison['best_explicit']}; "
+                            f"AUTO/best={comparison['auto_over_best_explicit']:.3f}x",
+                            flush=True,
+                        )
                 del logits, ids, upstream
+                print(
+                    f"Case finished in {time.perf_counter() - case_started:.1f}s; "
+                    f"elapsed {(time.perf_counter() - started) / 60:.1f} min",
+                    flush=True,
+                )
         report["complete"] = True
         _write_report(report, args.output_dir)
     return report
