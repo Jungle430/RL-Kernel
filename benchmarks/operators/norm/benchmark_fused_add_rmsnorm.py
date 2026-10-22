@@ -103,7 +103,9 @@ def _make_workload(op, inputs, upstream, mode):
     raise ValueError(f"Unknown mode: {mode}")
 
 
-def _check_accuracy(native, candidate, inputs, upstream):
+def _check_accuracy(native, candidate, inputs, upstream, *, strategy_candidates=()):
+    """Check reference accuracy and every surviving strategy before timing AUTO."""
+
     def evaluate(op):
         leaves = tuple(value.detach().requires_grad_(True) for value in inputs)
         y, updated_residual = op(*leaves)
@@ -151,6 +153,15 @@ def _check_accuracy(native, candidate, inputs, upstream):
             assert training.shape == inferred.shape and training.dtype == inferred.dtype
             if not torch.equal(training.view(torch.uint8), inferred.view(torch.uint8)):
                 raise AssertionError("Training/inference mismatch")
+    for strategy_name, strategy_op in strategy_candidates:
+        other = evaluate(strategy_op)
+        for label, shape, dtype in checks:
+            result = other[label]
+            assert result.shape == shape and result.dtype == dtype
+            if not torch.equal(
+                result.contiguous().view(torch.uint8), actual[label].contiguous().view(torch.uint8)
+            ):
+                raise AssertionError(f"{strategy_name}: cross-strategy mismatch in {label}")
     return errors
 
 
@@ -195,7 +206,8 @@ def _report(payload):
         "Speedup = eager PyTorch / Triton; values below 1 mean Triton was slower.",
         "",
         "Every reported case passed output and random-upstream gradient checks before timing, "
-        "plus byte equality of grad-enabled/no_grad/inference_mode outputs. FP32 weight "
+        "plus byte equality of grad-enabled/no_grad/inference_mode outputs and all five "
+        "results across SEQUENTIAL/TILED. FP32 weight "
         "gradient tolerance is rtol=2e-5, atol=2e-5*sqrt(M). JSON records all error bounds "
         "and measured errors. This is operator validation, not full-model or microbatch parity.",
         "",
@@ -227,9 +239,16 @@ def run_benchmark(args):
         raise RuntimeError("Benchmark requires a CUDA or ROCm GPU")
     import triton
 
-    from rl_engine.backends.shared.triton.norm.fused_add_rmsnorm import TritonFusedAddRMSNormOp
+    from rl_engine.backends.shared.triton.norm.fused_add_rmsnorm import (
+        RMSNormWeightGradStrategy,
+        TritonFusedAddRMSNormOp,
+    )
 
     native, candidate = NativeFusedAddRMSNormOp(), TritonFusedAddRMSNormOp()
+    strategy_candidates = tuple(
+        (strategy.value, TritonFusedAddRMSNormOp(weight_grad_strategy=strategy))
+        for strategy in RMSNormWeightGradStrategy
+    )
     with torch.cuda.device(device):
         device = torch.device("cuda", torch.cuda.current_device())
         profiler = PerformanceProfiler(device=device, warmup=args.warmup, repeat=args.repeat)
@@ -267,7 +286,9 @@ def run_benchmark(args):
                 upstream = tuple(
                     torch.randn(shape, device=device, dtype=torch.float32) for _ in range(2)
                 )
-                errors = _check_accuracy(native, candidate, inputs, upstream)
+                errors = _check_accuracy(
+                    native, candidate, inputs, upstream, strategy_candidates=strategy_candidates
+                )
                 leaves = tuple(value.detach().requires_grad_(True) for value in inputs)
                 y, updated_residual = candidate(*leaves)
                 plan = y.grad_fn.weight_grad_plan
@@ -291,6 +312,7 @@ def run_benchmark(args):
                             "triton_plan": selected,
                             "errors": errors,
                             "train_inference_bitwise": True,
+                            "strategy_bitwise": [name for name, _ in strategy_candidates],
                             "speedup": speedup,
                             **measured,
                         }

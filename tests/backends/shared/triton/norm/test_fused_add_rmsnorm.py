@@ -116,8 +116,6 @@ def _weight_grad_launcher(module, strategy):
             return module._launch_fused_add_rmsnorm_bwd_weight_sequential
         case "tiled":
             return module._launch_fused_add_rmsnorm_bwd_weight_tiled
-        case "parallel":
-            return module._launch_fused_add_rmsnorm_bwd_weight_parallel
         case _:
             raise ValueError(f"No standalone weight reduction for {strategy}")
 
@@ -198,7 +196,7 @@ def test_weight_reduction_matches_ordered_fp32_sum(kernels, n_rows, n_cols):
     assert torch.equal(actual, expected)
 
 
-@pytest.mark.parametrize("strategy", ["sequential", "tiled", "parallel"])
+@pytest.mark.parametrize("strategy", ["sequential", "tiled"])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
 @pytest.mark.parametrize(
     "n_rows,n_cols",
@@ -229,6 +227,10 @@ def test_weight_reduction_accuracy_tails_and_repeatability(
     launch()
     expected = rows.double().sum(dim=0).to(dtype)
     _assert_close(actual, expected)
+    ordered = torch.zeros(n_cols, device=rows.device, dtype=torch.float32)
+    for contribution in rows:
+        ordered = ordered + contribution
+    assert torch.equal(actual.view(torch.uint8), ordered.to(dtype).view(torch.uint8))
     first = actual.clone()
     actual.fill_(float("nan"))
     launch()
@@ -291,9 +293,6 @@ def test_zero_residual_sum_has_finite_gradients(kernels):
         ("sequential", 1, 256, 8),
         ("tiled", 16, 64, 4),
         ("tiled", 64, 128, 8),
-        ("parallel", 64, 64, 4),
-        ("parallel", 256, 128, 8),
-        ("parallel", 512, 128, 4),
     ],
 )
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
@@ -301,7 +300,7 @@ def test_configured_reduction_overwrites_output_and_replays_in_graph(
     kernels, strategy, block_rows, block_cols, num_warps, dtype
 ):
     _, module = kernels
-    # >32 row tiles exercises the parallel merge loop; odd width masks both stages.
+    # Multiple load tiles and an odd width exercise both tails.
     n_rows, n_cols = 33 * block_rows + 1, 129
     rows = _rand((n_rows, n_cols), 170)
     before = rows.clone()
@@ -309,13 +308,9 @@ def test_configured_reduction_overwrites_output_and_replays_in_graph(
     actual = buffer[:n_cols]
     if strategy == "sequential":
         config = module._SequentialConfig(block_cols=block_cols, num_warps=num_warps)
-    elif strategy == "tiled":
+    else:
         config = module._TiledConfig(
             block_rows=block_rows, block_cols=block_cols, num_warps=num_warps
-        )
-    else:
-        config = module._ParallelConfig(
-            rows_per_partial=block_rows, block_cols=block_cols, num_warps=num_warps
         )
     kwargs = dict(
         grad_weight_per_row=rows,
@@ -334,6 +329,10 @@ def test_configured_reduction_overwrites_output_and_replays_in_graph(
         rtol=tolerance,
         atol=max(tolerance, 2e-5 * n_rows**0.5),
     )
+    ordered = torch.zeros(n_cols, device=rows.device, dtype=torch.float32)
+    for contribution in rows:
+        ordered = ordered + contribution
+    assert torch.equal(actual.view(torch.uint8), ordered.to(dtype).view(torch.uint8))
     first = actual.clone()
     actual.fill_(float("nan"))
     launcher(**kwargs)
@@ -349,94 +348,3 @@ def test_configured_reduction_overwrites_output_and_replays_in_graph(
         assert torch.equal(first.view(torch.uint8), actual.view(torch.uint8))
     assert torch.isnan(buffer[n_cols:]).all()
     assert torch.equal(rows, before)
-
-
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
-@pytest.mark.parametrize(
-    "group_rows,n_rows,n_cols",
-    [
-        (16, 1, 1),
-        (16, 15, 129),
-        (16, 16, 129),
-        (16, 17, 2688),
-        (64, 63, 2688),
-        (64, 64, 4096),
-        (64, 65, 8192),
-        (256, 255, 129),
-        (256, 256, 2688),
-        (256, 257, 8193),
-        (64, 33 * 64 + 1, 129),
-    ],
-)
-def test_fused_groups_match_row_kernel_and_overwrite_partials(
-    kernels, dtype, group_rows, n_rows, n_cols
-):
-    triton, module = kernels
-    shape = (n_rows, n_cols)
-    x = _rand(shape, 210, dtype)
-    residual = _rand(shape, 211, dtype)
-    weight = _rand((n_cols,), 212)
-    grad_y, grad_u = _rand(shape, 213), _rand(shape, 214)
-    expected = _run_kernels(kernels, x, residual, weight, grad_y, grad_u)
-    n_groups = triton.cdiv(n_rows, group_rows)
-    # Guard all three output buffers; poison scratch again before each replay.
-    partial_buffer = torch.full((n_groups * n_cols + 8,), float("nan"), device="cuda")
-    partials = partial_buffer[: n_groups * n_cols].view(n_groups, n_cols)
-    dx_buffer = torch.full((x.numel() + 8,), float("nan"), device="cuda", dtype=dtype)
-    dr_buffer = torch.full_like(dx_buffer, float("nan"))
-    dx, dr = dx_buffer[: x.numel()].view(shape), dr_buffer[: x.numel()].view(shape)
-    dw_buffer = torch.full((n_cols + 8,), float("nan"), device="cuda")
-    dw = dw_buffer[:n_cols]
-    saved = (expected.updated_residual, expected.inverse_rms, weight, grad_y, grad_u)
-    before = tuple(t.clone() for t in saved)
-
-    def launch():
-        module._fused_add_rmsnorm_bwd_grouped_kernel[(n_groups,)](
-            *saved,
-            dx,
-            dr,
-            partials,
-            n_rows,
-            n_cols,
-            BLOCK_SIZE=triton.next_power_of_2(n_cols),
-            ROWS_PER_GROUP=group_rows,
-            num_warps=4,
-            enable_fp_fusion=False,
-        )
-        module._fused_add_rmsnorm_bwd_weight_tiled_kernel[(triton.cdiv(n_cols, 64),)](
-            partials,
-            dw,
-            n_groups,
-            n_cols,
-            BLOCK_SIZE=64,
-            BLOCK_ROWS=32,
-            num_warps=4,
-            enable_fp_fusion=False,
-        )
-
-    launch()
-    for actual, reference in ((dx, expected.grad_x), (dr, expected.grad_residual)):
-        assert torch.equal(actual.view(torch.uint8), reference.view(torch.uint8))
-    per_row = expected.grad_weight_per_row
-    expected_partials = torch.stack([chunk.double().sum(0) for chunk in per_row.split(group_rows)])
-    torch.testing.assert_close(
-        partials, expected_partials.float(), rtol=2e-5, atol=2e-5 * group_rows**0.5
-    )
-    torch.testing.assert_close(
-        dw, per_row.double().sum(0).float(), rtol=2e-5, atol=2e-5 * n_rows**0.5
-    )
-    first = tuple(t.clone() for t in (dx, dr, partials, dw))
-    torch.cuda.synchronize()
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        launch()
-    for replay in (launch, graph.replay, graph.replay):
-        for buffer in (dx_buffer, dr_buffer, partial_buffer, dw_buffer):
-            buffer.fill_(float("nan"))
-        replay()
-        for actual, expected in zip((dx, dr, partials, dw), first, strict=True):
-            assert torch.equal(actual.view(torch.uint8), expected.view(torch.uint8))
-        for buffer in (dx_buffer, dr_buffer, partial_buffer, dw_buffer):
-            assert torch.isnan(buffer[-8:]).all()
-    for actual, expected in zip(saved, before, strict=True):
-        assert torch.equal(actual.view(torch.uint8), expected.view(torch.uint8))

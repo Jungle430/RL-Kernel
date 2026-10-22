@@ -75,7 +75,7 @@ y, updated_residual = op(x, residual, weight, eps=1e-5)
 
 | Backend | Implementation | Status |
 | --- | --- | --- |
-| CUDA | `TritonFusedAddRMSNormOp` | preferred; automatic dispatch and operator regression validated on H100 |
+| CUDA | `TritonFusedAddRMSNormOp` | preferred; GPU qualification of the revised ordered reductions pending |
 | ROCm | same Triton implementation via `torch.cuda` | preferred; validation pending |
 | PyTorch | `NativeFusedAddRMSNormOp` | CPU reference and fallback when Triton cannot load |
 
@@ -97,46 +97,53 @@ inverse RMS and reuses the existing FP32 residual output for backward. Both
 forward and per-row backward use `enable_fp_fusion=False` and fixed row
 arithmetic independently of batch size.
 
-The weight gradient sums contributions across rows. Four strategies are available:
+Both feature-axis reductions use the shared embedded Triton `sum_tile` helper:
+forward reduces `updated_residual * updated_residual`, while input backward
+reduces `grad_normalized * normalized`. Each entire padded row is one tile;
+the shared whole-vector default of 1024 does not restrict this tile's width.
+For D=2688, the 4096 lanes form 512 sequential eight-value groups, followed by
+four sections of 128 group totals and the final fixed section tree. Padding
+contributes zero, and both means still divide by the actual D=2688.
+
+Changing M, gradient mode, or the weight-gradient strategy does not change D,
+the padded width, the group size (8), or the section count (4). These determine
+the same feature tree in every path. Changing D or the arithmetic configuration
+can change that tree and requires numerical requalification. Fixed order alone
+does not promise exact real arithmetic or cross-device/compiler bitwise equality.
+The old `tl.sum` tree may have rounded differently, so old output bits and
+performance figures are not evidence for this revision. `tl.rsqrt` is unchanged;
+its accuracy is checked separately from reduction conformance.
+
+The weight gradient uses a single declared FP32 row fold, starting from positive
+zero: `acc = ((0 + contribution[0]) + contribution[1]) + ...`. Only the completed
+sum is converted to the weight dtype. The two surviving strategies implement
+this exact order, including the same rounding after every addition:
 
 | Strategy | Backward organization |
 | --- | --- |
-| SEQUENTIAL | Compute all per-row contributions, then fold rows in ascending order per feature tile. |
-| TILED | Compute all per-row contributions, accumulate several row lanes per feature tile, then reduce the lanes. |
-| PARALLEL | Compute all per-row contributions, reduce independent row blocks into partials, then merge partials. |
-| FUSED | Compute input gradients while accumulating fixed row-group weight partials, then merge partials. Avoid the full per-row contribution buffer. |
+| SEQUENTIAL | Write FP32 [M, D] contributions; load and add one row at a time per column tile. |
+| TILED | Write the same contributions; load a row tile, gather its rows one at a time, and add them in ascending order. |
 
-FUSED follows the grouped-accumulation idea in
-[Mamba's backward](https://github.com/state-spaces/mamba/blob/main/mamba_ssm/ops/triton/layer_norm.py),
-but uses fixed row counts rather than the GPU's SM count and retains this
-operator's FP32 outputs, saved statistics, and cast points. Its input-gradient
-kernel keeps four warps and the original per-row expressions. Only its merge
-uses the internal `merge_block_cols` and `merge_num_warps`.
+TILED's `block_rows` now controls loads only. It no longer accumulates independent
+row lanes or reduces their partial sums. Neither strategy uses floating-point
+atomics, locks, reassociation, or partial-result downcasts. Both use the same
+per-row backward kernel; dependent launches share the input device's stream.
 
-No strategy uses floating-point atomics or locks. Dependent kernels launch on
-the same stream without an added host synchronization. Fixed grouping makes
-reduction order independent of runtime scheduling.
+The previous PARALLEL and FUSED strategies were removed because their partial
+sums change addition grouping. A fixed group size makes repeated calls
+reproducible, but does not make gradients equal to another reduction strategy.
+The former TILED lane accumulator and its tuning results are also superseded.
 
-The default policy is based on H100 80 GB measurements:
+AUTO conservatively selects SEQUENTIAL (128 columns, four warps) at every shape
+and dtype. The new TILED implementation remains explicit until GPU correctness
+and fresh performance measurements justify automatic rules. There is no
+model-width-specific or large-row fallback to a grouped reduction. Both paths
+currently allocate `4 * M * D` bytes for weight contributions: at `[65536, 2688]`
+this is 672 MiB. The previous 10.5 MiB FUSED scratch claim no longer applies.
 
-| Width D | Flattened rows M | Strategy | Rows / columns / warps |
-| --- | --- | --- | --- |
-| Any | 0–8 | SEQUENTIAL | 1 / 128 / 4 |
-| Any | 9–32 | TILED | 32 / 64 / 4 |
-| 2688 | 33–16383 | TILED | 64 / 64 / 8 |
-| 2688 | >=16384 | FUSED | 64 / 64 / 4 |
-| Other widths | >=33 | TILED | 64 / 64 / 8 |
-
-These rules are shared defaults for devices without their own entries, not
-proven optima for every GPU. D is matched exactly; other widths do not inherit
-the model's FUSED cutoff. Rows above 65536 explicitly extrapolate the large-row
-rule. Dtypes currently share configurations, and eager/Graph execution uses the
-same policy. The metadata lookup has a bounded 1024-entry cache.
-
-The resolved plan is saved in each autograd context. Changing the Op's settings
-after forward cannot change that call's backward. The public Op accepts only
-an optional strategy: `None` uses automatic selection; an explicit strategy uses
-its internal default settings. Tile sizes and warp counts are not public arguments:
+The resolved plan is saved in each autograd context. Changing the reusable Op
+cannot change an existing graph. The public constructor accepts only a strategy;
+its configurations remain internal:
 
 ```python
 from rl_engine.backends.shared.triton.norm.fused_add_rmsnorm import (
@@ -144,67 +151,97 @@ from rl_engine.backends.shared.triton.norm.fused_add_rmsnorm import (
     TritonFusedAddRMSNormOp,
 )
 
-op = TritonFusedAddRMSNormOp(
-    weight_grad_strategy=RMSNormWeightGradStrategy.FUSED,
-)
+op = TritonFusedAddRMSNormOp(weight_grad_strategy=RMSNormWeightGradStrategy.TILED)
 ```
 
-Internally, one registry groups complete static plans by strategy. Every plan
-contains its matching conditions, strategy, immutable config, and backward
-launcher. Each strategy has one `key=None` entry for explicit selection; the
-other entries define automatic device/dtype/shape ranges.
-SEQUENTIAL has no row-tile field; TILED uses `block_rows`; PARALLEL uses
-`rows_per_partial`; FUSED uses `rows_per_group` plus merge-only settings.
-Device matching uses the `RMSNormDeviceKey` sum type: `RMSNormDefaultDevice()`
-has no device attributes and matches all devices; `RMSNormDevice(backend,
-gpu_name)` carries the metadata required to match a real device. The immutable
-variant objects are used directly in rule keys and the selection cache.
-Selection compares matching plans through `get_priority()`, which computes
-device/dtype/width specificity from their static conditions. It returns the
-winning registry entry directly, without constructing or modifying a plan.
-The backward wrapper requires this selected plan; it only prepares buffers
-and calls the launcher. Direct internal callers must also supply a plan.
-There is no second strategy-dispatch table inside the launcher.
+One `_WEIGHT_GRAD_PLANS` registry groups immutable plans by strategy. Each plan
+contains matching conditions, its strategy-specific config and its launcher.
+A `key=None` entry is the explicit default. Other entries are automatic rules,
+ordered by device, dtype, then width specificity. Device identity uses
+`RMSNormDefaultDevice()` or `RMSNormDevice(backend, gpu_name)`, and lookups are
+cached by exact metadata. Future tuning may change load tile sizes or warp
+counts only when all outputs and gradients remain bitwise identical. The
+previous H100 policy and benchmark numbers do not qualify this implementation.
 
-### Policy rationale
+### Logical-token aggregation across microbatches
 
-H100 boundary and confirmation runs support FUSED 64 for large model-width
-inputs. Larger groups offered only marginal additional gains, while smaller-row
-and other-width results did not justify broader rules. Future hardware tuning
-belongs in the internal strategy registry; detailed strategy comparisons belong
-in PR attachments rather than the routine benchmark.
+Changing a single call's strategy preserves all three gradients. Splitting a
+logical batch across calls is a separate concern: adding already-reduced
+microbatch `weight.grad` values introduces new rounding points, even if every
+call uses SEQUENTIAL. Permuting rows also changes a plain floating-point fold.
 
-At `[65536, 2688]`, FUSED 64 replaces the 672 MiB FP32 per-row contribution buffer
-with 10.5 MiB of grouped partials. These are calculated scratch sizes, not total
-peak allocation.
+`TritonFusedAddRMSNormOp.parameter_vjp_contributions_fp32` exposes the existing
+project's parameter-contribution protocol for integration. It returns a
+`{"weight": rows}` mapping with unreduced FP32 `[M, D]` contributions. It
+recomputes statistics with this operator's production forward kernel and uses
+the exact contribution expression from its backward. `grad_output` is the
+upstream of `y`; the residual output has no weight dependency, and an unused
+`y` can be represented by `grad_output=None`.
+
+The caller must retain each row's logical token identity, collect all chunks,
+restore their common logical order, and call the project's `reduce_rows_fp32`
+with FP32 rows. Convert to `weight.dtype` only after the entire logical batch.
+The upstreams and loss-normalization denominator must be identical across
+layouts. This route is tested against the actual whole-batch `grad_weight`,
+not merely against another recomputed reference. The default PyTorch gradient
+accumulation loop does not automatically use this protocol; model integration
+must explicitly consume these contributions. This PR does not claim ordinary
+microbatch `.backward()` followed by summing `.grad` is bitwise invariant.
 
 ## Correctness and training/inference consistency
 
-Tests retain all four strategies and automatic selection. Coverage includes:
+Tests cover both retained strategies and automatic selection. Coverage includes:
 
 - Independent FP64 output/gradient references; random upstream gradients for
   both outputs; unused output branches; mixed input dtypes and partial gradient
   requirements; noncontiguous tensors and empty rows.
 - Byte equality of grad-enabled, `no_grad` and `inference_mode` outputs. Row
   permutation/subset tests compare corresponding outputs and input gradients;
-  automatic-policy boundary tests also cross grouping strategies.
+  all three gradients, including grad_weight, are compared across strategies.
 - Repeated backward, saved-state integrity, per-call plan retention, overwritten
-  scratch buffers, group tails, and CUDA Graph replay. Public autograd captures
+  scratch buffers, load-tile tails, and CUDA Graph replay. Public autograd captures
   use fresh leaves to isolate stream metadata from existing eager graphs.
 - Device restoration and noncurrent-GPU launches when two GPUs are available.
   CPU tests verify policy precedence, dtype/device keys, cache behavior, width
   fallbacks and extrapolation beyond measured rows.
 
-Repeated calls with an identical configuration must reproduce gradients bitwise.
-Different weight-reduction groupings, or separately reduced microbatches, can
-change FP32 addition order and are checked numerically rather than promised to
-have identical weight-gradient bytes. FP32 compute alone does not guarantee
-full-model training/inference parity.
+Same-input cross-strategy comparisons include every output and gradient, with
+no tolerance. Direct reduction tests also compare different load-tile/warp
+configurations to an independent ordered FP32 fold. Cancellation inputs that
+failed the old row-lane summation are retained. Chunk/permutation tests preserve
+the same logical row set and upstreams, export FP32 contributions, and compare
+the canonical aggregate bitwise to whole-batch backward. Independent FP64 and
+native PyTorch accuracy tests remain separate and keep their existing limits.
+GPU execution of the revised feature trees, TILED kernel, and new tests remains pending.
+
+The reference module also provides `ordered_forward`, `ordered_backward`, and
+named intermediate results for fixed-path diagnostics. `ordered_row_sum` pads
+to the same power of two and calls the PyTorch translation of `sum_tile`.
+Backward is hand-written: it uses the feature tree and a physical-row FP32
+left fold for weight gradients, without delegating reductions to autograd.
+Tensor division by a device FP32 scalar mirrors `tl.div_rn`; `torch.rsqrt`
+remains a separate elementary-math implementation.
+
+Tests separate the two purposes:
+
+- Conformance: expose the production row helpers, compare square/dot sum bits
+  with the ordered reference, check launch layouts, and compare all backward
+  outputs with the explicit VJP using the *same saved statistics*. Cross-strategy,
+  repeated-call, and training/inference tests use exact byte comparisons.
+- Accuracy: retain `NativeFusedAddRMSNormOp` with ordinary PyTorch reductions
+  and autograd, plus independent FP64 equations/autograd. Neither oracle calls
+  the ordered helpers. The ordered reference is not the benchmark baseline.
+
+The shared reduction package and its tests are reused unchanged from the
+softcapped-logprob work; this branch carries them as a shared dependency rather
+than an RMSNorm-specific copy of the algorithm.
 
 ```bash
 uv run --no-sync python -m pytest \
-  tests/ops/norm/test_fused_add_rmsnorm_interface.py \
+  tests/ops/norm/test_fused_add_rmsnorm*.py \
   tests/backends/shared/triton/norm/test_fused_add_rmsnorm*.py \
+  tests/reference/norm/test_fused_add_rmsnorm_ordered_reference.py \
+  tests/reference/reduction tests/backends/shared/triton/reduction \
   tests/runtime/test_fused_add_rmsnorm_registry.py \
   tests/validation/operators/test_fused_add_rmsnorm.py \
   tests/benchmarks/test_fused_add_rmsnorm_benchmark.py -q -rs -x
@@ -247,7 +284,8 @@ There is no `torch.compile` or CUDA Graph timing.
 Forward uses `no_grad`; backward reuses a prebuilt graph; combined calls build a
 fresh graph each time. Extra peak allocation excludes inputs and prebuilt graphs.
 Speedup is PyTorch latency divided by Triton latency. Every case must pass output
-and gradient accuracy plus forward byte-equality checks before timing. Weight
+and gradient accuracy, forward byte equality, and cross-strategy byte equality
+of all five results before timing. Weight
 gradient tolerance is `rtol=2e-5, atol=2e-5*sqrt(M)` for FP32 weights; JSON records
 actual errors and tolerances for all five values.
 
@@ -255,9 +293,9 @@ Reports default to `artifacts/benchmarks/fused-add-rmsnorm/{report.md,results.js
 checkpointed after each comparison. `complete` becomes true only after the
 entire plan finishes. Attach results to the PR instead of committing them.
 
-The H100 regression passed forward/backward accuracy, training/inference byte
-equality, automatic-selection boundaries, and Graph replay. The final public
-benchmark completed the default 15 input cases / 45 comparisons, including the
-FUSED cutoff. Single-GPU runs skip the noncurrent-device tests.
-Performance reports retain timing variation alongside medians; small advantages
-should not be treated as stable wins. ROCm validation remains pending.
+Prior H100 reports describe the superseded grouped reductions and cannot be
+used as performance evidence for this ordered implementation. Rerun GPU
+correctness first, then the public benchmark. Its JSON records the validated
+strategy names in `strategy_bitwise`; timings still compare only public AUTO
+against eager PyTorch. Single-GPU runs skip the noncurrent-device tests. ROCm
+validation remains pending.

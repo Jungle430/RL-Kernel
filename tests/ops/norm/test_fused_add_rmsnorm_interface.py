@@ -28,7 +28,7 @@ def triton_module():
     return importlib.import_module("rl_engine.backends.shared.triton.norm.fused_add_rmsnorm")
 
 
-@pytest.fixture(params=["native", "auto", "sequential", "tiled", "parallel", "fused"])
+@pytest.fixture(params=["native", "auto", "sequential", "tiled"])
 def implementation(request):
     if request.param == "native":
         return NativeFusedAddRMSNormOp(), "cpu"
@@ -254,7 +254,7 @@ def test_modifying_saved_residual_output_is_detected(triton_module):
 
 
 @pytest.mark.parametrize("eps", [1e-5, 1e-3])
-@pytest.mark.parametrize("strategy", ["sequential", "tiled", "parallel", "fused"])
+@pytest.mark.parametrize("strategy", ["sequential", "tiled"])
 def test_repeated_backward_preserves_saved_tensors(triton_module, eps, strategy):
     inputs = _inputs((65, 129), _DTYPES[0], "cuda", noncontiguous=True)
     op = triton_module.TritonFusedAddRMSNormOp(
@@ -273,7 +273,7 @@ def test_repeated_backward_preserves_saved_tensors(triton_module, eps, strategy)
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
-@pytest.mark.parametrize("strategy", ["sequential", "tiled", "parallel", "fused"])
+@pytest.mark.parametrize("strategy", ["sequential", "tiled"])
 def test_train_inference_and_row_invariance(triton_module, dtype, strategy):
     op = triton_module.TritonFusedAddRMSNormOp(
         weight_grad_strategy=triton_module.RMSNormWeightGradStrategy(strategy)
@@ -306,7 +306,7 @@ def test_train_inference_and_row_invariance(triton_module, dtype, strategy):
         assert torch.equal(full[order].view(torch.uint8), subset.view(torch.uint8))
 
 
-@pytest.mark.parametrize("strategy", [None, "sequential", "tiled", "parallel", "fused"])
+@pytest.mark.parametrize("strategy", [None, "sequential", "tiled"])
 def test_launches_use_input_device_and_restore_current_device(triton_module, strategy):
     if torch.cuda.device_count() < 2:
         pytest.skip("Two GPUs are required to check a noncurrent input device")
@@ -349,22 +349,8 @@ def test_auto_boundaries_match_explicit_plan_and_preserve_consistency(
     shape = (1, rows, 2688)  # Leading dimensions are flattened for dispatch.
     inputs = _inputs(shape, (dtype, dtype, torch.float32), "cuda")
     upstream = tuple(_rand(shape, seed, device="cuda") for seed in (190, 191))
-    if rows <= 8:
-        selected_strategy = module.RMSNormWeightGradStrategy.SEQUENTIAL
-        config = module._SequentialConfig(block_cols=128, num_warps=4)
-    elif rows <= 32:
-        selected_strategy = module.RMSNormWeightGradStrategy.TILED
-        config = module._TiledConfig(block_rows=32, block_cols=64, num_warps=4)
-    elif rows < 16384:
-        selected_strategy = module.RMSNormWeightGradStrategy.TILED
-        config = module._TiledConfig(block_rows=64, block_cols=64, num_warps=8)
-    else:
-        selected_strategy = module.RMSNormWeightGradStrategy.FUSED
-        config = module._FusedConfig(
-            rows_per_group=64,
-            merge_block_cols=64,
-            merge_num_warps=4,
-        )
+    selected_strategy = module.RMSNormWeightGradStrategy.SEQUENTIAL
+    config = module._SequentialConfig(block_cols=128, num_warps=4)
     op = module.TritonFusedAddRMSNormOp()
     actual = op(*inputs)
     assert actual[0].grad_fn.weight_grad_plan.strategy == selected_strategy
@@ -412,7 +398,7 @@ def test_auto_boundaries_match_explicit_plan_and_preserve_consistency(
         for lhs, rhs in zip(actual, inferred, strict=True):
             assert torch.equal(lhs.view(torch.uint8), rhs.view(torch.uint8))
 
-    # A smaller microbatch selects another reduction but preserves per-row arithmetic.
+    # A smaller microbatch preserves per-row arithmetic; its weight sum covers fewer rows.
     subset_inputs = tuple(t[:, :3].detach().requires_grad_(True) for t in inputs[:2]) + (inputs[2],)
     subset = op(*subset_inputs)
     subset_gradients = _backward(subset, subset_inputs, tuple(g[:, :3] for g in upstream), "both")
@@ -420,7 +406,7 @@ def test_auto_boundaries_match_explicit_plan_and_preserve_consistency(
         assert torch.equal(full[:, :3].contiguous().view(torch.uint8), part.view(torch.uint8))
 
     # Reusing/mutating the Op or clearing policy caches cannot change a saved graph's plan.
-    op.weight_grad_strategy = module.RMSNormWeightGradStrategy.SEQUENTIAL
+    op.weight_grad_strategy = module.RMSNormWeightGradStrategy.TILED
     module.select_rmsnorm_weight_grad_plan.cache_clear()
     repeated = _backward(actual, inputs, upstream, "both")
     for lhs, rhs in zip(gradients, repeated, strict=True):
@@ -428,7 +414,7 @@ def test_auto_boundaries_match_explicit_plan_and_preserve_consistency(
 
 
 @pytest.mark.parametrize("dtypes", _DTYPES)
-def test_weight_strategy_does_not_change_outputs_or_input_gradients(triton_module, dtypes):
+def test_weight_strategy_does_not_change_outputs_or_any_gradients(triton_module, dtypes):
     inputs = _inputs((65, 129), dtypes, "cuda")
     upstream = tuple(_rand((65, 129), seed, device="cuda") for seed in (160, 161))
     results = []
@@ -436,14 +422,14 @@ def test_weight_strategy_does_not_change_outputs_or_input_gradients(triton_modul
         op = triton_module.TritonFusedAddRMSNormOp(weight_grad_strategy=strategy)
         outputs = op(*inputs)
         gradients = _backward(outputs, inputs, upstream, "both")
-        results.append(outputs + gradients[:2])
+        results.append(outputs + gradients)
     for candidate in results[1:]:
         for sequential, actual in zip(results[0], candidate, strict=True):
             assert torch.equal(sequential.view(torch.uint8), actual.view(torch.uint8))
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
-@pytest.mark.parametrize("strategy", ["sequential", "tiled", "parallel", "fused"])
+@pytest.mark.parametrize("strategy", ["sequential", "tiled"])
 def test_plan_is_saved_per_forward_and_preserves_row_results(triton_module, dtype, strategy):
     inputs = _inputs((257, 129), (dtype, dtype, torch.float32), "cuda")
     upstream = tuple(_rand((257, 129), seed, device="cuda") for seed in (180, 181))
@@ -485,12 +471,12 @@ def test_plan_is_saved_per_forward_and_preserves_row_results(triton_module, dtyp
 
 @pytest.mark.filterwarnings("error:.*AccumulateGrad.*:UserWarning")
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
-@pytest.mark.parametrize("strategy", ["auto", "sequential", "tiled", "parallel", "fused"])
+@pytest.mark.parametrize("strategy", ["auto", "sequential", "tiled"])
 @pytest.mark.parametrize("mode", ["backward", "forward_backward"])
 def test_public_graph_replay_matches_eager_without_mutating_live_graph(
     triton_module, dtype, strategy, mode
 ):
-    # Exercise automatic FUSED at its boundary and every explicit strategy at a tail.
+    # Large automatic input and explicit load-tile tails use the same ordered fold.
     shape = (16384, 2688) if strategy == "auto" else (65, 129)
     selected = None if strategy == "auto" else triton_module.RMSNormWeightGradStrategy(strategy)
     op = triton_module.TritonFusedAddRMSNormOp(weight_grad_strategy=selected)
@@ -501,7 +487,7 @@ def test_public_graph_replay_matches_eager_without_mutating_live_graph(
     expected = eager_grads if mode == "backward" else eager_outputs + eager_grads
     if strategy == "auto":
         assert eager_outputs[0].grad_fn.weight_grad_plan.strategy == (
-            triton_module.RMSNormWeightGradStrategy.FUSED
+            triton_module.RMSNormWeightGradStrategy.SEQUENTIAL
         )
 
     stream = torch.cuda.Stream()

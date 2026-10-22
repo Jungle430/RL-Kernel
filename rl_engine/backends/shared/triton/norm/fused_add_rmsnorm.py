@@ -7,16 +7,15 @@ a contiguous weight vector [n_cols], and FP32 y/updated_residual output buffers.
 Forward also saves one FP32 inverse_rms per row for backward.
 Launch one program per row, with a fixed power-of-two BLOCK_SIZE >= n_cols > 0,
 fixed num_warps, and enable_fp_fusion=False.
+Both feature-axis reductions use the shared ordered sum_tile helper. Its
+power-of-two width follows D, never the batch size or weight-gradient strategy.
 
-Backward reuses updated_residual and inverse_rms. The unfused strategies launch
-one program per row and write input gradients plus FP32 weight-gradient
-contributions [rows, n_cols]. A metadata policy chooses the strategy.
-SEQUENTIAL left-folds in row
-order. TILED uses row lanes within each program. PARALLEL partitions rows and merges
-FP32 partials in a second launch. The strategies have different addition orders.
-FUSED instead accumulates weight contributions while computing
-input gradients for a fixed group of rows, then merges [groups, n_cols] partials.
-It never allocates the full [rows, n_cols] contribution matrix.
+Backward reuses updated_residual and inverse_rms. Both strategies launch one
+program per row and write input gradients plus FP32 weight contributions [M, D].
+SEQUENTIAL loads contributions one row at a time. TILED loads multiple rows but
+adds them individually in ascending order. Both start from positive FP32 zero
+and cast only after the complete row fold. Tile sizes change data movement,
+never the addition tree. Grouped PARALLEL/FUSED reductions are not supported.
 Both upstream gradient buffers are required; supply zeros for an unused output branch.
 Gradient output buffers select the final storage dtypes. Use the same stream
 for all backward launches, and disable FP fusion for all kernels.
@@ -38,6 +37,8 @@ import torch
 import triton
 import triton.language as tl
 
+from rl_engine.backends.shared.triton.reduction import sum_tile
+
 _SUPPORTED_DEVICES = ("cuda", "hip", "xpu", "musa")
 """Accepted device types; ROCm PyTorch also uses the CUDA namespace."""
 
@@ -47,9 +48,6 @@ _SUPPORTED_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 _NUM_WARPS = 4
 """Warps per program for forward and per-row input-gradient calculations."""
 
-_WEIGHT_BLOCK_ROWS = 32
-"""Fixed row lanes used when merging PARALLEL or FUSED weight partials."""
-
 
 class RMSNormWeightGradStrategy(Enum):
     """Select how backward computes and combines FP32 weight contributions."""
@@ -58,16 +56,7 @@ class RMSNormWeightGradStrategy(Enum):
     """Write [M, D] contributions; each column block sums rows one at a time."""
 
     TILED = "tiled"
-    """Write [M, D] contributions; accumulate row tiles, then reduce the row lanes."""
-
-    PARALLEL = "parallel"
-    """Write [M, D] contributions; independent row tiles produce partials for a merge."""
-
-    FUSED = "fused"
-    """Compute input gradients and group weight partials together, then merge.
-
-    Avoids writing the full [M, D] contribution matrix.
-    """
+    """Load row tiles; fold their rows in the same FP32 order as SEQUENTIAL."""
 
 
 @dataclass(frozen=True)
@@ -83,44 +72,16 @@ class _SequentialConfig:
 
 @dataclass(frozen=True)
 class _TiledConfig:
-    """Launch settings for accumulating row tiles within each column program."""
+    """Load-tile settings; neither tile size nor warp count changes row order."""
 
     block_rows: int = 32
-    """Independent row lanes accumulated before the final sum."""
+    """Rows loaded together, then added one at a time in ascending order."""
 
     block_cols: int = 128
     """Columns owned by one reduction program."""
 
     num_warps: int = 4
     """Warps for the tiled reduction."""
-
-
-@dataclass(frozen=True)
-class _ParallelConfig:
-    """Launch settings for parallel row partials followed by a separate merge."""
-
-    rows_per_partial: int = 256
-    """Rows reduced by each independent partial program."""
-
-    block_cols: int = 128
-    """Column tile shared by partial and merge kernels."""
-
-    num_warps: int = 4
-    """Warps for both stages; the merge uses fixed 32-row tiles."""
-
-
-@dataclass(frozen=True)
-class _FusedConfig:
-    """Row grouping and merge settings for fused input and weight-gradient work."""
-
-    rows_per_group: int = 64
-    """Rows whose input gradients and weight partial are fused."""
-
-    merge_block_cols: int = 64
-    """Column tile for merging group partials only."""
-
-    merge_num_warps: int = 4
-    """Merge warps; the fused kernel always uses _NUM_WARPS."""
 
 
 @dataclass(frozen=True)
@@ -196,7 +157,7 @@ class _RulePriority:
 
 
 _ConfigT = TypeVar("_ConfigT")
-"""The concrete config type stored by a plan, e.g. _FusedConfig."""
+"""The concrete config type stored by a plan, e.g. _TiledConfig."""
 
 _ConfigT_contra = TypeVar("_ConfigT_contra", contravariant=True)
 """Config type consumed by the launcher protocol.
@@ -389,6 +350,31 @@ def _resolve_weight_grad_plan(
 
 
 @triton.jit
+def _rmsnorm_row_statistics(updated_residual, n_cols: tl.constexpr, EPS: tl.constexpr):
+    """Return the ordered FP32 squared sum and inverse RMS of one padded row.
+
+    Invalid columns must already be zero. sum_tile fixes the addition tree;
+    divide by the real feature width, not the padded vector length. Return the
+    sum as well so conformance tests can distinguish reduction from rsqrt error.
+    """
+    sum_squares = sum_tile(updated_residual * updated_residual)
+    mean_square = tl.div_rn(sum_squares, n_cols)
+    inverse_rms = tl.rsqrt(mean_square + EPS)
+    return sum_squares, inverse_rms
+
+
+@triton.jit
+def _rmsnorm_row_correction(grad_normalized, normalized, n_cols: tl.constexpr):
+    """Return the ordered FP32 dot sum and its mean for input-gradient correction.
+
+    Both vectors have the same padded width as forward. Padding contributes
+    zero, and every weight-gradient strategy uses this identical row expression.
+    """
+    correction_sum = sum_tile(grad_normalized * normalized)
+    return correction_sum, tl.div_rn(correction_sum, n_cols)
+
+
+@triton.jit
 def _fused_add_rmsnorm_fwd_kernel(
     x_ptr,
     residual_ptr,
@@ -414,9 +400,7 @@ def _fused_add_rmsnorm_fwd_kernel(
     updated_residual = x + residual
 
     # 2. Reduce across this row only; masked columns contribute zero.
-    sum_squares = tl.sum(updated_residual * updated_residual, axis=0, keep_dims=True)
-    mean_square = tl.div_rn(sum_squares, n_cols)
-    inverse_rms = tl.rsqrt(mean_square + EPS)
+    _, inverse_rms = _rmsnorm_row_statistics(updated_residual, n_cols, EPS)
 
     # 3. Normalize each element, then apply its feature weight.
     normalized = updated_residual * inverse_rms
@@ -425,6 +409,34 @@ def _fused_add_rmsnorm_fwd_kernel(
     tl.store(y_ptr + offsets, y, mask=mask)
     tl.store(updated_residual_ptr + offsets, updated_residual, mask=mask)
     tl.store(inverse_rms_ptr + row, tl.reshape(inverse_rms, ()))
+
+
+@triton.jit
+def _weight_contribution_fp32(grad_y, updated_residual, inverse_rms):
+    """One row's parameter VJP, shared by backward and logical-row export."""
+    normalized = updated_residual * inverse_rms
+    return grad_y * normalized
+
+
+@triton.jit
+def _fused_add_rmsnorm_weight_contributions_kernel(
+    updated_residual_ptr,
+    inverse_rms_ptr,
+    grad_y_ptr,
+    contributions_ptr,
+    n_cols: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """Export actual FP32 per-row contributions without summing or downcasting."""
+    row = tl.program_id(0).to(tl.int64)
+    cols = tl.arange(0, BLOCK_SIZE)
+    offsets = row * n_cols + cols
+    mask = cols < n_cols
+    updated_residual = tl.load(updated_residual_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
+    inverse_rms = tl.load(inverse_rms_ptr + row)
+    grad_y = tl.load(grad_y_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
+    contributions = _weight_contribution_fp32(grad_y, updated_residual, inverse_rms)
+    tl.store(contributions_ptr + offsets, contributions, mask=mask)
 
 
 @triton.jit
@@ -461,12 +473,11 @@ def _fused_add_rmsnorm_bwd_kernel(
 
     # 2. y = normalized * weight. Save this row's weight-gradient contribution.
     grad_normalized = grad_y * weight
-    grad_weight_per_row = grad_y * normalized
+    grad_weight_per_row = _weight_contribution_fp32(grad_y, updated_residual, inverse_rms)
 
     # 3. RMSNorm backward: rstd * (g - normalized * mean(g * normalized)).
     # One fixed row reduction combines the direct and inverse_rms paths.
-    correction_sum = tl.sum(grad_normalized * normalized, axis=0)
-    correction = tl.div_rn(correction_sum, n_cols)
+    _, correction = _rmsnorm_row_correction(grad_normalized, normalized, n_cols)
     grad_updated_residual_from_y = inverse_rms * (grad_normalized - normalized * correction)
 
     # 4. Add the gradient from the separate residual output.
@@ -483,70 +494,6 @@ def _fused_add_rmsnorm_bwd_kernel(
         mask=mask,
     )
     tl.store(grad_weight_per_row_ptr + offsets, grad_weight_per_row, mask=mask)
-
-
-@triton.jit
-def _fused_add_rmsnorm_bwd_grouped_kernel(
-    updated_residual_ptr,
-    inverse_rms_ptr,
-    weight_ptr,
-    grad_y_ptr,
-    grad_updated_residual_output_ptr,
-    grad_x_ptr,
-    grad_residual_ptr,
-    grad_weight_partials_ptr,
-    n_rows,
-    n_cols: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr,
-    ROWS_PER_GROUP: tl.constexpr,
-):
-    """Compute input gradients and fold weight contributions within a row group.
-
-    Each program retains one FP32 vector of weight partials in registers. Only
-    that vector is written after the loop. Groups are fixed by ROWS_PER_GROUP,
-    independent of SM count, scheduling, or the current batch's number of rows.
-    Keep each row's arithmetic and four-warps layout identical to the row kernel.
-    """
-    group = tl.program_id(0).to(tl.int64)
-    cols = tl.arange(0, BLOCK_SIZE)
-    mask = cols < n_cols
-    weight = tl.load(weight_ptr + cols, mask=mask, other=0.0).to(tl.float32)
-    grad_weight_partial = tl.full((BLOCK_SIZE,), 0.0, tl.float32)
-    row_start = group * ROWS_PER_GROUP
-    row_end = tl.minimum(row_start + ROWS_PER_GROUP, n_rows)
-
-    for row in range(row_start, row_end):
-        offsets = row * n_cols + cols
-        updated_residual = tl.load(updated_residual_ptr + offsets, mask=mask, other=0.0).to(
-            tl.float32
-        )
-        inverse_rms = tl.load(inverse_rms_ptr + row).to(tl.float32)
-        grad_y = tl.load(grad_y_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
-        grad_updated_residual_output = tl.load(
-            grad_updated_residual_output_ptr + offsets, mask=mask, other=0.0
-        ).to(tl.float32)
-
-        # Preserve the original per-row expressions, including FP32 rounding.
-        normalized = updated_residual * inverse_rms
-        grad_normalized = grad_y * weight
-        grad_weight_per_row = grad_y * normalized
-        correction_sum = tl.sum(grad_normalized * normalized, axis=0)
-        correction = tl.div_rn(correction_sum, n_cols)
-        grad_updated_residual_from_y = inverse_rms * (grad_normalized - normalized * correction)
-        grad_updated_residual_total = grad_updated_residual_from_y + grad_updated_residual_output
-        tl.store(
-            grad_x_ptr + offsets,
-            grad_updated_residual_total.to(grad_x_ptr.dtype.element_ty),
-            mask=mask,
-        )
-        tl.store(
-            grad_residual_ptr + offsets,
-            grad_updated_residual_total.to(grad_residual_ptr.dtype.element_ty),
-            mask=mask,
-        )
-        grad_weight_partial = grad_weight_partial + grad_weight_per_row
-
-    tl.store(grad_weight_partials_ptr + group * n_cols + cols, grad_weight_partial, mask=mask)
 
 
 @triton.jit
@@ -586,54 +533,31 @@ def _fused_add_rmsnorm_bwd_weight_tiled_kernel(
     BLOCK_SIZE: tl.constexpr,
     BLOCK_ROWS: tl.constexpr,
 ):
-    """Accumulate row tiles, then reduce the row lanes once.
+    """Batch loads while preserving the exact sequential FP32 row fold.
 
-    Each program still owns distinct output columns; no atomics are used.
-    Row lane k accumulates rows k, k + BLOCK_ROWS, ... in FP32. Reducing those
-    lanes changes rounding relative to the sequential kernel, even with FP
-    fusion disabled. Zero rows yield zero; both row and column tails are masked.
+    A tile is a load buffer, not a set of partial sums. Gather one row from it
+    at a time and add to the single accumulator. The tail loop visits only real
+    rows, so padding cannot introduce additional additions or signed-zero changes.
     """
     block = tl.program_id(0).to(tl.int64)
     cols = block * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     rows = tl.arange(0, BLOCK_ROWS).to(tl.int64)
-
-    grad_weight = tl.full((BLOCK_ROWS, BLOCK_SIZE), 0.0, tl.float32)
+    grad_weight = tl.full((BLOCK_SIZE,), 0.0, tl.float32)
     for start in range(0, n_rows, BLOCK_ROWS):
         current_rows = start + rows
         offsets = current_rows[:, None] * n_cols + cols[None, :]
         mask = (current_rows[:, None] < n_rows) & (cols[None, :] < n_cols)
-        contribution = tl.load(grad_weight_per_row_ptr + offsets, mask=mask, other=0.0).to(
+        contributions = tl.load(grad_weight_per_row_ptr + offsets, mask=mask, other=0.0).to(
             tl.float32
         )
-        grad_weight = grad_weight + contribution
+        for row in range(tl.minimum(BLOCK_ROWS, n_rows - start)):
+            indices = tl.full((1, BLOCK_SIZE), row, tl.int32)
+            contribution = tl.gather(contributions, indices, axis=0).reshape((BLOCK_SIZE,))
+            grad_weight = grad_weight + contribution
 
-    grad_weight_sum = tl.sum(grad_weight, axis=0)
     tl.store(
-        grad_weight_ptr + cols,
-        grad_weight_sum.to(grad_weight_ptr.dtype.element_ty),
-        mask=cols < n_cols,
+        grad_weight_ptr + cols, grad_weight.to(grad_weight_ptr.dtype.element_ty), mask=cols < n_cols
     )
-
-
-@triton.jit
-def _fused_add_rmsnorm_bwd_weight_partial_kernel(
-    contributions_ptr,
-    partials_ptr,
-    n_rows,
-    n_cols: tl.constexpr,
-    BLOCK_ROWS: tl.constexpr,
-    BLOCK_COLS: tl.constexpr,
-):
-    """One independent FP32 sum per fixed row tile and column tile; no atomics."""
-    col_block = tl.program_id(0).to(tl.int64)
-    row_block = tl.program_id(1).to(tl.int64)
-    cols = col_block * BLOCK_COLS + tl.arange(0, BLOCK_COLS)
-    rows = row_block * BLOCK_ROWS + tl.arange(0, BLOCK_ROWS)
-    offsets = rows[:, None] * n_cols + cols[None, :]
-    mask = (rows[:, None] < n_rows) & (cols[None, :] < n_cols)
-    values = tl.load(contributions_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
-    partial = tl.sum(values, axis=0)
-    tl.store(partials_ptr + row_block * n_cols + cols, partial, mask=cols < n_cols)
 
 
 def _launch_fused_add_rmsnorm_bwd_weight_sequential(
@@ -679,48 +603,6 @@ def _launch_fused_add_rmsnorm_bwd_weight_tiled(
     )
 
 
-def _launch_fused_add_rmsnorm_bwd_weight_parallel(
-    *,
-    grad_weight_per_row: torch.Tensor,
-    grad_weight: torch.Tensor,
-    n_rows: int,
-    n_cols: int,
-    config: _ParallelConfig,
-) -> None:
-    """Partition rows, then merge on the same stream using a fixed reduction layout.
-
-    Allocate FP32 [max(1, ceil(rows / rows_per_partial)), n_cols] partials on the input
-    device. Every element is overwritten on every launch, including tails.
-    The split depends on the explicit configuration, never on SM count/occupancy.
-    """
-    n_partials = max(1, triton.cdiv(n_rows, config.rows_per_partial))
-    partials = torch.empty(
-        (n_partials, n_cols), device=grad_weight_per_row.device, dtype=torch.float32
-    )
-    col_blocks = triton.cdiv(n_cols, config.block_cols)
-    _fused_add_rmsnorm_bwd_weight_partial_kernel[(col_blocks, n_partials)](
-        grad_weight_per_row,
-        partials,
-        n_rows,
-        n_cols,
-        BLOCK_ROWS=config.rows_per_partial,
-        BLOCK_COLS=config.block_cols,
-        num_warps=config.num_warps,
-        enable_fp_fusion=False,
-    )
-    # Reuse a fixed 32-lane fold, now over partials rather than all input rows.
-    _fused_add_rmsnorm_bwd_weight_tiled_kernel[(col_blocks,)](
-        partials,
-        grad_weight,
-        n_partials,
-        n_cols,
-        BLOCK_SIZE=config.block_cols,
-        BLOCK_ROWS=_WEIGHT_BLOCK_ROWS,
-        num_warps=config.num_warps,
-        enable_fp_fusion=False,
-    )
-
-
 def _launch_row_backward(inputs: _BackwardInputs) -> torch.Tensor:
     """Write grad_x/grad_residual and return the FP32 [M, D] weight contributions."""
     contributions = torch.empty(
@@ -758,7 +640,7 @@ def _launch_backward_sequential(*, inputs: _BackwardInputs, config: _SequentialC
 
 
 def _launch_backward_tiled(*, inputs: _BackwardInputs, config: _TiledConfig) -> None:
-    """Write input gradients, then accumulate weight contributions with row lanes."""
+    """Write input gradients, then load tiles and fold their rows in ascending order."""
     contributions = _launch_row_backward(inputs)
     _launch_fused_add_rmsnorm_bwd_weight_tiled(
         grad_weight_per_row=contributions,
@@ -766,56 +648,6 @@ def _launch_backward_tiled(*, inputs: _BackwardInputs, config: _TiledConfig) -> 
         n_rows=inputs.n_rows,
         n_cols=inputs.n_cols,
         config=config,
-    )
-
-
-def _launch_backward_parallel(*, inputs: _BackwardInputs, config: _ParallelConfig) -> None:
-    """Write input gradients, reduce independent row tiles, then merge weight partials."""
-    contributions = _launch_row_backward(inputs)
-    _launch_fused_add_rmsnorm_bwd_weight_parallel(
-        grad_weight_per_row=contributions,
-        grad_weight=inputs.grad_weight,
-        n_rows=inputs.n_rows,
-        n_cols=inputs.n_cols,
-        config=config,
-    )
-
-
-def _launch_backward_fused(*, inputs: _BackwardInputs, config: _FusedConfig) -> None:
-    """Fused backward with only [ceil(M / rows_per_group), D] scratch."""
-    n_groups = triton.cdiv(inputs.n_rows, config.rows_per_group)
-    partials = torch.empty(
-        (n_groups, inputs.n_cols),
-        device=inputs.updated_residual.device,
-        dtype=torch.float32,
-    )
-    _fused_add_rmsnorm_bwd_grouped_kernel[(n_groups,)](
-        inputs.updated_residual,
-        inputs.inverse_rms,
-        inputs.weight,
-        inputs.grad_y,
-        inputs.grad_updated_residual_output,
-        inputs.grad_x,
-        inputs.grad_residual,
-        partials,
-        inputs.n_rows,
-        inputs.n_cols,
-        BLOCK_SIZE=triton.next_power_of_2(inputs.n_cols),
-        ROWS_PER_GROUP=config.rows_per_group,
-        num_warps=_NUM_WARPS,
-        enable_fp_fusion=False,
-    )
-    # Same-stream fixed-order merge; no atomic additions or host synchronization.
-    merge_grid = (triton.cdiv(inputs.n_cols, config.merge_block_cols),)
-    _fused_add_rmsnorm_bwd_weight_tiled_kernel[merge_grid](
-        partials,
-        inputs.grad_weight,
-        n_groups,
-        inputs.n_cols,
-        BLOCK_SIZE=config.merge_block_cols,
-        BLOCK_ROWS=_WEIGHT_BLOCK_ROWS,
-        num_warps=config.merge_num_warps,
-        enable_fp_fusion=False,
     )
 
 
@@ -833,7 +665,7 @@ _WEIGHT_GRAD_PLANS: dict[RMSNormWeightGradStrategy, tuple[RMSNormWeightGradPlan,
                 dtype=None,
                 n_cols=None,
                 min_rows=0,
-                max_rows=8,
+                max_rows=None,
             ),
             strategy=RMSNormWeightGradStrategy.SEQUENTIAL,
             config=_SequentialConfig(),
@@ -847,69 +679,14 @@ _WEIGHT_GRAD_PLANS: dict[RMSNormWeightGradStrategy, tuple[RMSNormWeightGradPlan,
             config=_TiledConfig(),
             launch=_launch_backward_tiled,
         ),
-        RMSNormWeightGradPlan(
-            key=RMSNormWeightGradKey(
-                device=_DEFAULT_DEVICE,
-                dtype=None,
-                n_cols=None,
-                min_rows=9,
-                max_rows=32,
-            ),
-            strategy=RMSNormWeightGradStrategy.TILED,
-            config=_TiledConfig(block_rows=32, block_cols=64, num_warps=4),
-            launch=_launch_backward_tiled,
-        ),
-        RMSNormWeightGradPlan(
-            key=RMSNormWeightGradKey(
-                device=_DEFAULT_DEVICE,
-                dtype=None,
-                n_cols=None,
-                min_rows=33,
-                max_rows=None,
-            ),
-            strategy=RMSNormWeightGradStrategy.TILED,
-            config=_TiledConfig(block_rows=64, block_cols=64, num_warps=8),
-            launch=_launch_backward_tiled,
-        ),
-    ),
-    RMSNormWeightGradStrategy.PARALLEL: (
-        RMSNormWeightGradPlan(
-            key=None,
-            strategy=RMSNormWeightGradStrategy.PARALLEL,
-            config=_ParallelConfig(),
-            launch=_launch_backward_parallel,
-        ),
-    ),
-    RMSNormWeightGradStrategy.FUSED: (
-        RMSNormWeightGradPlan(
-            key=None,
-            strategy=RMSNormWeightGradStrategy.FUSED,
-            config=_FusedConfig(),
-            launch=_launch_backward_fused,
-        ),
-        RMSNormWeightGradPlan(
-            key=RMSNormWeightGradKey(
-                device=_DEFAULT_DEVICE,
-                dtype=None,
-                n_cols=2688,
-                min_rows=16384,
-                max_rows=None,
-            ),
-            strategy=RMSNormWeightGradStrategy.FUSED,
-            config=_FusedConfig(),
-            launch=_launch_backward_fused,
-        ),
     ),
 }
-"""Complete static backward plans, grouped by strategy in a single registry.
+"""One registry of immutable plans; both strategies use the same FP32 row order.
 
-Each strategy has one key=None entry for explicit selection. Remaining entries
-pair a fixed matching range with its strategy, config, and launcher. Tuple order
-does not identify defaults; the key=None marker does.
-
-H100 80 GB defaults are shared by other devices until separately tuned.
-Only D=2688 and M>=16384 use FUSED; M>65536 is an explicit extrapolation.
-Dtypes share settings, and graph/eager execution never changes selection.
+AUTO conservatively uses SEQUENTIAL at every shape until the ordered-load TILED
+implementation has new GPU evidence. The former lane/group reduction timings
+cannot select this new algorithm. Device-specific tuning may change loads or
+launch dimensions, but must not introduce row partial sums or earlier casts.
 """
 
 
@@ -1144,8 +921,8 @@ class TritonFusedAddRMSNormOp:
     that input's dtype. Noncontiguous tensors are copied to contiguous buffers.
     Normalization uses the FP32 residual sum without an intermediate downcast.
     weight_grad_strategy selects how backward accumulates weight gradients.
-    FUSED combines row backward and grouped weight accumulation,
-    keeping the row's fixed arithmetic and using a smaller partial workspace.
+    Both strategies implement the same arithmetic order for all gradients.
+    GPU conformance must be qualified on the selected backend/compiler.
     None selects a conservative metadata-based strategy and configuration.
     An explicit strategy uses its internal default configuration. Tile sizes
     and warp counts are internal tuning details, not constructor arguments.
@@ -1201,3 +978,56 @@ class TritonFusedAddRMSNormOp:
         return _FusedAddRMSNormTritonFunction.apply(
             x, residual, weight, eps, self.weight_grad_strategy
         )
+
+    def parameter_vjp_contributions_fp32(
+        self,
+        *,
+        x: torch.Tensor,
+        residual: torch.Tensor,
+        weight: torch.Tensor,
+        grad_output: torch.Tensor | None,
+        eps: float = 1e-5,
+    ) -> dict[str, torch.Tensor]:
+        """Return unreduced weight VJPs for the logical-token aggregation protocol.
+
+        grad_output is the upstream of y. The residual output is independent
+        of weight and contributes nothing here; pass None when only it is used.
+        The returned weight tensor is FP32 [M, D], even for a low-precision
+        weight. This recomputes forward statistics with the production kernel
+        and uses backward's exact contribution expression, not a PyTorch oracle.
+
+        For batch/chunk invariance, callers retain token identities, restore
+        these rows to the common logical order, and left-fold from FP32 zero.
+        Cast to weight.dtype only once after the full logical batch. Adding
+        already-reduced microbatch weight.grad tensors is not this protocol.
+        Both SEQUENTIAL and TILED backward implement this same ordered fold
+        when their input rows are already in logical order.
+        """
+        if grad_output is not None:
+            if grad_output.shape != x.shape or grad_output.device != x.device:
+                raise ValueError("grad_output must have the same shape and device as x.")
+            if grad_output.dtype not in _SUPPORTED_DTYPES:
+                raise TypeError(f"grad_output must have dtype in {_SUPPORTED_DTYPES}.")
+        _, updated_residual, inverse_rms = _launch_fused_add_rmsnorm_fwd(
+            x, residual, weight, eps=eps
+        )
+        n_rows, n_cols = inverse_rms.numel(), x.shape[-1]
+        if grad_output is None:
+            return {"weight": torch.zeros((n_rows, n_cols), device=x.device, dtype=torch.float32)}
+        contributions = torch.empty((n_rows, n_cols), device=x.device, dtype=torch.float32)
+        if n_rows:
+            device_context = (
+                torch.cuda.device(x.device) if x.device.type == "cuda" else nullcontext()
+            )
+            with device_context:
+                _fused_add_rmsnorm_weight_contributions_kernel[(n_rows,)](
+                    updated_residual,
+                    inverse_rms,
+                    grad_output.contiguous(),
+                    contributions,
+                    n_cols,
+                    BLOCK_SIZE=triton.next_power_of_2(n_cols),
+                    num_warps=_NUM_WARPS,
+                    enable_fp_fusion=False,
+                )
+        return {"weight": contributions}

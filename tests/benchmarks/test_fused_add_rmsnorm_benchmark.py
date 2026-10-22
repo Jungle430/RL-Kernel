@@ -151,6 +151,30 @@ def test_accuracy_gate_checks_gradients_of_both_outputs(benchmark, broken_branch
         assert all(entry["max_abs_error"] == 0 for entry in errors.values())
 
 
+@pytest.mark.parametrize("break_weight_gradient", [False, True])
+def test_strategy_gate_includes_weight_gradient(benchmark, break_weight_gradient):
+    """An alternative may have identical outputs/dx/dr but a different dw."""
+    inputs = (torch.ones(3, 7), torch.zeros(3, 7), torch.ones(7))
+    upstream = (torch.ones(3, 7), torch.ones(3, 7))
+    native = NativeFusedAddRMSNormOp()
+
+    def alternative(x, residual, weight):
+        if break_weight_gradient:
+            weight = weight.detach() + 0.5 * (weight - weight.detach())
+        return native(x, residual, weight)
+
+    def check():
+        return benchmark._check_accuracy(
+            native, native, inputs, upstream, strategy_candidates=(("tiled", alternative),)
+        )
+
+    if break_weight_gradient:
+        with pytest.raises(AssertionError, match="cross-strategy mismatch in grad_weight"):
+            check()
+    else:
+        check()
+
+
 @pytest.mark.parametrize("latency", [0.0, -1.0, float("nan"), float("inf")])
 def test_invalid_timer_results_cannot_be_reported(benchmark, latency):
     profiler = SimpleNamespace(_time_kernel=lambda fn: (None, latency, None))
@@ -190,10 +214,9 @@ def test_report_preserves_completion_latency_and_configuration(benchmark, tmp_pa
             "shape": [16384, 2688],
             "mode": "forward_backward",
             "triton_plan": {
-                "strategy": "fused",
-                "rows_per_group": 64,
-                "merge_block_cols": 64,
-                "merge_num_warps": 4,
+                "strategy": "sequential",
+                "block_cols": 128,
+                "num_warps": 4,
             },
             "native": {"median_ms": 4.0, "std_ms": 0.1, "peak_extra_mib": 800.0},
             "triton": {"median_ms": 1.0, "std_ms": 0.02, "peak_extra_mib": 200.0},
@@ -205,7 +228,7 @@ def test_report_preserves_completion_latency_and_configuration(benchmark, tmp_pa
     assert json.loads((tmp_path / "results.json").read_text()) == payload
     report = (tmp_path / "report.md").read_text()
     assert "Status: complete; 1/1 comparisons" in report
-    assert "fused | forward_backward | 4.000000 | 1.000000 | 4.00x" in report
+    assert "sequential | forward_backward | 4.000000 | 1.000000 | 4.00x" in report
     assert "No torch.compile or CUDA Graph timing" in report
     assert "Extra peak allocation excludes inputs and prebuilt graphs" in report
 
@@ -237,11 +260,11 @@ def test_gpu_benchmark_compares_public_ops_and_records_accuracy(benchmark, tmp_p
     }
     for result in payload["results"]:
         assert result["train_inference_bitwise"]
+        assert result["strategy_bitwise"] == ["sequential", "tiled"]
         assert result["triton_plan"] == {
-            "strategy": "tiled",
-            "block_rows": 64,
-            "block_cols": 64,
-            "num_warps": 8,
+            "strategy": "sequential",
+            "block_cols": 128,
+            "num_warps": 4,
         }
         assert set(result["errors"]) == {
             "y",

@@ -8,9 +8,12 @@ dtype. Model integration must preserve these declared cast points.
 """
 
 import math
+from dataclasses import dataclass
 
 import torch
 from torch import nn
+
+from rl_engine.reference.reduction import sum_tile
 
 _SUPPORTED_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 
@@ -79,3 +82,120 @@ class NativeFusedAddRMSNormOp(nn.Module):
         y = normalized * weight_f
 
         return y, updated_residual
+
+
+@dataclass(frozen=True)
+class OrderedForward:
+    """Fixed-path FP32 outputs and row statistics; not an autograd graph.
+
+    y and updated_residual retain the input shape. sum_squares has shape
+    [..., 1], while inverse_rms is flattened to [M] like the production save.
+    """
+
+    y: torch.Tensor
+    updated_residual: torch.Tensor
+    sum_squares: torch.Tensor
+    inverse_rms: torch.Tensor
+
+
+@dataclass(frozen=True)
+class OrderedBackward:
+    """Explicit VJP and intermediate sums for arithmetic-path checks.
+
+    Final gradients use their input dtypes. correction_sum is FP32 [..., 1];
+    grad_weight_per_row is the unrounded FP32 [M, D] matrix before the row fold.
+    """
+
+    grad_x: torch.Tensor
+    grad_residual: torch.Tensor
+    grad_weight: torch.Tensor
+    correction_sum: torch.Tensor
+    grad_weight_per_row: torch.Tensor
+
+
+@torch.no_grad()
+def ordered_row_sum(values: torch.Tensor) -> torch.Tensor:
+    """Pad D to its next power of two and apply the shared FP32 feature tree.
+
+    Leading dimensions are independent rows. The result has shape [..., 1]
+    for broadcasting. This mirrors sum_tile in the Triton row kernels; it
+    deliberately does not use torch.sum or change the tree with batch size.
+    """
+    if values.ndim == 0 or values.shape[-1] == 0:
+        raise ValueError("values must have a nonempty feature dimension")
+    n_cols = values.shape[-1]
+    block_size = 1 << (n_cols - 1).bit_length()
+    padded = torch.nn.functional.pad(values.float(), (0, block_size - n_cols))
+    return sum_tile(padded).unsqueeze(-1)
+
+
+@torch.no_grad()
+def ordered_forward(
+    x: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor, *, eps: float
+) -> OrderedForward:
+    """Mirror the declared forward order, separately from the Native accuracy oracle.
+
+    A device FP32 divisor requests tensor division rather than Python-scalar
+    reciprocal multiplication. rsqrt remains PyTorch's implementation: matching
+    the sum tree alone does not promise bitwise equality of elementary math
+    across implementations. Inspect sum_squares separately from inverse_rms.
+    """
+    _validate_inputs(x, residual, weight, eps)
+    updated_residual = x.float() + residual.float()
+    sum_squares = ordered_row_sum(updated_residual * updated_residual)
+    divisor = torch.tensor(x.shape[-1], device=x.device, dtype=torch.float32)
+    inverse_rms = torch.rsqrt(sum_squares / divisor + eps)
+    normalized = updated_residual * inverse_rms
+    return OrderedForward(
+        y=normalized * weight.float(),
+        updated_residual=updated_residual,
+        sum_squares=sum_squares,
+        inverse_rms=inverse_rms.reshape(-1),
+    )
+
+
+@torch.no_grad()
+def ordered_backward(
+    updated_residual: torch.Tensor,
+    inverse_rms: torch.Tensor,
+    weight: torch.Tensor,
+    grad_y: torch.Tensor | None,
+    grad_updated_residual_output: torch.Tensor | None,
+    *,
+    x_dtype: torch.dtype,
+    residual_dtype: torch.dtype,
+) -> OrderedBackward:
+    """Hand-written FP32 VJP with explicit feature and parameter reduction order.
+
+    Pass either ordered_forward's saved values or the production saved values.
+    The latter isolates backward arithmetic from any forward rsqrt difference.
+    No PyTorch autograd reduction is used. The feature dot product uses the
+    shared tree; weight contributions fold from +0 in ascending physical-row
+    order, casting only the final gradient. Already-reduced microbatch gradients
+    cannot be merged to reproduce this fold in general.
+    """
+    n_cols = updated_residual.shape[-1]
+    inverse = inverse_rms.reshape(*updated_residual.shape[:-1], 1)
+    upstream_y = torch.zeros_like(updated_residual) if grad_y is None else grad_y.float()
+    upstream_residual = (
+        torch.zeros_like(updated_residual)
+        if grad_updated_residual_output is None
+        else grad_updated_residual_output.float()
+    )
+    normalized = updated_residual * inverse
+    grad_normalized = upstream_y * weight.float()
+    contributions = (upstream_y * normalized).reshape(-1, n_cols)
+    correction_sum = ordered_row_sum(grad_normalized * normalized)
+    divisor = torch.tensor(n_cols, device=updated_residual.device, dtype=torch.float32)
+    correction = correction_sum / divisor
+    grad_updated = inverse * (grad_normalized - normalized * correction) + upstream_residual
+    grad_weight = torch.zeros(n_cols, device=weight.device, dtype=torch.float32)
+    for row in contributions:
+        grad_weight = grad_weight + row
+    return OrderedBackward(
+        grad_x=grad_updated.to(x_dtype),
+        grad_residual=grad_updated.to(residual_dtype),
+        grad_weight=grad_weight.to(weight.dtype),
+        correction_sum=correction_sum,
+        grad_weight_per_row=contributions,
+    )
