@@ -300,6 +300,83 @@ then use the partial merge helpers. Serial and parallel paths must keep the
 same tile boundaries, group/section sizes, dtype and outer seed. Convenience and generic
 exports cover loaded values, complete memory vectors and stored partials.
 
+## Performance comparison
+
+The standalone benchmark compares three implementations of a row sum:
+
+| Provider | Implementation | Numerical contract |
+| --- | --- | --- |
+| PyTorch | Eager `torch.sum(..., dtype=torch.float32, out=...)` | PyTorch chooses its reduction tree |
+| Native Triton | Full-row `tl.sum`, or two-stage partial/merge `tl.sum` | Triton chooses each stage's tree |
+| Ordered Triton | Public `sum` and `sum_partials`, with serial, pipelined or parallel producers | All schedules retain one declared tree and partial fold |
+
+All providers read the same input prefix and accumulate/output FP32. Inputs cover
+FP16, BF16 and FP32; optional physical suffixes are filled with NaNs. Before timing,
+every provider is checked against a separate FP64 sum using the shared FP32
+reduction tolerance. Ordered schedules must also match each other bitwise across
+all rows and the fixed-order CPU reference on sampled rows. Graph replay must
+preserve eager output bits. A failed check stops the case; it is not a speedup.
+
+The default uniform `[0, 1)` workload measures throughput without severe
+cancellation. Use `--distribution normal` for signed cancellation stress with
+the same acceptance threshold. This benchmark supplements, rather than replaces,
+the broader independent accuracy and conformance test suites.
+
+Inspect the plan, then run a short GPU smoke check:
+
+```bash
+python -m benchmarks.backends.shared.triton.benchmark_ordered_reduction --dry-run
+python -m benchmarks.backends.shared.triton.benchmark_ordered_reduction \
+  --shapes 3x1025 --dtypes bf16 --padding 17 \
+  --rounds 1 --warmup 2 --repeat 5 --graph-calls 4
+```
+
+Run the default comparison and a separate execution-parameter sweep:
+
+```bash
+python -m benchmarks.backends.shared.triton.benchmark_ordered_reduction
+python -m benchmarks.backends.shared.triton.benchmark_ordered_reduction \
+  --warps 4 8 --pipeline-stages 0 2 3 --merge-unroll 1 3 \
+  --case-timeout 300
+```
+
+Defaults cover 18 dtype/shape cases and 204 provider/timing combinations, from
+`[1, 1024]` to `[1024, 262144]`, including non-power-of-two lengths. Full-row
+`tl.sum` is capped at 32768 elements to bound compilation; the two-stage native
+baseline remains available for wider inputs. The report's best native result
+means the best **measured** configuration, not a claim of exhaustive native tuning.
+
+Outputs and partial workspaces are preallocated for every provider. CUDA events
+measure eager calls and graph replays separately; graph samples batch multiple
+calls and divide by that count. Compilation, accuracy checks and graph capture
+are excluded. Eager measurements can include host dispatch gaps. Reused inputs
+are not explicitly evicted from cache, so small cases can measure cache bandwidth.
+Candidates run in shuffled order over repeated rounds, with raw samples, round
+medians and round spread saved. Effective GB/s counts input plus output bytes;
+scratch allocation and extra peak allocator growth are reported separately.
+
+Each shape/dtype runs in a subprocess with a hard timeout (180 seconds by default),
+including compilation. On timeout, the worker and its compiler subprocesses are
+terminated. Reports and phase logs survive; the default stops after the first
+failure, while `--keep-going` retains failed cases and continues. New timestamped
+directories under `artifacts/benchmarks/` contain `results.json`, `report.md` and
+per-case logs/checkpoints. Explicit existing output directories are rejected.
+JSON records the source revision/hashes, dirty-worktree state, hardware, versions,
+compiler settings, input distribution and complete measurement plan. Record driver,
+clock and power settings alongside the report when comparing separate machines/runs.
+
+`--warps`, `--pipeline-stages` (0 means unhinted) and `--merge-unroll` tune execution
+without intentionally changing arithmetic; bitwise checks enforce that boundary.
+`--block-size`, `--max-group-size` and `--section-count` are **one arithmetic
+configuration per run**. Changing them can change rounding and requires a new
+numerical qualification and coordinated training/inference configuration. They
+must not be switched by shape-dependent autotuning under an unchanged contract.
+
+Performance results on target devices are still pending. PR reports should show
+latency/speedup against both native baselines, scratch usage and timing variation,
+including cases where fixed order costs performance. The same-tree PyTorch
+reference is a conformance oracle and is never used as the performance baseline.
+
 <details markdown="1">
 <summary>Internal stages and conformance checks</summary>
 
@@ -450,7 +527,9 @@ fixed-path checks. Sharing constants must not silently redefine expected results
 GPU tests skip on CPU hosts; a CPU pass does not qualify Triton compilation,
 GPU numerical behavior or performance.
 
-The CPU CI job runs `tests/reference/reduction`. This includes the independent
-accuracy checks as well as fixed-path conformance; neither replaces the other.
+The CPU CI job runs `tests/reference/reduction` and
+`tests/benchmarks/test_ordered_reduction_benchmark.py`. These cover independent
+accuracy, fixed-path conformance, benchmark planning and timeout recovery.
+The benchmark smoke/replay tests require a GPU and skip on CPU hosts.
 
 </details>

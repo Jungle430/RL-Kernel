@@ -10,6 +10,7 @@ Examples, from the repository root:
 python benchmarks/operators/gemm/benchmark_det_gemm.py --help
 python benchmarks/distributed/benchmark_rocm_collectives.py --help
 python benchmarks/e2e/benchmark_stateless_executor.py --help
+python -m benchmarks.backends.shared.triton.benchmark_ordered_reduction --dry-run
 ```
 
 Some benchmark entry points require their target accelerator libraries even for
@@ -23,3 +24,9 @@ clocks, compiler flags, library versions and backend provenance identical for
 before/after comparisons. Report both raw samples and median latency; report
 throughput and peak memory separately. The refactor has no automatic performance
 regression percentage gate.
+
+The [ordered reduction benchmark](../docs/architecture/ordered-reduction.md#performance-comparison)
+compares `torch.sum`, native `tl.sum`, and fixed-order serial/pipelined/parallel
+sum. It supports execution-parameter sweeps, independent accuracy and same-tree
+checks, separate eager/graph timing, and per-case process timeouts. Its CPU-safe
+dry run prints the exact workload before allocating GPU time.
