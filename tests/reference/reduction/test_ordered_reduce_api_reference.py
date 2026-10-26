@@ -288,15 +288,80 @@ def test_boolean_count_explicitly_uses_integer_accumulation():
 
 
 @pytest.mark.parametrize("reduce,native,identity", _OPERATIONS)
-def test_public_reference_preserves_autograd_boundary(reduce, native, identity):
-    values = torch.ones((2, 8), requires_grad=True)
-    with pytest.raises(RuntimeError, match="without autograd"):
-        reduce(values, compute_dtype=torch.float32, from_memory=True)
+@pytest.mark.parametrize("dtype", (torch.float32, torch.float64))
+@pytest.mark.parametrize("compute_dtype", (None, torch.float64))
+@pytest.mark.parametrize("from_memory", (False, True))
+def test_public_reference_supports_autograd_without_changing_forward_bits(
+    reduce, native, identity, dtype, compute_dtype, from_memory
+):
+    """Check casts, strided input, an excluded suffix and a partially filled tile."""
+    storage = torch.linspace(0.75, 1.25, 64, dtype=dtype).reshape(2, 32).requires_grad_()
+    native_storage = storage.detach().clone().requires_grad_()
+    before = storage.detach().clone()
+    values = storage[:, ::2]
+    options = dict(length=11, from_memory=from_memory, block_size=4, compute_dtype=compute_dtype)
+    actual = reduce(values, **options)
+    expected = native(native_storage[:, ::2][:, :11].to(compute_dtype or dtype), dim=-1)
+    upstream = torch.tensor([0.75, -1.25], dtype=actual.dtype)
+    gradient = torch.autograd.grad(actual, storage, upstream)[0]
+    native_gradient = torch.autograd.grad(expected, native_storage, upstream)[0]
+    torch.testing.assert_close(gradient, native_gradient)
+    assert gradient.dtype == dtype
+    assert torch.count_nonzero(gradient[:, 1::2]) == 0
+    assert torch.count_nonzero(gradient[:, 22:]) == 0
     with torch.no_grad():
-        actual = reduce(values, compute_dtype=torch.float32, from_memory=True)
+        no_grad = reduce(values, **options)
     with torch.inference_mode():
-        inference = reduce(values, compute_dtype=torch.float32, from_memory=True)
-    assert_bitwise(actual, inference)
+        inference = reduce(values, **options)
+    assert_bitwise(actual.detach(), no_grad)
+    assert_bitwise(actual.detach(), inference)
+    assert_bitwise(storage.detach(), before)
+    assert actual.requires_grad and not no_grad.requires_grad
+
+
+@pytest.mark.parametrize(
+    "reduce,native", ((sum_partials, torch.sum), (product_partials, torch.prod))
+)
+@pytest.mark.parametrize("unroll", (1, 3, 8))
+def test_partial_helpers_propagate_gradients_through_unrolled_groups_and_tails(
+    reduce, native, unroll
+):
+    partials = torch.linspace(0.75, 1.25, 10, dtype=torch.float64).reshape(2, 5).requires_grad_()
+    native_partials = partials.detach().clone().requires_grad_()
+    actual = reduce(partials, merge_unroll=unroll)
+    expected = native(native_partials, dim=-1)
+    upstream = torch.tensor([0.5, -2.0], dtype=torch.float64)
+    gradient = torch.autograd.grad(actual, partials, upstream)[0]
+    native_gradient = torch.autograd.grad(expected, native_partials, upstream)[0]
+    torch.testing.assert_close(gradient, native_gradient)
+    with torch.no_grad():
+        assert_bitwise(actual.detach(), reduce(partials, merge_unroll=unroll))
+
+
+@pytest.mark.parametrize("path", ("loaded", "memory", "partials"))
+@pytest.mark.parametrize("zeros", (0, 1, 2))
+def test_product_gradients_handle_zero_factors(path, zeros):
+    values = torch.tensor([0.5, 2.0, -1.0, 4.0], dtype=torch.float64)
+    values[:zeros] = 0
+    values.requires_grad_()
+    native_values = values.detach().clone().requires_grad_()
+    if path == "partials":
+        actual = product_partials(values, merge_unroll=3)
+    else:
+        actual = ordered_product(values, from_memory=path == "memory", block_size=2)
+    gradient = torch.autograd.grad(actual, values)[0]
+    expected = torch.autograd.grad(native_values.prod(), native_values)[0]
+    torch.testing.assert_close(gradient, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("reduce,native,identity", _OPERATIONS)
+def test_empty_memory_fold_remains_constant_without_reading_differentiable_input(
+    reduce, native, identity
+):
+    """Removing the guard must not add arithmetic or artificial graph dependencies."""
+    values = torch.ones((2, 8), requires_grad=True)
+    actual = reduce(values, length=0, from_memory=True)
+    assert_bitwise(actual, torch.full((2,), identity))
     assert not actual.requires_grad
 
 

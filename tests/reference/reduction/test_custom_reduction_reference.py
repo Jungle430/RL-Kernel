@@ -135,16 +135,49 @@ def test_custom_callback_uses_explicit_compute_dtype_without_touching_input():
 
 
 @pytest.mark.parametrize("count", (0, 3))
-def test_custom_merge_keeps_initial_tensor_outside_autograd(count):
-    """A differentiable seed must obey the same reference-only boundary as partials."""
-    partials = torch.tensor([[1.0, 2.0, 3.0]])[:, :count]
-    initial = torch.tensor([5.0], requires_grad=True)
-    with pytest.raises(RuntimeError, match="evaluate under torch.no_grad"):
-        ordered.reduce_partials(partials, combine_fn=torch.add, initial=initial)
+def test_custom_merge_propagates_initial_tensor_gradients(count):
+    """Preserve the seed's graph through a cast, broadcasting and an empty fold."""
+    partials = torch.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]], dtype=torch.float64)[:, :count]
+    partials.requires_grad_()
+    initial = torch.tensor(5.0, requires_grad=True)
+    actual = ordered.reduce_partials(partials, combine_fn=torch.add, initial=initial)
+    upstream = torch.tensor([2.0, -3.0], dtype=torch.float64)
+    seed_gradient = torch.autograd.grad(actual, initial, upstream, retain_graph=True)[0]
+    torch.testing.assert_close(seed_gradient, upstream.sum().float(), rtol=0, atol=0)
+    if count:
+        gradient = torch.autograd.grad(actual, partials, upstream)[0]
+        torch.testing.assert_close(gradient, upstream[:, None].expand_as(partials), rtol=0, atol=0)
     with torch.no_grad():
-        actual = ordered.reduce_partials(partials, combine_fn=torch.add, initial=initial)
-    assert_bitwise(actual, torch.tensor([5.0 if count == 0 else 11.0]))
-    # An empty fold may return a view of the seed; no_grad does not clear a
-    # view's requires_grad flag, but no backward graph should be constructed.
-    assert actual.grad_fn is None
+        no_grad = ordered.reduce_partials(partials, combine_fn=torch.add, initial=initial)
+    assert_bitwise(actual.detach(), no_grad)
+    assert_bitwise(initial.detach(), torch.tensor(5.0))
     assert initial.grad is None
+
+
+@pytest.mark.parametrize("from_memory", (False, True))
+def test_custom_differentiable_callback_matches_independent_product_formula(from_memory):
+    """(1+a)(1+b)-1 is associative with identity zero; its derivative is independent."""
+
+    def caller_combine(left, right):
+        return left + right + left * right
+
+    values = torch.linspace(-0.1, 0.1, 32, dtype=torch.float64).reshape(2, 16).requires_grad_()
+    actual = ordered.reduce(
+        values,
+        length=11,
+        from_memory=from_memory,
+        block_size=4,
+        combine_fn=caller_combine,
+        identity=0,
+    )
+    upstream = torch.tensor([0.5, -2.0], dtype=torch.float64)
+    gradient = torch.autograd.grad(actual, values, upstream)[0]
+    expected = torch.zeros_like(values)
+    with torch.no_grad():
+        factors = 1 + values[:, :11]
+        for column in range(11):
+            others = torch.cat((factors[:, :column], factors[:, column + 1 :]), dim=-1)
+            expected[:, column] = upstream * others.prod(dim=-1)
+        gold = factors.prod(dim=-1) - 1
+    torch.testing.assert_close(actual.detach(), gold, rtol=1e-12, atol=1e-12)
+    torch.testing.assert_close(gradient, expected, rtol=1e-12, atol=1e-12)

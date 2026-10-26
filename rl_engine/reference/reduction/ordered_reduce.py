@@ -19,8 +19,9 @@ so its complete groups and tail can be compared directly with the JIT helper.
 
 This module imports no Triton kernels. Run eagerly; compilation can transform
 arithmetic. These helpers check fixed-path conformance, not independent numerical
-accuracy, and do not define a custom Triton operator's backward order. Public
-sum/product helpers require no_grad when their inputs require gradients.
+accuracy. Differentiable operations participate in ordinary PyTorch autograd;
+this does not prescribe a custom Triton operator's backward order. Operators
+requiring a fixed backward reduction must define and validate it separately.
 
 The final ordered_reduce collector is PyTorch-only diagnostic support: it returns
 both partials and their merged total using the same partial/merge helpers. It is
@@ -44,16 +45,11 @@ class _Combine(Protocol):
 
 
 def _validate_public_inputs(values: torch.Tensor) -> None:
-    """Check PyTorch layout/autograd constraints; JIT helpers receive device values."""
+    """Check PyTorch layout and rank; JIT helpers receive device values."""
     if values.layout != torch.strided:
         raise ValueError("ordered reductions require a strided tensor")
     if values.ndim == 0:
         raise ValueError("ordered reductions require at least one dimension")
-    if torch.is_grad_enabled() and values.requires_grad:
-        raise RuntimeError(
-            "ordered references validate forward arithmetic without autograd; "
-            "evaluate under torch.no_grad()"
-        )
 
 
 def reduce_add(left: torch.Tensor, right: torch.Tensor) -> torch.Tensor:
@@ -277,9 +273,11 @@ def reduce(
     compute_dtype=None keeps input dtype; explicit precision casts inputs before
     combining. block_size defaults to 1024 and only affects the memory path;
     max_group_size/section_count default to 8/4. All sizes are positive powers of
-    two. Inputs are never mutated. Run eagerly and under no_grad for gradient-
-    requiring inputs. A same-tree reference is separate from independent accuracy
-    validation and does not prescribe a Triton backward implementation.
+    two. Inputs are never mutated. Run eagerly; differentiable operations retain
+    PyTorch's autograd graph. The fixed-order guarantee covers forward arithmetic;
+    backward order must be specified and validated separately. A same-tree
+    reference is separate from independent accuracy validation. An empty memory
+    fold returns the constant identity without a dependency on values.
     """
     _validate_public_inputs(values)
     width = values.shape[-1]
@@ -347,8 +345,9 @@ def sum(
 
     Returns a tensor shaped [...] in compute_dtype on the input device.
     An empty prefix returns zero; a loaded vector must still have positive width.
-    Inputs are never mutated. Run eagerly and under no_grad for inputs requiring
-    gradients; this reference does not define a Triton backward formula.
+    Inputs are never mutated. Run eagerly; floating-point arithmetic supports
+    ordinary PyTorch autograd, without prescribing a Triton backward order.
+    An empty memory fold returns a constant with no dependency on values.
     Same-tree checks require the matching mode, width, parameters and precision.
     They are separate from independent native/FP64 accuracy validation.
     """
@@ -423,15 +422,12 @@ def reduce_partials(
 
     compute_dtype=None uses storage precision. An explicit dtype must match
     storage; no cast silently changes partials. Positive merge_unroll changes
-    only loop expansion. Inputs are preserved; evaluate eagerly under no_grad
-    for partials or an initial tensor requiring gradients, as with reduce.
+    only loop expansion. Inputs are preserved. Differentiable partials and tensor
+    seeds retain ordinary PyTorch autograd connections; backward reduction order
+    is not prescribed. An empty fold returns the broadcast seed without reading
+    partials, so only a differentiable seed contributes an autograd connection.
     """
     _validate_public_inputs(partials)
-    if isinstance(initial, torch.Tensor) and torch.is_grad_enabled() and initial.requires_grad:
-        raise RuntimeError(
-            "ordered references validate forward arithmetic without autograd; "
-            "evaluate under torch.no_grad()"
-        )
     compute_dtype = partials.dtype if compute_dtype is None else compute_dtype
     return ordered_reduce_merge(
         partials,
@@ -458,7 +454,8 @@ def sum_partials(
     compute_dtype=None uses partials.dtype. An explicit dtype must match storage,
     so the merge cannot silently change the producer's precision. merge_unroll
     accepts any positive integer and preserves the fold, including tail entries.
-    Inputs are unchanged; use no_grad when they require gradients.
+    Inputs are unchanged; differentiable arithmetic retains PyTorch's autograd
+    graph. An empty fold returns a constant with no dependency on partials.
     """
     return reduce_partials(
         partials,

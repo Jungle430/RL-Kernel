@@ -195,15 +195,14 @@ The reference package exports the same six names:
 import torch
 from rl_engine.reference import reduction as reference
 
-with torch.no_grad():
-    # Models an already-loaded, power-of-two vector.
-    loaded = reference.sum(values, length=128)
+# Models an already-loaded, power-of-two vector.
+loaded = reference.sum(values, length=128)
 
-    # Models the scalar-pointer path, including fixed tiles and the outer seed.
-    memory = reference.sum(storage, length=2500, from_memory=True)
+# Models the scalar-pointer path, including fixed tiles and the outer seed.
+memory = reference.sum(storage, length=2500, from_memory=True)
 
-    # Partial count comes from the final dimension.
-    merged = reference.sum_partials(partials)
+# Partial count comes from the final dimension.
+merged = reference.sum_partials(partials)
 ```
 
 A Torch Tensor cannot distinguish a loaded JIT vector from the storage addressed
@@ -215,10 +214,22 @@ the memory path selects the prefix before fixed-width tiling.
 
 References accept CPU/GPU strided tensors, reduce the last dimension and retain
 leading batch dimensions: `[M, V]` becomes `[M]`. `compute_dtype=None` keeps input
-precision. Run eagerly and use `no_grad` for inputs requiring gradients; this
-forward reference does not prescribe a Triton backward formula. PyTorch needs
-no pipeline scheduling counterpart. Its optional `merge_unroll` mirrors the
-partial fold's unrolled groups and tail.
+precision. Run eagerly; differentiable operations support ordinary PyTorch
+autograd, including gradients through input casts and tensor seeds. `no_grad`
+remains optional when only a forward reference is needed. PyTorch needs no
+pipeline scheduling counterpart. Its optional `merge_unroll` mirrors the partial
+fold's unrolled groups and tail.
+
+The fixed-order guarantee applies to **forward arithmetic**. Automatic
+differentiation computes gradients but does not establish the same reduction
+order as a Triton backward. Operators requiring fixed backward order must define
+and validate that path separately, for example with `torch.autograd.Function`.
+Gradient tests compare these references with independent sum/product formulas;
+they do not claim cross-schedule or cross-device bitwise backward equivalence.
+
+Empty memory/partial folds retain the existing seed-only behavior: they do not
+read the input or add a graph connection to it. A constant seed therefore returns
+a constant result; a differentiable tensor seed retains its own gradient path.
 
 Keep native PyTorch or higher-precision numerical-accuracy checks separate.
 A same-tree reference is not an independent mathematical oracle or performance

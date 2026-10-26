@@ -9,8 +9,10 @@ Torch tensors cannot otherwise distinguish loaded values from pointer storage.
 compute_dtype=None retains input precision; leading dimensions batch reductions.
 
 sum_partials/product_partials merge stored tile results from zero/one in order.
-Run eagerly; use no_grad for gradient-requiring inputs. These are fixed-path
-references, separate from independent native or higher-precision accuracy checks.
+Run eagerly; differentiable operations support ordinary PyTorch autograd. The
+fixed-order guarantee covers forward arithmetic, not automatically generated
+backward reductions. Empty folds return their seed without reading the input.
+Independent native or higher-precision accuracy checks remain separate.
 
 reduce/reduce_partials expose the same implementations with caller-owned binary
 functions. sum/product and their partial helpers supply standard operations and
