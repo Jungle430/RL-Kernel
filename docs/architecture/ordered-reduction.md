@@ -399,6 +399,7 @@ reference is a conformance oracle and is never used as the performance baseline.
 | `reference/reduction/ordered_reduce.py` | Eager PyTorch translation, with matching names, order and arithmetic |
 | Each package's `__init__.py` | Convenience and generic helpers through one entry point; the only `__all__` list |
 | `tests/helpers/ordered_reduce_kernels.py` | Test-only launch adapters; no production operator dependencies |
+| `tests/helpers/ordered_reduce_reference.py` | Test-only collector of PyTorch partials and their merged total |
 
 Existing reductions retain their own contracts: `reduce_rows_fp32` in
 `rl_engine/ops/autograd/vjp_fp32.py` folds dimension zero for parameter gradients;
@@ -436,9 +437,12 @@ use the same partial stage, and `ordered_reduce_merge` folds their stored result
 Each stage has a distinct role; the small `reduce_add`/`reduce_multiply` functions
 are the binary callbacks required by the shared tree and fold.
 
-The PyTorch-only `ordered_reduce` collector composes partial and merge helpers,
-returning `OrderedReduceResult.partials` and `.total` for stage diagnostics.
-Its last dimension must be nonempty. It does not implement another tree.
+The test-only `ordered_reduce` collector lives in
+`tests/helpers/ordered_reduce_reference.py`, outside the production reference
+module. It composes the PyTorch partial and merge helpers, returning
+`OrderedReduceResult.partials` and `.total` for stage diagnostics. Its last
+dimension must be nonempty. It defines no additional tree and is not exported
+by either reduction package.
 
 ### Fixed tile tree and partial fold
 

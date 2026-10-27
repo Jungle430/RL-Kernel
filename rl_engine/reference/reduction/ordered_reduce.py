@@ -22,13 +22,8 @@ arithmetic. These helpers check fixed-path conformance, not independent numerica
 accuracy. Differentiable operations participate in ordinary PyTorch autograd;
 this does not prescribe a custom Triton operator's backward order. Operators
 requiring a fixed backward reduction must define and validate it separately.
-
-The final ordered_reduce collector is PyTorch-only diagnostic support: it returns
-both partials and their merged total using the same partial/merge helpers. It is
-not an additional reduction algorithm or a performance baseline.
 """
 
-from dataclasses import dataclass
 from typing import Protocol
 
 import torch
@@ -464,63 +459,3 @@ def product_partials(
         compute_dtype=compute_dtype,
         merge_unroll=merge_unroll,
     )
-
-
-@dataclass(frozen=True)
-class OrderedReduceResult:
-    """PyTorch-only diagnostic trace of the partial and merge stages."""
-
-    partials: torch.Tensor
-    """compute_dtype [..., ceil(length / block_size)] totals in ascending tile order."""
-
-    total: torch.Tensor
-    """compute_dtype [...] left fold of partials, starting with initial once."""
-
-
-def ordered_reduce(
-    values: torch.Tensor,
-    *,
-    block_size: int,
-    max_group_size: int,
-    combine_fn: _Combine,
-    identity: bool | int | float,
-    initial: bool | int | float | torch.Tensor,
-    compute_dtype: torch.dtype,
-) -> OrderedReduceResult:
-    """Collect inspectable partials and total for operator-stage diagnostics.
-
-    This PyTorch-only collector composes ordered_reduce_partial and
-    ordered_reduce_merge; it does not define another tree. Use the matching
-    stage helpers or sum/product with from_memory=True when only a total is needed.
-    Leading dimensions batch independent vectors; the last dimension must be
-    nonempty. All arithmetic parameters are required, with the same meanings
-    as in the stage helpers. initial never enters the unseeded partials.
-    """
-    if values.ndim == 0 or values.shape[-1] == 0:
-        raise ValueError("ordered_reduce requires values with a nonempty last dimension")
-    if block_size <= 0 or (block_size & (block_size - 1)) != 0:
-        raise ValueError("block_size must be a positive power of two")
-    length = values.shape[-1]
-    n_tiles = (length + block_size - 1) // block_size
-    tile_partials: list[torch.Tensor] = []
-    for tile in range(n_tiles):
-        tile_partials.append(
-            ordered_reduce_partial(
-                values,
-                tile,
-                block_size=block_size,
-                max_group_size=max_group_size,
-                combine_fn=combine_fn,
-                identity=identity,
-                compute_dtype=compute_dtype,
-            )
-        )
-    partials = torch.stack(tile_partials, dim=-1)
-    total = ordered_reduce_merge(
-        partials,
-        initial,
-        combine_fn=combine_fn,
-        merge_unroll=1,
-        compute_dtype=compute_dtype,
-    )
-    return OrderedReduceResult(partials=partials, total=total)

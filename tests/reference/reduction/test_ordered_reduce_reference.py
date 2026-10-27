@@ -4,7 +4,8 @@
 import pytest
 import torch
 
-from rl_engine.reference.reduction.ordered_reduce import ordered_reduce, ordered_tile_reduce
+from rl_engine.reference.reduction.ordered_reduce import ordered_tile_reduce
+from tests.helpers.ordered_reduce_reference import ordered_reduce
 from tests.helpers.tensor_checks import assert_bitwise
 
 _DTYPES = (torch.float16, torch.bfloat16, torch.float32)
