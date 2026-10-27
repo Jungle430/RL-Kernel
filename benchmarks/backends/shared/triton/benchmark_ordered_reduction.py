@@ -26,7 +26,7 @@ from pathlib import Path
 import torch
 
 from rl_engine.contracts.numerical import load_contract, resolve_tolerance
-from rl_engine.contracts.operators.ordered_reduction import MAX_GROUP_SIZE, SECTION_COUNT, TILE_SIZE
+from rl_engine.contracts.operators.ordered_reduction import MAX_GROUP_SIZE, TILE_SIZE
 from rl_engine.reference import reduction as reference
 
 MODULE = "benchmarks.backends.shared.triton.benchmark_ordered_reduction"
@@ -71,7 +71,6 @@ def parser():
     cli.add_argument("--merge-unroll", type=positive, nargs="+", default=[1])
     cli.add_argument("--block-size", type=power_of_two, default=TILE_SIZE)
     cli.add_argument("--max-group-size", type=power_of_two, default=MAX_GROUP_SIZE)
-    cli.add_argument("--section-count", type=power_of_two, default=SECTION_COUNT)
     cli.add_argument(
         "--padding", type=int, default=0, help="physical suffix columns, filled with NaN"
     )
@@ -140,7 +139,6 @@ def plan(args):
     tree = dict(
         block_size=args.block_size,
         max_group_size=args.max_group_size,
-        section_count=args.section_count,
     )
     cases = []
     for dtype in dict.fromkeys(args.dtypes):

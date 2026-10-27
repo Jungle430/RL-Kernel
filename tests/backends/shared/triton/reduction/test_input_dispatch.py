@@ -29,15 +29,17 @@ def test_same_public_function_distinguishes_values_and_pointer(operation, dtype,
         values[:, ::2] = 2
         values[:, 1::2] = 0.5
     values[:, length:] = float("nan")
-    pointer_block = 32
+    pointer_block = 16
     ref = getattr(reference, operation)
     # Keep arithmetic in input dtype to catch implicit widening; both paths are
     # also exercised with explicit FP32 by the existing embedded-helper matrix.
     expected_loaded = ref(values, length=length, block_size=pointer_block)
     expected_memory = ref(values, length=length, block_size=pointer_block, from_memory=True)
     if operation == "sum" and width == 64:
-        assert expected_loaded[0].item() == 0
-        assert expected_memory[0].item() == 2
+        # The loaded tree cancels before adding ones; each 16-wide pointer
+        # tile rounds its one away before the two partials are merged.
+        assert expected_loaded[0].item() == 2
+        assert expected_memory[0].item() == 0
     source = values.cuda()
     before = source.clone()
     outputs = [torch.full((5,), -123, device="cuda", dtype=dtype) for _ in range(2)]

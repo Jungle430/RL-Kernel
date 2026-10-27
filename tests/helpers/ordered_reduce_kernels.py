@@ -20,14 +20,11 @@ def tile_reduce_probe(
     sums_ptr,
     BLOCK_SIZE: tl.constexpr,
     MAX_GROUP_SIZE: tl.constexpr,
-    SECTION_COUNT: tl.constexpr,
     COMBINE_FN: tl.constexpr,
 ):
     tile = tl.program_id(0).to(tl.int64)
     values = tl.load(values_ptr + tile * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE))
-    tile_sum = ordered_tile_reduce(
-        values, MAX_GROUP_SIZE=MAX_GROUP_SIZE, SECTION_COUNT=SECTION_COUNT, COMBINE_FN=COMBINE_FN
-    )
+    tile_sum = ordered_tile_reduce(values, MAX_GROUP_SIZE=MAX_GROUP_SIZE, COMBINE_FN=COMBINE_FN)
     tl.store(sums_ptr + tile, tile_sum)
 
 
@@ -39,7 +36,6 @@ def configured_tile_probe(
     COMPUTE_DTYPE: tl.constexpr,
     REDUCE_FN: tl.constexpr,
     MAX_GROUP_SIZE: tl.constexpr,
-    SECTION_COUNT: tl.constexpr,
 ):
     """Exercise the tile helper used by fused operators with an explicit tree."""
     row = tl.program_id(0).to(tl.int64)
@@ -48,7 +44,6 @@ def configured_tile_probe(
         values,
         COMPUTE_DTYPE=COMPUTE_DTYPE,
         MAX_GROUP_SIZE=MAX_GROUP_SIZE,
-        SECTION_COUNT=SECTION_COUNT,
     )
     tl.store(sums_ptr + row, total)
 
@@ -101,7 +96,6 @@ def ordered_reduce_serial_probe(
     LENGTH: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     MAX_GROUP_SIZE: tl.constexpr,
-    SECTION_COUNT: tl.constexpr,
     COMBINE_FN: tl.constexpr,
     IDENTITY: tl.constexpr,
     PIPELINE_STAGES: tl.constexpr,
@@ -114,7 +108,6 @@ def ordered_reduce_serial_probe(
         LENGTH,
         BLOCK_SIZE=BLOCK_SIZE,
         MAX_GROUP_SIZE=MAX_GROUP_SIZE,
-        SECTION_COUNT=SECTION_COUNT,
         PIPELINE_STAGES=PIPELINE_STAGES,
         COMBINE_FN=COMBINE_FN,
         IDENTITY=IDENTITY,
@@ -131,7 +124,6 @@ def ordered_reduce_partial_probe(
     LENGTH: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     MAX_GROUP_SIZE: tl.constexpr,
-    SECTION_COUNT: tl.constexpr,
     COMBINE_FN: tl.constexpr,
     IDENTITY: tl.constexpr,
     COMPUTE_DTYPE: tl.constexpr = tl.float32,
@@ -146,7 +138,6 @@ def ordered_reduce_partial_probe(
         tile,
         BLOCK_SIZE=BLOCK_SIZE,
         MAX_GROUP_SIZE=MAX_GROUP_SIZE,
-        SECTION_COUNT=SECTION_COUNT,
         COMBINE_FN=COMBINE_FN,
         IDENTITY=IDENTITY,
         COMPUTE_DTYPE=COMPUTE_DTYPE,
@@ -209,7 +200,6 @@ def configured_vector_probe(
     REDUCE_FN: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     MAX_GROUP_SIZE: tl.constexpr,
-    SECTION_COUNT: tl.constexpr,
     PIPELINE_STAGES: tl.constexpr,
 ):
     """Exercise a public vector helper with explicit arithmetic and loop scheduling."""
@@ -220,7 +210,6 @@ def configured_vector_probe(
         COMPUTE_DTYPE=COMPUTE_DTYPE,
         BLOCK_SIZE=BLOCK_SIZE,
         MAX_GROUP_SIZE=MAX_GROUP_SIZE,
-        SECTION_COUNT=SECTION_COUNT,
         PIPELINE_STAGES=PIPELINE_STAGES,
     )
     tl.store(output_ptr + row, total)

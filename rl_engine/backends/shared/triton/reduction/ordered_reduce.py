@@ -22,7 +22,7 @@ from types import SimpleNamespace
 import triton
 import triton.language as tl
 
-from rl_engine.contracts.operators.ordered_reduction import MAX_GROUP_SIZE, SECTION_COUNT, TILE_SIZE
+from rl_engine.contracts.operators.ordered_reduction import MAX_GROUP_SIZE, TILE_SIZE
 
 
 @triton.jit
@@ -57,7 +57,6 @@ def _reduction_callback(combine_fn):
 def ordered_tile_reduce(
     values,
     MAX_GROUP_SIZE: tl.constexpr,
-    SECTION_COUNT: tl.constexpr,
     COMBINE_FN: tl.constexpr,
 ):
     """Combine one already-computed Triton vector into a scalar in a fixed order.
@@ -78,10 +77,6 @@ def ordered_tile_reduce(
             each initial group; must be a positive power of two. The actual
             group size is min(BLOCK_SIZE, MAX_GROUP_SIZE). Each group combines
             left to right. These are arithmetic groups, not GPU thread groups.
-        SECTION_COUNT: Compile-time maximum number of equal sections of group
-            totals; must be a positive power of two. The actual section count
-            is min(N_GROUPS, SECTION_COUNT), so no empty sections are inserted.
-            Each section is reduced first, then its total joins the section tree.
         COMBINE_FN: Compile-time-selected, pure @triton.jit binary function,
             called as COMBINE_FN(left, right). It must return the same shape
             and dtype as its operands. Choose a mathematically associative,
@@ -95,12 +90,10 @@ def ordered_tile_reduce(
     Reduction order:
         1. Split values into adjacent groups and fold each group from its first
            element, without inserting an initial value.
-        2. Divide group totals into min(N_GROUPS, SECTION_COUNT) equal sections.
-           Within each section, repeatedly combine corresponding entries from
-           its lower and upper halves until one section total remains.
-        3. Repeatedly combine the lower and upper halves of the section totals.
-           Four sections retain combine(combine(s0, s2), combine(s1, s3)).
-           A single entry at either stage passes through without a combine.
+        2. Repeatedly combine corresponding entries from the lower and upper
+           halves of all group totals until one value remains. For eight group
+           totals, pair 0+4, 1+5, 2+6, 3+7 first, then 0+2, 1+3, then 0+1.
+           One group returns directly without inserting an identity operand.
 
     Every tree step combines only the prescribed left/right pair through a
     two-entry reduction, for both built-in and caller-owned JIT combiners.
@@ -108,9 +101,9 @@ def ordered_tile_reduce(
     to Triton's reduction lowering without requiring permute/split layouts
     or letting the compiler choose a larger reduction tree.
     No seed, dtype conversion or merge across separate tiles is added here.
-    The same BLOCK_SIZE, MAX_GROUP_SIZE and SECTION_COUNT determine the same
-    operand tree. Bitwise conformance also requires identical inputs, combiner,
-    dtype and rounding behavior. Changing the arithmetic configuration can
+    The same BLOCK_SIZE and MAX_GROUP_SIZE determine the same operand tree.
+    Bitwise conformance also requires identical inputs, combiner, dtype and
+    rounding behavior. Changing the arithmetic configuration can
     change results; fixed order alone does not promise equal bits across
     backends or compiler versions.
 
@@ -118,7 +111,6 @@ def ordered_tile_reduce(
         tile_sum = ordered_tile_reduce(
             exponentials,
             MAX_GROUP_SIZE=8,
-            SECTION_COUNT=4,
             COMBINE_FN=reduce_add,
         )
     """
@@ -132,10 +124,6 @@ def ordered_tile_reduce(
         MAX_GROUP_SIZE > 0 and (MAX_GROUP_SIZE & (MAX_GROUP_SIZE - 1)) == 0,
         "maximum group size must be a positive power of two",
     )
-    tl.static_assert(
-        SECTION_COUNT > 0 and (SECTION_COUNT & (SECTION_COUNT - 1)) == 0,
-        "section count must be a positive power of two",
-    )
     GROUP_SIZE: tl.constexpr = min(BLOCK_SIZE, MAX_GROUP_SIZE)
     N_GROUPS: tl.constexpr = BLOCK_SIZE // GROUP_SIZE
     # Keep indexed extraction: split-based extraction caused LLVM O3 compilation
@@ -145,17 +133,10 @@ def ordered_tile_reduce(
     subtotal = tl.gather(values, groups, axis=0)
     for offset in tl.static_range(1, GROUP_SIZE):
         subtotal = COMBINE_FN(subtotal, tl.gather(values, groups + offset, axis=0))
-    N_SECTIONS: tl.constexpr = min(N_GROUPS, SECTION_COUNT)
-    SECTION_SIZE: tl.constexpr = N_GROUPS // N_SECTIONS
-    # Convert only compile-time sizes: the interpreter can retain constexpr
-    # wrappers, which do not expose Python int.bit_length directly.
-    # Each reduced axis has exactly two entries: the prescribed lower/upper pair.
-    for shift in tl.static_range(int(SECTION_SIZE).bit_length() - 2, -1, -1):
-        pairs = tl.reshape(subtotal, (N_SECTIONS, 2, 1 << shift))
-        subtotal = tl.reduce(pairs, axis=1, combine_fn=_reduction_callback(COMBINE_FN).combine)
-    subtotal = tl.reshape(subtotal, (N_SECTIONS,))
-    # Merge section totals by halving distance: four sections pair 0+2, 1+3.
-    for shift in tl.static_range(int(N_SECTIONS).bit_length() - 2, -1, -1):
+    # Combine the lower and upper halves of all remaining group totals.
+    # Each reduced axis has exactly two entries, so every operand pair is fixed.
+    # int() also supports interpreter constexpr wrappers before bit_length().
+    for shift in tl.static_range(int(N_GROUPS).bit_length() - 2, -1, -1):
         pairs = tl.reshape(subtotal, (2, 1 << shift))
         subtotal = tl.reduce(pairs, axis=0, combine_fn=_reduction_callback(COMBINE_FN).combine)
     return tl.reshape(subtotal, ())
@@ -168,7 +149,6 @@ def ordered_reduce_partial(
     tile_index,
     BLOCK_SIZE: tl.constexpr,
     MAX_GROUP_SIZE: tl.constexpr,
-    SECTION_COUNT: tl.constexpr,
     COMBINE_FN: tl.constexpr,
     IDENTITY: tl.constexpr,
     COMPUTE_DTYPE: tl.constexpr,
@@ -190,7 +170,6 @@ def ordered_reduce_partial(
     return ordered_tile_reduce(
         values,
         MAX_GROUP_SIZE=MAX_GROUP_SIZE,
-        SECTION_COUNT=SECTION_COUNT,
         COMBINE_FN=COMBINE_FN,
     )
 
@@ -202,7 +181,6 @@ def ordered_reduce_serial(
     initial,
     BLOCK_SIZE: tl.constexpr,
     MAX_GROUP_SIZE: tl.constexpr,
-    SECTION_COUNT: tl.constexpr,
     COMBINE_FN: tl.constexpr,
     IDENTITY: tl.constexpr,
     COMPUTE_DTYPE: tl.constexpr,
@@ -226,10 +204,6 @@ def ordered_reduce_serial(
         MAX_GROUP_SIZE > 0 and (MAX_GROUP_SIZE & (MAX_GROUP_SIZE - 1)) == 0,
         "maximum group size must be a positive power of two",
     )
-    tl.static_assert(
-        SECTION_COUNT > 0 and (SECTION_COUNT & (SECTION_COUNT - 1)) == 0,
-        "section count must be a positive power of two",
-    )
     n_tiles: tl.constexpr = (length + BLOCK_SIZE - 1) // BLOCK_SIZE
     # Construct constants directly in the chosen dtype; a scalar cast can first
     # materialize a Python float as FP32 and lose bits before conversion to FP64.
@@ -241,7 +215,6 @@ def ordered_reduce_serial(
             tile,
             BLOCK_SIZE=BLOCK_SIZE,
             MAX_GROUP_SIZE=MAX_GROUP_SIZE,
-            SECTION_COUNT=SECTION_COUNT,
             COMBINE_FN=COMBINE_FN,
             IDENTITY=IDENTITY,
             COMPUTE_DTYPE=COMPUTE_DTYPE,
@@ -300,7 +273,6 @@ def reduce(
     COMPUTE_DTYPE: tl.constexpr = None,
     BLOCK_SIZE: tl.constexpr = TILE_SIZE,
     MAX_GROUP_SIZE: tl.constexpr = MAX_GROUP_SIZE,
-    SECTION_COUNT: tl.constexpr = SECTION_COUNT,
     PIPELINE_STAGES: tl.constexpr = None,
 ):
     """Reduce loaded values or a memory vector with a caller-owned binary function.
@@ -328,10 +300,10 @@ def reduce(
             a seed to loaded tiles. The caller is responsible for its validity.
         COMPUTE_DTYPE: None retains the numeric dtype or pointer element type.
             An explicit dtype converts inputs before applying the combiner.
-        BLOCK_SIZE: Pointer-only arithmetic tile width, default 1024.
-        MAX_GROUP_SIZE: Maximum adjacent group size, default 8.
-        SECTION_COUNT: Maximum section count, default 4. All three sizes must
-            be positive powers of two. Loaded values retain their existing width.
+        BLOCK_SIZE: Pointer-only positive power-of-two arithmetic tile width,
+            default 1024. Loaded values retain their existing width.
+        MAX_GROUP_SIZE: Positive power-of-two maximum adjacent group size,
+            default 8. Group totals follow the fixed halving tree to one value.
         PIPELINE_STAGES: Pointer-only software-pipeline hint; None is unhinted.
             It changes scheduling, not the order of combines.
 
@@ -364,7 +336,6 @@ def reduce(
             initial=IDENTITY,
             BLOCK_SIZE=BLOCK_SIZE,
             MAX_GROUP_SIZE=MAX_GROUP_SIZE,
-            SECTION_COUNT=SECTION_COUNT,
             COMBINE_FN=COMBINE_FN,
             IDENTITY=IDENTITY,
             COMPUTE_DTYPE=compute_dtype,
@@ -386,7 +357,6 @@ def reduce(
         return ordered_tile_reduce(
             values,
             MAX_GROUP_SIZE=MAX_GROUP_SIZE,
-            SECTION_COUNT=SECTION_COUNT,
             COMBINE_FN=COMBINE_FN,
         )
 
@@ -399,7 +369,6 @@ def sum(
     COMPUTE_DTYPE: tl.constexpr = None,
     BLOCK_SIZE: tl.constexpr = TILE_SIZE,
     MAX_GROUP_SIZE: tl.constexpr = MAX_GROUP_SIZE,
-    SECTION_COUNT: tl.constexpr = SECTION_COUNT,
     PIPELINE_STAGES: tl.constexpr = None,
 ):
     """Sum loaded values or a contiguous memory vector in a prescribed order.
@@ -427,8 +396,7 @@ def sum(
             Loaded input retains its existing width regardless of this option.
         MAX_GROUP_SIZE: Positive power-of-two maximum adjacent group size,
             default 8. Each group accumulates sequentially from its first value.
-        SECTION_COUNT: Positive power-of-two maximum section count, default 4.
-            Group totals follow the fixed lower-half/upper-half tree.
+            Group totals follow the fixed lower-half/upper-half tree to one value.
         PIPELINE_STAGES: Pointer path only: optional tl.range loop-pipeline hint.
             None leaves it unhinted. Scheduling does not change combine order.
 
@@ -451,7 +419,6 @@ def sum(
         COMPUTE_DTYPE=COMPUTE_DTYPE,
         BLOCK_SIZE=BLOCK_SIZE,
         MAX_GROUP_SIZE=MAX_GROUP_SIZE,
-        SECTION_COUNT=SECTION_COUNT,
         PIPELINE_STAGES=PIPELINE_STAGES,
     )
 
@@ -464,7 +431,6 @@ def product(
     COMPUTE_DTYPE: tl.constexpr = None,
     BLOCK_SIZE: tl.constexpr = TILE_SIZE,
     MAX_GROUP_SIZE: tl.constexpr = MAX_GROUP_SIZE,
-    SECTION_COUNT: tl.constexpr = SECTION_COUNT,
     PIPELINE_STAGES: tl.constexpr = None,
 ):
     """Multiply loaded values or a contiguous memory vector in a prescribed order.
@@ -480,7 +446,7 @@ def product(
 
     COMPUTE_DTYPE=None retains the input dtype, without widening. BLOCK_SIZE
     (default 1024) and PIPELINE_STAGES (default None) affect only pointer input.
-    MAX_GROUP_SIZE (default 8) and SECTION_COUNT (default 4) control either tree;
+    MAX_GROUP_SIZE (default 8) controls adjacent grouping in either input path;
     all arithmetic sizes must be positive powers of two. Input representation
     is selected at compile time, never by length or a runtime loading flag.
     The result is a scalar usable in surrounding fused arithmetic, with no
@@ -496,7 +462,6 @@ def product(
         COMPUTE_DTYPE=COMPUTE_DTYPE,
         BLOCK_SIZE=BLOCK_SIZE,
         MAX_GROUP_SIZE=MAX_GROUP_SIZE,
-        SECTION_COUNT=SECTION_COUNT,
         PIPELINE_STAGES=PIPELINE_STAGES,
     )
 

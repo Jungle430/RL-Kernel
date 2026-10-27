@@ -9,8 +9,8 @@ from tests.helpers.tensor_checks import assert_bitwise
 
 _DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 _TILE_WIDTHS = tuple(1 << exponent for exponent in range(14))
-_TREE_CONFIG = {"max_group_size": 8, "section_count": 4}
-"""The established 8-value/four-section tree; passed explicitly to each reference."""
+_TREE_CONFIG = {"max_group_size": 8}
+"""Eight-value sequential groups, then one tree over all group totals."""
 
 
 @pytest.mark.parametrize(
@@ -86,10 +86,7 @@ def test_custom_boolean_combiner_with_padding_and_nonidentity_seed():
 
 @pytest.mark.parametrize("block_size,length", ((1, 5), (4, 3), (4, 17), (32, 65), (1024, 1025)))
 @pytest.mark.parametrize("operation", ("sum", "product"))
-@pytest.mark.parametrize("section_count", (1, 4, 8))
-def test_operation_identity_and_initial_have_distinct_roles(
-    operation, block_size, length, section_count
-):
+def test_operation_identity_and_initial_have_distinct_roles(operation, block_size, length):
     """Independent native checks use exactly representable inputs and results."""
     columns = torch.arange(length)
     values = (columns % 8 + 2).float().expand(4, -1).clone()
@@ -112,7 +109,6 @@ def test_operation_identity_and_initial_have_distinct_roles(
         identity=identity,
         initial=initials,
         max_group_size=8,
-        section_count=section_count,
         compute_dtype=torch.float32,
     )
     assert_bitwise(result.total, expected, f"{operation}: padding and one final seed")
@@ -125,7 +121,6 @@ def test_operation_identity_and_initial_have_distinct_roles(
         identity=identity,
         initial=identity,
         max_group_size=8,
-        section_count=section_count,
         compute_dtype=torch.float32,
     )
     assert_bitwise(result.partials, without_seed.partials, "partials never include initial")
@@ -133,66 +128,44 @@ def test_operation_identity_and_initial_have_distinct_roles(
 
 @pytest.mark.parametrize("block_size", (4, 32, 256))
 @pytest.mark.parametrize("max_group_size", (1, 4, 16, 64))
-@pytest.mark.parametrize("section_count", (1, 2, 4, 8, 16, 128))
-def test_explicit_group_and_section_sizes(block_size, max_group_size, section_count):
-    """Cover fewer/more sections than groups without adding identity operands."""
+def test_explicit_group_sizes(block_size, max_group_size):
+    """Cover groups smaller/larger than the tile without adding identity operands."""
     values = torch.ones((2, block_size), dtype=torch.float32)
-    result = ordered_tile_reduce(
-        values, max_group_size=max_group_size, section_count=section_count, combine_fn=torch.add
-    )
+    result = ordered_tile_reduce(values, max_group_size=max_group_size, combine_fn=torch.add)
     assert_bitwise(result, torch.full((2,), float(block_size)))
     negative_zero = ordered_tile_reduce(
         torch.full_like(values, -0.0),
         max_group_size=max_group_size,
-        section_count=section_count,
         combine_fn=torch.add,
     )
-    assert_bitwise(negative_zero, torch.full((2,), -0.0), "no empty positive-zero sections")
+    assert_bitwise(negative_zero, torch.full((2,), -0.0), "no extra positive-zero operands")
 
 
 @pytest.mark.parametrize("max_group_size", (0, -1, 3))
 def test_rejects_invalid_group_size(max_group_size):
     with pytest.raises(ValueError, match="maximum group size"):
-        ordered_tile_reduce(
-            torch.ones(16), max_group_size=max_group_size, section_count=4, combine_fn=torch.add
-        )
+        ordered_tile_reduce(torch.ones(16), max_group_size=max_group_size, combine_fn=torch.add)
 
 
-@pytest.mark.parametrize("section_count", (0, -1, 3, 6, 12))
-def test_rejects_invalid_section_count(section_count):
-    with pytest.raises(ValueError, match="section count must be a positive power of two"):
-        ordered_tile_reduce(
-            torch.ones(16), max_group_size=8, section_count=section_count, combine_fn=torch.add
-        )
-
-
-@pytest.mark.parametrize(
-    "section_count,expected",
-    ((1, (2, 2, 2)), (2, (0, 2, 0)), (4, (0, 0, 2)), (8, (2, 2, 2)), (16, (2, 2, 2))),
-)
 @pytest.mark.parametrize("max_group_size", (1, 8))
 @pytest.mark.parametrize(
     "dtype,precision_bits",
     ((torch.float16, 11), (torch.bfloat16, 8), (torch.float32, 24), (torch.float64, 53)),
 )
-def test_section_count_prescribes_nonassociative_pairs(
-    section_count, expected, max_group_size, dtype, precision_bits
-):
-    """Frozen results distinguish the trees, not just an exact-arithmetic total.
+def test_group_totals_follow_one_halving_tree(max_group_size, dtype, precision_bits):
+    """Freeze pairs independently of the reference implementation.
 
-    For eight group totals, four sections pair adjacent groups first; eight
-    sections pair g0+g4, g1+g5, g2+g6, g3+g7 first. Two sections first pair
-    g0+g2, g1+g3, g4+g6, g5+g7. Cancellation exposes changes to these pairs.
+    Eight group totals first pair 0+4, 1+5, 2+6, 3+7. The first three rows
+    cancel large values before adding the ones; the last row rounds both
+    ones away in that first step. Adjacent-first and left-fold trees differ.
     """
     large = 2 ** (precision_bits + 2)
-    values = torch.zeros((3, 8 * max_group_size), dtype=dtype)
-    for row, positions in enumerate(((0, 1, 4, 5), (0, 1, 2, 3), (0, 2, 4, 6))):
+    values = torch.zeros((4, 8 * max_group_size), dtype=dtype)
+    for row, positions in enumerate(((0, 1, 4, 5), (0, 1, 2, 3), (0, 2, 4, 6), (0, 4, 1, 5))):
         columns = [group * max_group_size for group in positions]
         values[row, columns] = torch.tensor([large, 1.0, -large, 1.0], dtype=dtype)
-    actual = ordered_tile_reduce(
-        values, max_group_size=max_group_size, section_count=section_count, combine_fn=torch.add
-    )
-    assert_bitwise(actual, torch.tensor(expected, dtype=dtype), "declared section tree")
+    actual = ordered_tile_reduce(values, max_group_size=max_group_size, combine_fn=torch.add)
+    assert_bitwise(actual, torch.tensor([2, 2, 2, 0], dtype=dtype), "halving tree")
 
 
 @pytest.mark.parametrize("dtype", _DTYPES)
@@ -242,8 +215,8 @@ def test_collector_rejects_missing_or_empty_vector(shape):
     "positions, expected",
     [
         ((0, 1, 2, 3), 1.0),  # Eight-element sequential fold, not adjacent pairs.
-        ((0, 8, 128, 136), 2.0),  # Pair groups 0+16 and 1+17 first.
-        ((0, 256, 512, 768), 2.0),  # Pair sections 0+2 and 1+3 first.
+        ((0, 8, 512, 520), 2.0),  # Pair groups 0+64 and 1+65 first.
+        ((0, 256, 512, 768), 2.0),  # Pair groups 0+64 and 32+96 first.
     ],
 )
 def test_fixed_tile_tree_has_explicit_nonassociative_pairs(positions, expected):
@@ -299,51 +272,45 @@ def test_small_tile_tree_preserves_sequential_groups(block_size):
 
 
 @pytest.mark.parametrize("block_size", _TILE_WIDTHS[5:])
-def test_variable_width_sections_preserve_nonassociative_pairs(block_size):
-    """Regardless of width, the four sections merge as (s0+s2)+(s1+s3)."""
+def test_variable_width_tree_preserves_half_pairing(block_size):
+    """The first tree level pairs positions separated by half the tile width."""
     values = torch.zeros(block_size, dtype=torch.float32)
     values[:: block_size // 4] = torch.tensor([1e20, 1.0, -1e20, 1.0])
     assert_bitwise(
         ordered_tile_reduce(values, **_TREE_CONFIG, combine_fn=torch.add),
         torch.tensor(2.0),
-        "four-section pairing",
+        "lower-half/upper-half pairing",
     )
 
 
 @pytest.mark.parametrize("seed", (415, 438, 939))
 @pytest.mark.parametrize("block_size", _TILE_WIDTHS)
 @pytest.mark.parametrize("max_group_size", (1, 8, 64))
-def test_four_sections_keep_previous_addition_tree(seed, block_size, max_group_size):
-    """Freeze the old four-section tree, including 1024/8/4 and the small paths."""
+def test_tile_tree_matches_explicit_pairs(seed, block_size, max_group_size):
+    """Cross-check a list of explicit operand pairs across widths, groups and batches."""
     generator = torch.Generator().manual_seed(seed)
     storage = torch.randn((2, 3, 2 * block_size), generator=generator)
     storage *= torch.pow(2.0, torch.randint(-30, 30, storage.shape, generator=generator))
     values = storage[..., ::2]
     group_size = min(block_size, max_group_size)
     n_groups = block_size // group_size
-    groups = values.reshape(2, 3, n_groups, group_size)
-    old_subtotal = groups[..., 0]
-    for offset in range(1, group_size):
-        old_subtotal = old_subtotal + groups[..., offset]
-    if n_groups == 1:
-        expected = old_subtotal[..., 0]
-    elif n_groups == 2:
-        expected = old_subtotal[..., 0] + old_subtotal[..., 1]
-    else:
-        sections = old_subtotal.reshape(2, 3, 4, n_groups // 4)
-        distance = n_groups // 8
-        while distance:
-            sections = sections[..., :distance] + sections[..., distance:]
-            distance //= 2
-        sections = sections[..., 0]
-        pairs = sections[..., :2] + sections[..., 2:]
-        expected = pairs[..., 0] + pairs[..., 1]
+    totals = []
+    for group in range(n_groups):
+        start = group * group_size
+        total = values[..., start]
+        for offset in range(1, group_size):
+            total = total + values[..., start + offset]
+        totals.append(total)
+    while len(totals) > 1:
+        halfway = len(totals) // 2
+        totals = [
+            left + right for left, right in zip(totals[:halfway], totals[halfway:], strict=True)
+        ]
+    expected = totals[0]
     assert_bitwise(
-        ordered_tile_reduce(
-            values, max_group_size=max_group_size, section_count=4, combine_fn=torch.add
-        ),
+        ordered_tile_reduce(values, max_group_size=max_group_size, combine_fn=torch.add),
         expected,
-        "unchanged four-section tree",
+        "explicit pair sequence",
     )
 
 

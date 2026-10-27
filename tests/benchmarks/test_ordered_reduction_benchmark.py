@@ -59,7 +59,7 @@ def test_scheduling_sweep_preserves_one_tree_and_deduplicates_baselines():
     )
     report = plan(args)
     for case in report["cases"]:
-        assert case["tree"] == dict(block_size=2048, max_group_size=8, section_count=4)
+        assert case["tree"] == dict(block_size=2048, max_group_size=8)
         assert case["padding"] == 37
         names = [p["name"] for p in case["providers"]]
         assert len(names) == len(set(names))

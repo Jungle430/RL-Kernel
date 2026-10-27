@@ -31,9 +31,7 @@ def test_loaded_prefix_masks_poisoned_suffix_without_mutation(
         actual = reduce(values, length=length, compute_dtype=compute_dtype)
         padded = torch.full((2, width), identity, dtype=resolved_dtype)
         padded[:, :length] = values[:, :length].to(resolved_dtype)
-        expected = ordered_tile_reduce(
-            padded, max_group_size=8, section_count=4, combine_fn=combine
-        )
+        expected = ordered_tile_reduce(padded, max_group_size=8, combine_fn=combine)
         assert_bitwise(actual, expected)
         # The valid numbers above have an exact answer under any association.
         native = torch.sum if operation == "sum" else torch.prod
@@ -44,16 +42,16 @@ def test_loaded_prefix_masks_poisoned_suffix_without_mutation(
         assert_bitwise(reduce(values), reduce(values, length=length))
 
 
-def test_loaded_prefix_keeps_width_even_when_pointer_tile_size_is_supplied():
-    """Frozen cancellation case: width 64 yields 0, while a 32-wide tree yields 2."""
+def test_loaded_prefix_ignores_pointer_tile_size():
+    """A loaded tree returns 2; two 16-wide pointer tiles lose both unit terms."""
     values = torch.zeros(64)
     values[[0, 8, 16, 24]] = torch.tensor([1e20, 1, -1e20, 1])
     values[32:] = float("nan")
-    assert_bitwise(ordered.sum(values, length=32), torch.tensor(0.0))
-    assert_bitwise(ordered.sum(values, length=32, block_size=32), torch.tensor(0.0))
+    assert_bitwise(ordered.sum(values, length=32), torch.tensor(2.0))
+    assert_bitwise(ordered.sum(values, length=32, block_size=16), torch.tensor(2.0))
     assert_bitwise(ordered.sum(values[:32]), torch.tensor(2.0))
     assert_bitwise(
-        ordered.sum(values, length=32, from_memory=True, block_size=32), torch.tensor(2.0)
+        ordered.sum(values, length=32, from_memory=True, block_size=16), torch.tensor(0.0)
     )
 
 

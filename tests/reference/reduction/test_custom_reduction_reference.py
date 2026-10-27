@@ -94,10 +94,12 @@ def test_generic_callback_retains_the_declared_loaded_tree_and_memory_seed():
     values[[0, 8, 16, 24]] = torch.tensor([1e20, 1, -1e20, 1])
     values[32:] = float("nan")
     options = dict(combine_fn=caller_add, identity=0)
-    assert_bitwise(ordered.reduce(values, length=32, **options), torch.tensor(0.0))
+    # The loaded tree cancels large terms before adding ones. Two memory
+    # tiles of 16 values each round away their one before their totals merge.
+    assert_bitwise(ordered.reduce(values, length=32, **options), torch.tensor(2.0))
     assert_bitwise(
-        ordered.reduce(values, length=32, from_memory=True, block_size=32, **options),
-        torch.tensor(2.0),
+        ordered.reduce(values, length=32, from_memory=True, block_size=16, **options),
+        torch.tensor(0.0),
     )
     values = torch.tensor([-0.0])
     assert_bitwise(ordered.reduce(values, **options), values[0])

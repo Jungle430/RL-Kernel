@@ -52,7 +52,6 @@ def prefix_partials_probe(
         tile,
         BLOCK_SIZE=BLOCK_SIZE,
         MAX_GROUP_SIZE=8,
-        SECTION_COUNT=4,
         COMBINE_FN=COMBINE_FN,
         IDENTITY=IDENTITY,
         COMPUTE_DTYPE=tl.float32,

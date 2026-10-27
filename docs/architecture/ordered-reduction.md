@@ -244,7 +244,6 @@ Defaults come from `contracts/operators/ordered_reduction.py`:
 | `COMPUTE_DTYPE` | `compute_dtype` | `None` | Input dtype, unless explicitly overridden |
 | `BLOCK_SIZE` | `block_size` | 1024 | Pointer/memory path's arithmetic tile width only |
 | `MAX_GROUP_SIZE` | `max_group_size` | 8 | Maximum adjacent values folded sequentially inside each tile |
-| `SECTION_COUNT` | `section_count` | 4 | Maximum sections used to combine group totals |
 
 All arithmetic sizes must be positive powers of two. The loaded path uses its
 vector width instead of `BLOCK_SIZE`. For matching nondefault pointer references:
@@ -253,17 +252,17 @@ vector width instead of `BLOCK_SIZE`. For matching nondefault pointer references
 # Inside @triton.jit:
 total = ordered.sum(
     ptr, length=V, COMPUTE_DTYPE=tl.float32,
-    BLOCK_SIZE=2048, MAX_GROUP_SIZE=16, SECTION_COUNT=8,
+    BLOCK_SIZE=2048, MAX_GROUP_SIZE=16,
 )
 
 # In eager PyTorch:
 expected = reference.sum(
     x, length=V, from_memory=True, compute_dtype=torch.float32,
-    block_size=2048, max_group_size=16, section_count=8,
+    block_size=2048, max_group_size=16,
 )
 ```
 
-Widths, group/section sizes and cast points can change rounding. Keep them fixed
+Widths, group sizes and cast points can change rounding. Keep them fixed
 across paths requiring identical bits. `COMPUTE_DTYPE` controls input conversion
 and arithmetic, not just the output cast. No automatic widening is applied;
 choose an integer accumulator to count booleans. Backend-supported types are
@@ -308,7 +307,7 @@ supported. Strided/paged pointer gathers remain caller-owned.
 Use `sum(values)` or `product(values)` after computing and masking one fixed-width
 tile. Separate programs can store unseeded tile results in canonical slots and
 then use the partial merge helpers. Serial and parallel paths must keep the
-same tile boundaries, group/section sizes, dtype and outer seed. Convenience and generic
+same tile boundaries, group sizes, dtype and outer seed. Convenience and generic
 exports cover loaded values, complete memory vectors and stored partials.
 
 ## Performance comparison
@@ -378,9 +377,9 @@ clock and power settings alongside the report when comparing separate machines/r
 
 `--warps`, `--pipeline-stages` (0 means unhinted) and `--merge-unroll` tune execution
 without intentionally changing arithmetic; bitwise checks enforce that boundary.
-`--block-size`, `--max-group-size` and `--section-count` are **one arithmetic
-configuration per run**. Changing them can change rounding and requires a new
-numerical qualification and coordinated training/inference configuration. They
+`--block-size` and `--max-group-size` select **one arithmetic configuration per run**.
+Changing them can change rounding and requires a new numerical qualification and
+coordinated training/inference configuration. They
 must not be switched by shape-dependent autotuning under an unchanged contract.
 
 Performance results on target devices are still pending. PR reports should show
@@ -445,10 +444,17 @@ Its last dimension must be nonempty. It does not implement another tree.
 
 1. Split a tile into adjacent groups of `min(BLOCK_SIZE, MAX_GROUP_SIZE)` values.
    Fold each group left to right, starting from its first value.
-2. Split group totals into `min(N_GROUPS, SECTION_COUNT)` equal sections.
-   Repeatedly pair each section's lower and upper halves until one total remains.
-3. Merge section totals using the same halving-distance pairs. Four sections
-   produce `(s0 + s2) + (s1 + s3)` for addition.
+2. Repeatedly pair corresponding entries from the lower and upper halves of
+   **all** group totals until one value remains. For eight group totals, the
+   first level combines `g0+g4`, `g1+g5`, `g2+g6`, `g3+g7`; the next combines
+   result positions `0+2`, `1+3`, and the last combines `0+1`.
+   A single group returns directly without an extra identity operation.
+
+One halving loop defines the whole group tree; there is no section-count option.
+This replaces the earlier four-section tree and can change rounded results for
+identical inputs. The PyTorch reference uses the new tree too. Earlier numerical
+and performance results do not qualify this changed tree; GPU conformance,
+independent accuracy and timing must be checked again.
 
 Each tree step explicitly selects its lower/upper operands and calls the binary
 combiner. Triton uses `tl.reduce` only on an axis of exactly two entries, with
@@ -456,9 +462,9 @@ no implicit dtype widening. Built-in and caller-owned JIT combiners share this
 path. A compile-time Python namespace exposes the original function to Triton
 3.7.1 without turning it into a bound method; it adds no GPU operation.
 PyTorch explicitly selects the same operand slices. The two-entry lowering cannot
-choose a different whole-section tree because each level remains explicit.
+choose a different whole-group tree because each level remains explicit.
 A one-entry stage passes through without adding an identity. Neither delegates
-the complete tile or section tree to an unconstrained native reduction.
+the complete tile tree to an unconstrained native reduction.
 
 The callback adapter targets Triton 3.7.1. Compile-time tree sizes are converted
 to Python `int` before `bit_length()` so interpreter-mode constexpr values use
@@ -514,8 +520,8 @@ python -m pytest tests/reference/reduction tests/backends/shared/triton/reductio
 
 Coverage includes public XOR/modular-add callbacks with independent scalar oracles,
 type-based public dispatch, loaded-prefix masks with poisoned suffixes, invalid
-lengths, retained loaded width, frozen nonassociative examples, the original 1024/8/4 tree,
-small and large tiles, alternative group/section sizes, strided reference inputs,
+lengths, retained loaded width, frozen nonassociative examples, the single halving
+tree at width 1024, small and large tiles, alternative group sizes, strided reference inputs,
 tails, empty vectors, custom seeds, compute precision, and serial/pipelined/parallel
 conformance. Dedicated prefix tests compare the same values across batch sizes,
 row positions and physical strides with NaN-poisoned suffixes. The GPU matrix

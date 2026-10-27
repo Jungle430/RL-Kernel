@@ -17,7 +17,6 @@ def _row_sum(
     BLOCK: tl.constexpr,
     ORDERED: tl.constexpr,
     GROUP: tl.constexpr,
-    SECTIONS: tl.constexpr,
     PIPELINE: tl.constexpr,
 ):
     row = tl.program_id(0).to(tl.int64)
@@ -28,7 +27,6 @@ def _row_sum(
             COMPUTE_DTYPE=tl.float32,
             BLOCK_SIZE=BLOCK,
             MAX_GROUP_SIZE=GROUP,
-            SECTION_COUNT=SECTIONS,
             PIPELINE_STAGES=PIPELINE,
         )
     else:
@@ -47,14 +45,13 @@ def _partial_sum(
     BLOCK: tl.constexpr,
     ORDERED: tl.constexpr,
     GROUP: tl.constexpr,
-    SECTIONS: tl.constexpr,
 ):
     row = tl.program_id(0).to(tl.int64)
     tile = tl.program_id(1).to(tl.int64)
     cols = tile * BLOCK + tl.arange(0, BLOCK)
     values = tl.load(x + row * stride + cols, cols < LENGTH, other=0).to(tl.float32)
     if ORDERED:
-        total = ordered.sum(values, MAX_GROUP_SIZE=GROUP, SECTION_COUNT=SECTIONS)
+        total = ordered.sum(values, MAX_GROUP_SIZE=GROUP)
     else:
         total = tl.sum(values, axis=0)
     tl.store(partials + row * tl.cdiv(LENGTH, BLOCK) + tile, total)
@@ -107,7 +104,6 @@ def make_call(x, out, length, provider, tree):
                 block,
                 is_ordered,
                 tree["max_group_size"],
-                tree["section_count"],
                 provider["pipeline"],
                 **options,
             )
@@ -125,7 +121,6 @@ def make_call(x, out, length, provider, tree):
             block,
             is_ordered,
             tree["max_group_size"],
-            tree["section_count"],
             **options,
         )
         _merge_sum[(rows,)](

@@ -104,7 +104,6 @@ def _whole_vector_reference(values, combine, identity, compute_dtype=torch.float
         values,
         block_size=1024,
         max_group_size=8,
-        section_count=4,
         combine_fn=combine,
         identity=identity,
         initial=identity,
@@ -451,10 +450,9 @@ def test_tile_default_compute_dtype_preserves_input_bits_and_rounding(operation,
 
 @pytest.mark.parametrize("block_size", (16, 1024))
 @pytest.mark.parametrize("max_group_size", (1, 8, 32))
-@pytest.mark.parametrize("section_count", (1, 4, 8))
 @pytest.mark.parametrize("operation,combine,identity", _OPERATIONS)
 def test_tile_helpers_accept_caller_selected_tree(
-    block_size, max_group_size, section_count, operation, combine, identity
+    block_size, max_group_size, operation, combine, identity
 ):
     """Public tree overrides must reach the reduction, including small-tile limits."""
     import triton.language as tl
@@ -476,7 +474,6 @@ def test_tile_helpers_accept_caller_selected_tree(
         values,
         compute_dtype=torch.float32,
         max_group_size=max_group_size,
-        section_count=section_count,
     )
     actual = torch.empty_like(expected)
     configured_tile_probe[(3,)](
@@ -486,7 +483,6 @@ def test_tile_helpers_accept_caller_selected_tree(
         COMPUTE_DTYPE=tl.float32,
         REDUCE_FN=(primitives.sum if operation == "sum" else primitives.product),
         MAX_GROUP_SIZE=max_group_size,
-        SECTION_COUNT=section_count,
         **_launch_options(4),
     )
     assert_bitwise(actual, expected, f"embedded {operation}_tile tree parameters")
@@ -516,13 +512,13 @@ def test_enclosing_kernel_warp_count_does_not_change_arithmetic(operation, combi
 
 
 @pytest.mark.parametrize(
-    "block_size,max_group_size,section_count",
-    ((1, 8, 4), (16, 1, 8), (16, 4, 1), (1024, 8, 4), (2048, 16, 8)),
+    "block_size,max_group_size",
+    ((1, 8), (16, 1), (16, 4), (1024, 8), (2048, 16)),
 )
 @pytest.mark.parametrize("operation,combine,identity", _OPERATIONS)
 @pytest.mark.parametrize("pipeline_stages", (None, 3))
 def test_vector_helpers_accept_caller_selected_tiles_and_tree(
-    block_size, max_group_size, section_count, operation, combine, identity, pipeline_stages
+    block_size, max_group_size, operation, combine, identity, pipeline_stages
 ):
     """Loop scheduling preserves the configured tree on empty vectors, tiles and tails."""
     import triton.language as tl
@@ -548,7 +544,6 @@ def test_vector_helpers_accept_caller_selected_tiles_and_tree(
             compute_dtype=torch.float32,
             block_size=block_size,
             max_group_size=max_group_size,
-            section_count=section_count,
             from_memory=True,
         )
         before = values.clone()
@@ -561,7 +556,6 @@ def test_vector_helpers_accept_caller_selected_tiles_and_tree(
             REDUCE_FN=(primitives.sum if operation == "sum" else primitives.product),
             BLOCK_SIZE=block_size,
             MAX_GROUP_SIZE=max_group_size,
-            SECTION_COUNT=section_count,
             PIPELINE_STAGES=pipeline_stages,
             **_launch_options(4),
         )
@@ -637,9 +631,7 @@ def test_precision_is_exposed_by_embedded_helpers(
     block_size = 1 << (length - 1).bit_length()
     mapped = values.to(compute_dtype) * 2.0 + 1.0
     mapped = torch.nn.functional.pad(mapped, (0, block_size - length), value=identity)
-    expected_tile = ordered_tile_reduce(
-        mapped, max_group_size=8, section_count=4, combine_fn=combine
-    )
+    expected_tile = ordered_tile_reduce(mapped, max_group_size=8, combine_fn=combine)
     composed_tile_probe[(3,)](
         values,
         actual,

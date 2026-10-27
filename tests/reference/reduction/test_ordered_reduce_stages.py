@@ -39,7 +39,6 @@ def test_partial_serial_and_merge_preserve_seed_padding_and_rounding(dtype, oper
     config = dict(
         block_size=4,
         max_group_size=8,
-        section_count=4,
         combine_fn=combine,
         identity=identity,
         compute_dtype=dtype,
@@ -102,7 +101,7 @@ def test_tile_helpers_cast_before_arithmetic_and_do_not_insert_a_seed(helper):
 
 @pytest.mark.parametrize("helper", (ordered_sum, ordered_product))
 @pytest.mark.parametrize("dtype", (torch.float16, torch.bfloat16, torch.float32, torch.float64))
-def test_tile_helpers_apply_requested_group_and_section_tree(helper, dtype):
+def test_tile_helpers_apply_requested_group_size(helper, dtype):
     if helper is ordered_sum:
         large = 2 / torch.finfo(dtype).eps
         values = torch.tensor([large, 1, -large, 1], dtype=dtype)
@@ -118,7 +117,7 @@ def test_tile_helpers_apply_requested_group_and_section_tree(helper, dtype):
     for group_size, result in zip((4, 1), expected, strict=True):
         for dtype_kwargs in ({}, {"compute_dtype": None}, {"compute_dtype": dtype}):
             assert_bitwise(
-                helper(values, max_group_size=group_size, section_count=4, **dtype_kwargs),
+                helper(values, max_group_size=group_size, **dtype_kwargs),
                 torch.tensor(result, dtype=dtype),
             )
 
@@ -141,7 +140,6 @@ def test_empty_stage_inputs_preserve_typed_seed_bits():
             seed,
             block_size=16,
             max_group_size=8,
-            section_count=4,
             combine_fn=reduce_add,
             identity=0,
             compute_dtype=torch.float64,

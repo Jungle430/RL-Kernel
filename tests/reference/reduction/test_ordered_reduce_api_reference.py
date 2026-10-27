@@ -130,7 +130,7 @@ def test_public_reference_infers_input_dtype_without_widening(
     "positions,expected",
     (
         ((0, 1, 2, 3), 1.0),
-        ((0, 8, 128, 136), 2.0),
+        ((0, 8, 512, 520), 2.0),
         ((0, 256, 512, 768), 2.0),
         ((0, 1024, 2048, 3072), 1.0),
     ),
@@ -145,20 +145,18 @@ def test_public_sum_keeps_declared_tile_tree_and_ascending_merge(positions, expe
 
 
 @pytest.mark.parametrize(
-    "block_size,max_group_size,section_count,positions,expected",
+    "block_size,max_group_size,positions,expected",
     (
-        (16, 8, 4, (0, 8, 16, 24), 0.0),
-        (32, 8, 4, (0, 8, 16, 24), 2.0),
-        (32, 8, 4, (0, 1, 2, 3), 1.0),
-        (32, 1, 4, (0, 1, 2, 3), 2.0),
-        (64, 8, 4, (0, 8, 16, 24), 0.0),
-        (64, 8, 8, (0, 8, 16, 24), 2.0),
+        (16, 8, (0, 8, 16, 24), 0.0),
+        (32, 8, (0, 8, 16, 24), 2.0),
+        (32, 8, (0, 1, 2, 3), 1.0),
+        (32, 1, (0, 1, 2, 3), 2.0),
     ),
 )
 def test_public_sum_configuration_controls_rounding(
-    block_size, max_group_size, section_count, positions, expected
+    block_size, max_group_size, positions, expected
 ):
-    """Each adjacent pair changes one parameter and has independently derived expected bits."""
+    """Tile width and group size change rounding; expected bits are derived independently."""
     values = torch.zeros(64)
     values[list(positions)] = torch.tensor([1e20, 1, -1e20, 1])
     actual = ordered_sum(
@@ -166,7 +164,6 @@ def test_public_sum_configuration_controls_rounding(
         compute_dtype=torch.float32,
         block_size=block_size,
         max_group_size=max_group_size,
-        section_count=section_count,
         from_memory=True,
     )
     assert_bitwise(actual, torch.tensor(expected))
@@ -182,7 +179,6 @@ def test_public_product_configuration_controls_intermediate_overflow(max_group_s
         compute_dtype=torch.float32,
         block_size=32,
         max_group_size=max_group_size,
-        section_count=4,
         from_memory=True,
     )
     assert_bitwise(actual, torch.tensor(expected))
@@ -190,11 +186,11 @@ def test_public_product_configuration_controls_intermediate_overflow(max_group_s
 
 @pytest.mark.parametrize("reduce,native,identity", _OPERATIONS)
 @pytest.mark.parametrize(
-    "block_size,max_group_size,section_count",
-    ((1, 8, 4), (16, 1, 8), (16, 4, 1), (1024, 8, 4), (2048, 16, 8)),
+    "block_size,max_group_size",
+    ((1, 8), (16, 1), (16, 4), (1024, 8), (2048, 16)),
 )
 def test_public_configurations_cover_empty_strided_vectors_and_tails(
-    reduce, native, identity, block_size, max_group_size, section_count
+    reduce, native, identity, block_size, max_group_size
 ):
     """Keep an independent exact-math oracle for both public configured operations."""
     for length in sorted({0, block_size - 1, block_size, 2 * block_size + 3}):
@@ -210,7 +206,6 @@ def test_public_configurations_cover_empty_strided_vectors_and_tails(
             compute_dtype=torch.float32,
             block_size=block_size,
             max_group_size=max_group_size,
-            section_count=section_count,
             from_memory=True,
         )
         assert_bitwise(actual, native(values, dim=-1).float())
@@ -218,7 +213,7 @@ def test_public_configurations_cover_empty_strided_vectors_and_tails(
 
 
 @pytest.mark.parametrize("reduce,native,identity", _OPERATIONS)
-@pytest.mark.parametrize("parameter", ("block_size", "max_group_size", "section_count"))
+@pytest.mark.parametrize("parameter", ("block_size", "max_group_size"))
 @pytest.mark.parametrize("size", (-1, 0, 3))
 @pytest.mark.parametrize("shape", ((2, 17), (2, 0), (0, 17)))
 def test_public_configuration_validation_includes_empty_inputs(

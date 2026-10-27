@@ -6,7 +6,8 @@ sum/product accept either loaded numeric vectors or scalar pointers. Input type
 selects the path at compile time. Optional length masks a loaded prefix without
 resizing its tree; pointer input requires length and uses fixed-width tiles.
 COMPUTE_DTYPE=None retains input precision. Pointer-only BLOCK_SIZE and
-PIPELINE_STAGES configure loading; MAX_GROUP_SIZE and SECTION_COUNT set the tree.
+PIPELINE_STAGES configure loading; MAX_GROUP_SIZE sets the initial sequential groups.
+Group totals follow one fixed lower-half/upper-half tree to a scalar.
 
 sum_partials/product_partials fold stored tile results in ascending order.
 All helpers return scalars without allocating, storing or launching kernels.

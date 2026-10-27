@@ -33,7 +33,7 @@ from typing import Protocol
 
 import torch
 
-from rl_engine.contracts.operators.ordered_reduction import MAX_GROUP_SIZE, SECTION_COUNT, TILE_SIZE
+from rl_engine.contracts.operators.ordered_reduction import MAX_GROUP_SIZE, TILE_SIZE
 
 
 class _Combine(Protocol):
@@ -63,16 +63,15 @@ def reduce_multiply(left: torch.Tensor, right: torch.Tensor) -> torch.Tensor:
 
 
 def ordered_tile_reduce(
-    values: torch.Tensor, *, max_group_size: int, section_count: int, combine_fn: _Combine
+    values: torch.Tensor, *, max_group_size: int, combine_fn: _Combine
 ) -> torch.Tensor:
     """Apply the declared binary-combine tree to [..., 2**n] values.
 
     First fold up to max_group_size adjacent elements sequentially, starting
-    with element 0 rather than a seed. Both max_group_size and section_count
-    must be positive powers of two. Divide the group totals into
-    min(n_groups, section_count) equal sections, then repeatedly combine each
-    section's lower and upper halves. Merge section totals in the same way.
-    Four sections retain (s0+s2)+(s1+s3) for addition. One group returns directly.
+    with element 0 rather than a seed. max_group_size must be a positive power
+    of two. Repeatedly combine corresponding entries from the lower and upper
+    halves of all group totals until one value remains. Eight group totals pair
+    0+4, 1+5, 2+6, 3+7 first, then 0+2, 1+3, then 0+1. One group returns directly.
     Widths below max_group_size form one shorter sequential group.
     No seed or dtype conversion is inserted in this tile tree. The caller
     supplies values in the required compute dtype; combine_fn must preserve
@@ -94,23 +93,14 @@ def ordered_tile_reduce(
         raise ValueError("ordered tile width must be a positive power of two")
     if max_group_size <= 0 or (max_group_size & (max_group_size - 1)) != 0:
         raise ValueError("maximum group size must be a positive power of two")
-    if section_count <= 0 or (section_count & (section_count - 1)) != 0:
-        raise ValueError("section count must be a positive power of two")
     group_size = min(block_size, max_group_size)
     n_groups = block_size // group_size
     groups = torch.arange(0, n_groups, device=values.device) * group_size
     subtotal = values.index_select(-1, groups)
     for offset in range(1, group_size):
         subtotal = combine_fn(subtotal, values.index_select(-1, groups + offset))
-    n_sections = min(n_groups, section_count)
-    section_size = n_groups // n_sections
-    # Split each section into lower/upper halves, then combine matching entries.
-    for shift in range(section_size.bit_length() - 2, -1, -1):
-        subtotal = subtotal.reshape(*values.shape[:-1], n_sections, 2, 1 << shift)
-        subtotal = combine_fn(subtotal[..., 0, :], subtotal[..., 1, :])
-    subtotal = subtotal.reshape(*values.shape[:-1], n_sections)
-    # Merge section totals by halving distance: four sections pair 0+2, 1+3.
-    for shift in range(n_sections.bit_length() - 2, -1, -1):
+    # Pair the lower/upper halves of all group totals, retaining batch dimensions.
+    for shift in range(n_groups.bit_length() - 2, -1, -1):
         subtotal = subtotal.reshape(*values.shape[:-1], 2, 1 << shift)
         subtotal = combine_fn(subtotal[..., 0, :], subtotal[..., 1, :])
     return subtotal.reshape(values.shape[:-1])
@@ -122,7 +112,6 @@ def ordered_reduce_partial(
     *,
     block_size: int,
     max_group_size: int,
-    section_count: int,
     combine_fn: _Combine,
     identity: bool | int | float,
     compute_dtype: torch.dtype,
@@ -154,7 +143,6 @@ def ordered_reduce_partial(
     return ordered_tile_reduce(
         tile,
         max_group_size=max_group_size,
-        section_count=section_count,
         combine_fn=combine_fn,
     )
 
@@ -165,7 +153,6 @@ def ordered_reduce_serial(
     *,
     block_size: int,
     max_group_size: int,
-    section_count: int,
     combine_fn: _Combine,
     identity: bool | int | float,
     compute_dtype: torch.dtype,
@@ -184,8 +171,6 @@ def ordered_reduce_serial(
         raise ValueError("block_size must be a positive power of two")
     if max_group_size <= 0 or (max_group_size & (max_group_size - 1)) != 0:
         raise ValueError("maximum group size must be a positive power of two")
-    if section_count <= 0 or (section_count & (section_count - 1)) != 0:
-        raise ValueError("section count must be a positive power of two")
     length = values.shape[-1]
     n_tiles = (length + block_size - 1) // block_size
     total = torch.as_tensor(initial, device=values.device, dtype=compute_dtype)
@@ -196,7 +181,6 @@ def ordered_reduce_serial(
             tile,
             block_size=block_size,
             max_group_size=max_group_size,
-            section_count=section_count,
             combine_fn=combine_fn,
             identity=identity,
             compute_dtype=compute_dtype,
@@ -249,7 +233,6 @@ def reduce(
     compute_dtype: torch.dtype | None = None,
     block_size: int = TILE_SIZE,
     max_group_size: int = MAX_GROUP_SIZE,
-    section_count: int = SECTION_COUNT,
 ) -> torch.Tensor:
     """Eager fixed-order reduction with a caller-owned PyTorch binary function.
 
@@ -272,7 +255,7 @@ def reduce(
 
     compute_dtype=None keeps input dtype; explicit precision casts inputs before
     combining. block_size defaults to 1024 and only affects the memory path;
-    max_group_size/section_count default to 8/4. All sizes are positive powers of
+    max_group_size defaults to 8. Both sizes are positive powers of
     two. Inputs are never mutated. Run eagerly; differentiable operations retain
     PyTorch's autograd graph. The fixed-order guarantee covers forward arithmetic;
     backward order must be specified and validated separately. A same-tree
@@ -291,7 +274,6 @@ def reduce(
             initial=identity,
             block_size=block_size,
             max_group_size=max_group_size,
-            section_count=section_count,
             combine_fn=combine_fn,
             identity=identity,
             compute_dtype=compute_dtype,
@@ -307,7 +289,6 @@ def reduce(
         return ordered_tile_reduce(
             selected,
             max_group_size=max_group_size,
-            section_count=section_count,
             combine_fn=combine_fn,
         )
 
@@ -320,7 +301,6 @@ def sum(
     compute_dtype: torch.dtype | None = None,
     block_size: int = TILE_SIZE,
     max_group_size: int = MAX_GROUP_SIZE,
-    section_count: int = SECTION_COUNT,
 ) -> torch.Tensor:
     """Eager reference for Triton's sum, with explicit loaded/storage semantics.
 
@@ -341,7 +321,6 @@ def sum(
         block_size: Positive power-of-two tile width for from_memory=True only,
             default 1024. Loaded values always retain their supplied width.
         max_group_size: Positive power-of-two adjacent group size, default 8.
-        section_count: Positive power-of-two maximum section count, default 4.
 
     Returns a tensor shaped [...] in compute_dtype on the input device.
     An empty prefix returns zero; a loaded vector must still have positive width.
@@ -360,7 +339,6 @@ def sum(
         compute_dtype=compute_dtype,
         block_size=block_size,
         max_group_size=max_group_size,
-        section_count=section_count,
     )
 
 
@@ -372,7 +350,6 @@ def product(
     compute_dtype: torch.dtype | None = None,
     block_size: int = TILE_SIZE,
     max_group_size: int = MAX_GROUP_SIZE,
-    section_count: int = SECTION_COUNT,
 ) -> torch.Tensor:
     """Eager reference for Triton's product; use one for padding and the memory seed.
 
@@ -385,7 +362,7 @@ def product(
     dimensions and the resolved compute dtype, without modifying inputs.
 
     block_size defaults to 1024 and only affects the memory path; max_group_size
-    and section_count default to 8/4 for either path. compute_dtype=None uses
+    defaults to 8 for either path. compute_dtype=None uses
     input precision without widening. Fixed order does not prevent rounding,
     underflow or overflow; independent accuracy checks are still needed.
     """
@@ -398,7 +375,6 @@ def product(
         compute_dtype=compute_dtype,
         block_size=block_size,
         max_group_size=max_group_size,
-        section_count=section_count,
     )
 
 
@@ -506,7 +482,6 @@ def ordered_reduce(
     *,
     block_size: int,
     max_group_size: int,
-    section_count: int,
     combine_fn: _Combine,
     identity: bool | int | float,
     initial: bool | int | float | torch.Tensor,
@@ -535,7 +510,6 @@ def ordered_reduce(
                 tile,
                 block_size=block_size,
                 max_group_size=max_group_size,
-                section_count=section_count,
                 combine_fn=combine_fn,
                 identity=identity,
                 compute_dtype=compute_dtype,
