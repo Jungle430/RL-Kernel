@@ -461,11 +461,16 @@ def test_compute_dtype_rounds_each_add_in_tiles_and_merge(compute_dtype, bits):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="A CUDA or ROCm GPU is required")
-@pytest.mark.parametrize("block_size", (4, 32, 256))
+@pytest.mark.parametrize("block_size", (4, 32, 256, 1024))
 @pytest.mark.parametrize("max_group_size", (1, 4, 16, 64))
 @pytest.mark.parametrize("num_warps", (4, 8))
 def test_explicit_group_sizes_match_reference(block_size, max_group_size, num_warps):
-    """The single tree agrees across backends for short and long initial groups."""
+    """Group-axis extraction preserves the same tree across layouts and warp counts.
+
+    Cover singleton groups, one group, groups shorter than a warp, and groups
+    spanning multiple lanes. Distinct random values detect cross-group mixing;
+    cancellation and negative zero pin the fold's rounding and seed behavior.
+    """
     from rl_engine.backends.shared.triton.reduction.ordered_reduce import reduce_add
     from tests.helpers.ordered_reduce_kernels import tile_reduce_probe
 

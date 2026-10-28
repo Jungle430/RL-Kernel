@@ -129,13 +129,20 @@ def ordered_tile_reduce(
     )
     GROUP_SIZE: tl.constexpr = min(BLOCK_SIZE, MAX_GROUP_SIZE)
     N_GROUPS: tl.constexpr = BLOCK_SIZE // GROUP_SIZE
-    # Keep indexed extraction: split-based extraction caused LLVM O3 compilation
-    # timeouts with three-stage pipelining on H100/Triton 3.7.1. The group fold
-    # below retains the declared operand order without requiring that layout.
-    groups = tl.arange(0, N_GROUPS) * GROUP_SIZE
-    subtotal = tl.gather(values, groups, axis=0)
+    # Keep each adjacent group on its own row. Gather along that short axis,
+    # so the compiler sees that extraction never reaches another group. A flat
+    # gather hides this bound and can repeatedly stage the whole tile in shared
+    # memory. This is a layout change only: group g still folds g*GROUP_SIZE+k
+    # for k=0, 1, ..., GROUP_SIZE-1, with the same dtype and rounding points.
+    # Avoid split-based extraction, which previously caused LLVM O3 timeouts
+    # with three-stage pipelining on H100/Triton 3.7.1.
+    grouped = tl.reshape(values, (N_GROUPS, GROUP_SIZE))
+    first = tl.full((N_GROUPS, 1), 0, tl.int32)
+    subtotal = tl.gather(grouped, first, axis=1)
     for offset in tl.static_range(1, GROUP_SIZE):
-        subtotal = COMBINE_FN(subtotal, tl.gather(values, groups + offset, axis=0))
+        index = tl.full((N_GROUPS, 1), offset, tl.int32)
+        subtotal = COMBINE_FN(subtotal, tl.gather(grouped, index, axis=1))
+    subtotal = tl.reshape(subtotal, (N_GROUPS,))
     # Combine the lower and upper halves of all remaining group totals.
     # Each reduced axis has exactly two entries, so every operand pair is fixed.
     # int() also supports interpreter constexpr wrappers before bit_length().

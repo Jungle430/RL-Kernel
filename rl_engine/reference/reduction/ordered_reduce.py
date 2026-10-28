@@ -72,13 +72,13 @@ def ordered_tile_reduce(
     supplies values in the required compute dtype; combine_fn must preserve
     their shape and dtype. All combine pairs are explicit.
 
-    Steps and local names mirror Triton's ordered_tile_reduce. Lowercase sizes
-    correspond to its constexpr values. PyTorch additionally accepts leading
-    batch dimensions; only the last dimension participates in the tree.
-    index_select corresponds to tl.gather. The two slices select the same
-    halves as Triton's two-entry axis reduction for every combiner, followed
-    by one direct combine_fn call. Keep these explicit
-    slices as an independent expression of the operand pairs.
+    Lowercase sizes correspond to Triton's constexpr values. PyTorch additionally
+    accepts leading batch dimensions; only the last dimension participates in
+    the tree. Flat index_select keeps an independent expression of the same
+    operands that Triton extracts along the short axis of a grouped view.
+    The two slices select the same halves as Triton's two-entry axis reduction,
+    followed by one direct combine_fn call for every combiner. Keep these
+    explicit slices as an independent expression of the operand pairs.
     Neither implementation delegates the tree to a native reduction.
     """
     if values.ndim == 0:
