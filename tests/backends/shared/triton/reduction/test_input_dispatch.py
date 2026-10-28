@@ -23,7 +23,8 @@ def test_same_public_function_distinguishes_values_and_pointer(operation, dtype,
         values = (torch.arange(3 * width).reshape(3, width) % 17 - 8).to(dtype)
         if width == 64:
             values[0].zero_()
-            large = 2 / torch.finfo(dtype).eps
+            # Both signs must lose +1; at 2/eps, -large + 1 is still exact.
+            large = 4 / torch.finfo(dtype).eps
             values[0, [0, 8, 16, 24]] = torch.tensor([large, 1, -large, 1], dtype=dtype)
     else:
         values[:, ::2] = 2
@@ -83,14 +84,22 @@ def test_same_public_function_distinguishes_values_and_pointer(operation, dtype,
     ),
 )
 def test_public_dispatch_rejects_invalid_arguments_before_launch(operation, mode, length, message):
-    from triton.compiler.errors import CompilationError
+    """Require the specific static assertion beneath nested JIT call-site wrappers."""
+    from triton.compiler.errors import CompilationError, CompileTimeAssertionFailure
 
     from rl_engine.backends.shared.triton import reduction as ordered
     from tests.helpers.ordered_reduce_kernels import invalid_input_probe
 
     values = torch.ones(16, device="cuda")
     output = torch.empty((), device="cuda")
-    with pytest.raises(CompilationError, match=message):
+    with pytest.raises(CompilationError) as error_info:
         invalid_input_probe[(1,)](
             values, output, MODE=mode, LENGTH=length, REDUCE_FN=getattr(ordered, operation)
         )
+    # Each nested JIT call adds a source-location wrapper. Inspect the original
+    # assertion so unrelated compilation failures cannot satisfy this test.
+    error = error_info.value
+    while error.__cause__ is not None:
+        error = error.__cause__
+    assert isinstance(error, CompileTimeAssertionFailure), str(error)
+    assert error.error_message == message

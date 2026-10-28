@@ -15,6 +15,9 @@ whitelist or implicit widening: callers select supported arithmetic precision
 and own allocation, launch/device/stream ordering and compiler math settings.
 Fixed order is not exact arithmetic or a cross-hardware reproducibility promise.
 Independent accuracy and GPU conformance tests remain necessary.
+
+JIT signatures use ordinary parameters: Triton 3.7.1 does not bind keyword-only
+parameters. Callers can still pass every configuration option by name.
 """
 
 from types import SimpleNamespace
@@ -266,10 +269,9 @@ def ordered_reduce_merge(
 @triton.jit
 def reduce(
     input,
-    length: tl.constexpr = None,
-    *,
     COMBINE_FN: tl.constexpr,
     IDENTITY: tl.constexpr,
+    length: tl.constexpr = None,
     COMPUTE_DTYPE: tl.constexpr = None,
     BLOCK_SIZE: tl.constexpr = TILE_SIZE,
     MAX_GROUP_SIZE: tl.constexpr = MAX_GROUP_SIZE,
@@ -318,9 +320,7 @@ def reduce(
     results using reduce_partials with the same callback and initial=IDENTITY.
 
     Example:
-        @triton.jit
-        def xor_pair(left, right):
-            return left ^ right
+        Given a caller-defined @triton.jit xor_pair that returns left ^ right:
 
         flags = reduce(values, COMBINE_FN=xor_pair, IDENTITY=0)
         flags = reduce(ptr, length=n, COMBINE_FN=xor_pair, IDENTITY=0)
@@ -365,7 +365,6 @@ def reduce(
 def sum(
     input,
     length: tl.constexpr = None,
-    *,
     COMPUTE_DTYPE: tl.constexpr = None,
     BLOCK_SIZE: tl.constexpr = TILE_SIZE,
     MAX_GROUP_SIZE: tl.constexpr = MAX_GROUP_SIZE,
@@ -413,7 +412,7 @@ def sum(
     """
     return reduce(
         input,
-        length,
+        length=length,
         COMBINE_FN=reduce_add,
         IDENTITY=0,
         COMPUTE_DTYPE=COMPUTE_DTYPE,
@@ -427,7 +426,6 @@ def sum(
 def product(
     input,
     length: tl.constexpr = None,
-    *,
     COMPUTE_DTYPE: tl.constexpr = None,
     BLOCK_SIZE: tl.constexpr = TILE_SIZE,
     MAX_GROUP_SIZE: tl.constexpr = MAX_GROUP_SIZE,
@@ -456,7 +454,7 @@ def product(
     """
     return reduce(
         input,
-        length,
+        length=length,
         COMBINE_FN=reduce_multiply,
         IDENTITY=1,
         COMPUTE_DTYPE=COMPUTE_DTYPE,
@@ -470,7 +468,6 @@ def product(
 def reduce_partials(
     partials_ptr,
     n_tiles: tl.constexpr,
-    *,
     COMBINE_FN: tl.constexpr,
     initial,
     COMPUTE_DTYPE: tl.constexpr = None,

@@ -42,17 +42,26 @@ def test_loaded_prefix_masks_poisoned_suffix_without_mutation(
         assert_bitwise(reduce(values), reduce(values, length=length))
 
 
-def test_loaded_prefix_ignores_pointer_tile_size():
-    """A loaded tree returns 2; two 16-wide pointer tiles lose both unit terms."""
-    values = torch.zeros(64)
-    values[[0, 8, 16, 24]] = torch.tensor([1e20, 1, -1e20, 1])
+@pytest.mark.parametrize("dtype", (torch.float16, torch.bfloat16, torch.float32, torch.float64))
+def test_loaded_prefix_ignores_pointer_tile_size(dtype):
+    """Qualify the GPU dispatch fixture on CPU before checking its two input paths.
+
+    Both signed large values must round away +1. At 2/eps, -large + 1 is
+    representable, so the pointer path correctly returns 1 rather than 0.
+    Use 4/eps to make the intended 2-versus-0 distinction in every dtype.
+    """
+    large = 4 / torch.finfo(dtype).eps
+    signed_large = torch.tensor([large, -large], dtype=dtype)
+    assert_bitwise(signed_large + torch.ones_like(signed_large), signed_large)
+    values = torch.zeros(64, dtype=dtype)
+    values[[0, 8, 16, 24]] = torch.tensor([large, 1, -large, 1], dtype=dtype)
     values[32:] = float("nan")
-    assert_bitwise(ordered.sum(values, length=32), torch.tensor(2.0))
-    assert_bitwise(ordered.sum(values, length=32, block_size=16), torch.tensor(2.0))
-    assert_bitwise(ordered.sum(values[:32]), torch.tensor(2.0))
-    assert_bitwise(
-        ordered.sum(values, length=32, from_memory=True, block_size=16), torch.tensor(0.0)
-    )
+    expected_loaded = torch.tensor(2.0, dtype=dtype)
+    expected_memory = torch.tensor(0.0, dtype=dtype)
+    assert_bitwise(ordered.sum(values, length=32), expected_loaded)
+    assert_bitwise(ordered.sum(values, length=32, block_size=16), expected_loaded)
+    assert_bitwise(ordered.sum(values[:32]), expected_loaded)
+    assert_bitwise(ordered.sum(values, length=32, from_memory=True, block_size=16), expected_memory)
 
 
 @pytest.mark.parametrize("operation", ("sum", "product"))
