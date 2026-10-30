@@ -16,21 +16,21 @@ an implementation's mistake.
 | --- | --- | --- |
 | Arithmetic defaults | `rl_engine/contracts/operators/ordered_reduction.py` | Tile width and initial group size; no backend imports |
 | Default implementation | `rl_engine/backends/shared/triton/reduction/` | Helpers embedded in `@triton.jit` kernels |
-| H100 implementation | `rl_engine/backends/cuda/reduction/gluon.py` | Explicit layouts embedded in `@gluon.jit` kernels |
-| H100 eligibility | `rl_engine/platforms/hardware.py` | Pure metadata predicate; no device query or backend selection |
+| Gluon implementation | `rl_engine/backends/shared/triton/reduction/gluon.py` | Shared explicit-layout arithmetic embedded in `@gluon.jit` kernels |
 | Matching reference | `rl_engine/reference/reduction/` | Eager PyTorch translation of the same arithmetic |
-| Tests | `tests/reference/reduction/`, `tests/backends/shared/triton/reduction/`, `tests/backends/cuda/reduction/` | Reference, default backend and H100 conformance |
+| Tests | `tests/reference/reduction/`, `tests/backends/shared/triton/reduction/` | Reference and both frontend conformance suites |
 | Performance comparison | `benchmarks/backends/shared/triton/benchmark_ordered_reduction.py` | Native baselines and enclosing kernels for both frontends |
 
-Gluon is Triton's explicit-layout frontend, not another hardware platform. The
-repository groups implementations by hardware ownership: the general version
-stays in `shared/triton`; the NVIDIA-specific version belongs in `cuda/reduction`.
-Only H100 has been qualified for the Gluon implementation. NVIDIA's 32-lane warp
-layout is not an AMD portability claim. Default Triton CUDA results likewise do
-not qualify ROCm automatically; ROCm execution remains to be validated.
+Gluon is Triton's explicit-layout frontend, not another hardware platform. Both
+implementations share the arithmetic contract. The Gluon source parameterizes
+warp/wave width instead of assuming every device has NVIDIA's 32-lane warps.
+The caller supplies the compiler target's width and can tune batch size,
+vectorization and launch warps without copying the reduction algorithm.
+Only H100 has GPU validation so far. Support for configuring an AMD wave layout
+is not a claim of validated ROCm execution or equal bits across different GPUs.
 
-Both packages expose the same six device functions. The upper layer chooses an
-entire enclosing kernel and its execution settings. Neither package automatically
+Both frontends expose the same six device functions. The upper layer chooses an
+entire enclosing kernel and its execution settings. Neither frontend automatically
 switches frontends. An ordinary Triton kernel cannot transparently call this Gluon
 implementation. Importing the default package does not import Gluon.
 
@@ -145,24 +145,41 @@ def row_sum(x, out, stride, length: tl.constexpr):
     tl.store(out + row, total)
 ```
 
-An H100 caller opting into Gluon supplies a separate enclosing kernel:
+A caller opting into Gluon supplies a separate enclosing kernel:
 
 ```python
+import torch
+import triton
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
-from rl_engine.backends.cuda import reduction as ordered_h100
+from rl_engine.backends.shared.triton.reduction import gluon as ordered_gluon
 
 @gluon.jit
-def h100_row_sum(x, out, stride, length: gl.constexpr):
+def gluon_row_sum(x, out, stride, length: gl.constexpr, WARP_SIZE: gl.constexpr):
     row = gl.program_id(0).to(gl.int64)
-    total = ordered_h100.sum(x + row * stride, length, COMPUTE_DTYPE=gl.float32)
+    total = ordered_gluon.sum(
+        x + row * stride, length, COMPUTE_DTYPE=gl.float32, WARP_SIZE=WARP_SIZE,
+        TILES_PER_BATCH=32, ELEMENTS_PER_THREAD=8,
+    )
     gl.store(out + row, total)
+
+# Host code, after choosing the enclosing Gluon kernel:
+# torch.cuda is also PyTorch's device API for ROCm.
+with torch.cuda.device(x.device):
+    target = triton.runtime.driver.active.get_current_target()
+    gluon_row_sum[(x.shape[0],)](
+        x, out, x.stride(0), length, WARP_SIZE=target.warp_size,
+        num_warps=4, enable_fp_fusion=False,
+        **({"allow_flush_denorm": False} if torch.version.hip else {}),
+    )
 ```
 
 The host chooses which kernel to launch using the **input device's** metadata and
-its own validated policy. `is_h100` recognizes NVIDIA H100 plus SM90 and rejects
-ROCm; SM90 alone also matches H200. Eligibility does not mean a kernel is fastest
-for every shape. An explicitly selected backend's compilation or correctness
+its own validated policy. A 32-lane or 64-lane target supplies that exact width;
+do not tune this value independently of the hardware. The public default remains
+32 to preserve existing NVIDIA callers. AMD callers must pass their actual
+target width, which is not necessarily the same across all AMD architectures.
+An explicitly selected backend's compilation or correctness
 failure must surface, rather than silently substituting a result from another
 backend. Callers providing only a Triton kernel remain supported.
 
@@ -179,7 +196,8 @@ tl.store(output_ptr + row, total)
 ```
 
 Use the same frontend throughout each enclosing kernel. The Gluon API supports
-the same composition. The benchmark's CUDA kernels provide complete examples.
+the same composition. `benchmarks/backends/shared/triton/ordered_reduction_gluon_kernels.py`
+provides complete examples, including target-width propagation to the merge.
 A single program processing more tiles does not spread those tiles across SMs;
 separate producer programs expose that parallelism. Cross-stream producers need
 an explicit dependency before merge. The helpers themselves do not synchronize.
@@ -212,6 +230,15 @@ scheduling knobs. Changing them can change rounding.
 | `MERGE_UNROLL` | Triton partial merge | Expansion of the ordered merge loop; default 1 |
 | `TILES_PER_BATCH` | Gluon pointer path | Independent tiles processed together; default 32, power of two up to 64 |
 | `ELEMENTS_PER_THREAD` | Gluon pointer path | Initial memory layout; default 8, positive power of two |
+| `WARP_SIZE` | All Gluon helpers | Hardware warp/wave width; default 32, must match the compilation target |
+
+To qualify another NVIDIA or AMD GPU, keep the arithmetic settings fixed and
+pass its target width. First run the shared conformance suite, including custom
+callbacks, same-tree reference checks, inference and Graph replay. Then measure
+execution settings on that device. Retain only configurations that pass those
+checks; callers own any hardware/shape dispatch table. A future architecture
+needing different instructions can add a separate implementation, while reusing
+the numerical contract and tests. No unmeasured AMD tuning table is provided.
 
 The final implementation avoids arithmetic changes while reducing overhead:
 
@@ -286,10 +313,11 @@ is made.
 
 ```bash
 python -m pytest tests/reference/reduction tests/backends/shared/triton/reduction \
-  tests/backends/cuda/reduction tests/benchmarks/test_ordered_reduction_benchmark.py -q
+  tests/benchmarks/test_ordered_reduction_benchmark.py -q
 ```
 
-CUDA/Gluon tests skip when the required hardware is absent. H100 correctness and
+GPU/Gluon tests skip when the required runtime or accelerator is absent. They use
+the selected target's width and are not restricted to H100. H100 correctness and
 measured performance are described in the [H100 report](../benchmarking/ordered-reduction-h100.md).
 
 ## Performance comparison
@@ -306,15 +334,17 @@ python -m benchmarks.backends.shared.triton.benchmark_ordered_reduction --dry-ru
 python -m benchmarks.backends.shared.triton.benchmark_ordered_reduction \
   --timings graph --warps 4 --case-timeout 180
 
-# Add both H100 Gluon row and parallel callers.
+# Add Gluon row and parallel callers on the selected CUDA/ROCm device.
 python -m benchmarks.backends.shared.triton.benchmark_ordered_reduction \
-  --include-h100-gluon --timings graph --warps 1 --merge-warps 2 \
+  --include-gluon --timings graph --warps 1 --merge-warps 2 \
   --shapes 128x8193 16x262144 --dtypes fp16 bf16 fp32 --case-timeout 180
 ```
 
 Each run uses **one explicit configuration per schedule**, not a parameter grid
-or best-of-search selection. `--warps`, `--merge-warps` and `--pipeline-stages`
-control enclosing benchmark kernels; the arithmetic contract is fixed at 1024/8.
+or best-of-search selection. `--warps`, `--merge-warps`, `--pipeline-stages`,
+`--gluon-elements-per-thread` and `--gluon-tiles-per-batch` select one execution
+setting each; the arithmetic contract is fixed at 1024/8. The benchmark reads
+warp/wave width from the selected compilation target and records it in JSON.
 Backend API execution overrides remain available to callers. Experimental
 candidate implementations, compiler dumps and sweep drivers are not part of the
 maintained benchmark.

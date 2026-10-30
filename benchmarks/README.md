@@ -27,7 +27,8 @@ regression percentage gate.
 
 The [ordered reduction benchmark](../docs/architecture/ordered-reduction.md#performance-comparison)
 compares `torch.sum`, native `tl.sum`, and fixed-order Triton row/parallel callers.
-`--include-h100-gluon` adds the corresponding H100 Gluon callers. Each run uses one
+`--include-gluon` adds shared Gluon callers using the selected target's warp/wave
+width. Only H100 has measured results so far. Each run uses one
 explicit execution configuration per schedule; parameter sweeps and diagnostic
 candidates are excluded. Independent accuracy and same-tree checks, eager/graph
 timing and hard per-case timeouts remain. Its CPU-safe dry run prints the exact

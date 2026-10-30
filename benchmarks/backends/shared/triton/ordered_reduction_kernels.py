@@ -89,27 +89,26 @@ def make_call(x, out, length, provider, tree):
     family = provider["family"]
     if family == "torch":
         return lambda: torch.sum(selected, dim=-1, dtype=torch.float32, out=out), 0
+    options = dict(num_warps=provider["warps"], enable_fp_fusion=False)
+    if torch.version.hip is not None:
+        options["allow_flush_denorm"] = False
     if family in ("ordered_gluon", "ordered_gluon_parallel"):
-        from rl_engine.platforms.hardware import is_h100
-
-        if not is_h100(
-            device_type=x.device.type,
-            device_name=torch.cuda.get_device_name(x.device),
-            capability=torch.cuda.get_device_capability(x.device),
-            is_rocm=torch.version.hip is not None,
-        ):
-            raise RuntimeError("ordered_gluon is only qualified for NVIDIA H100")
         # Select the enclosing kernel on the host. An ordinary Triton JIT caller
         # cannot change language merely by importing a Gluon reduction helper.
-        from benchmarks.backends.cuda.ordered_reduction_kernels import (
+        from benchmarks.backends.shared.triton.ordered_reduction_gluon_kernels import (
             merge_sum,
             partial_sum,
             row_sum,
         )
 
+        # Query the input device, including ROCm's CUDA-compatible torch API.
+        # Warp/wave width is a hardware property, never a performance choice.
+        with torch.cuda.device(x.device):
+            warp_size = triton.runtime.driver.active.get_current_target().warp_size
         if family == "ordered_gluon_parallel":
             count = triton.cdiv(length, tree["block_size"])
             partials = torch.empty((x.shape[0], count), device=x.device, dtype=torch.float32)
+            merge_options = dict(options, num_warps=provider["merge_warps"])
 
             def call():
                 partial_sum[(x.shape[0], count)](
@@ -120,15 +119,15 @@ def make_call(x, out, length, provider, tree):
                     tree["block_size"],
                     tree["max_group_size"],
                     provider["elements_per_thread"],
-                    num_warps=provider["warps"],
-                    enable_fp_fusion=False,
+                    warp_size,
+                    **options,
                 )
                 merge_sum[(x.shape[0],)](
                     partials,
                     out,
                     count,
-                    num_warps=provider["merge_warps"],
-                    enable_fp_fusion=False,
+                    warp_size,
+                    **merge_options,
                 )
 
             return call, partials.numel() * partials.element_size()
@@ -143,14 +142,11 @@ def make_call(x, out, length, provider, tree):
                 tree["max_group_size"],
                 provider["tiles_per_batch"],
                 provider["elements_per_thread"],
-                num_warps=provider["warps"],
-                enable_fp_fusion=False,
+                warp_size,
+                **options,
             )
 
         return call, 0
-    options = dict(num_warps=provider["warps"], enable_fp_fusion=False)
-    if torch.version.hip is not None:
-        options["allow_flush_denorm"] = False
     rows, stride = x.shape[0], x.stride(0)
     is_ordered = family.startswith("ordered_")
     block = triton.next_power_of_2(length) if family == "tl_row" else tree["block_size"]

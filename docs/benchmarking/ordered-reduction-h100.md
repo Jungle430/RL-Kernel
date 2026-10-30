@@ -109,10 +109,12 @@ round medians, variation, errors, environment and measured-source hashes.
 Full raw-sample archives remain separate from the source tree; their SHA256
 identities are recorded in that file. Historical source paths identify the
 measured snapshot before cleanup. The evidence also records the mapping to the
-new layout: executable ASTs of the two implementations, reference, metadata
-predicate and benchmark kernel modules match after normalizing import paths and
-docstrings. Namespace cleanup and CLI checks were validated locally; they are not
-reported as a fresh H100 run.
+earlier namespace cleanup: executable ASTs of the two implementations, reference,
+metadata predicate and benchmark kernel modules matched after normalizing import
+paths and docstrings. The subsequent shared-Gluon revision moves that implementation
+to `backends/shared/triton/reduction/gluon.py` and parameterizes warp/wave width.
+The H100 default remains 32; the measured arithmetic and layout choices are retained.
+This report does not claim a new GPU run of that revision or AMD validation.
 
 The maintained benchmark uses one explicit configuration per schedule. It keeps
 accuracy/replay checks, timeout recovery and both native baselines, without

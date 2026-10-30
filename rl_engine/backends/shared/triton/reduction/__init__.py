@@ -2,8 +2,9 @@
 # Copyright (c) 2026 RL-Kernel Contributors
 """Ordered reductions to embed inside another Triton kernel.
 
-These helpers are for enclosing @triton.jit kernels. Callers choose between this
-package and the separate Gluon package; neither package selects the backend.
+These helpers are for enclosing @triton.jit kernels. The optional gluon submodule
+exposes matching functions for @gluon.jit callers. Import it explicitly; importing
+this package does not load Gluon. Neither frontend selects the enclosing kernel.
 
 sum/product accept either loaded numeric vectors or scalar pointers. Input type
 selects the path at compile time. Optional length masks a loaded prefix without

@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
-"""H100 conformance kernels; imported only by tests running on qualified hardware."""
+"""Gluon conformance kernels with an explicit target warp/wave width."""
 
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
-from rl_engine.backends.cuda import reduction as ordered
+from rl_engine.backends.shared.triton.reduction import gluon as ordered
 
 
 @gluon.jit
@@ -27,11 +27,12 @@ def reduction_probe(
     OP: gl.constexpr,
     LOADED: gl.constexpr,
     COMPUTE: gl.constexpr,
+    WARP_SIZE: gl.constexpr,
 ):
     row = gl.program_id(0).to(gl.int64)
     input = x + row * stride
     if LOADED:
-        cols = gl.arange(0, WIDTH, layout=gl.BlockedLayout([1], [32], [gl.num_warps()], [0]))
+        cols = gl.arange(0, WIDTH, layout=gl.BlockedLayout([1], [WARP_SIZE], [gl.num_warps()], [0]))
         input = gl.load(input + cols)
     if OP == "xor":
         value = ordered.reduce(
@@ -44,22 +45,27 @@ def reduction_probe(
             MAX_GROUP_SIZE=GROUP,
             TILES_PER_BATCH=BATCH,
             ELEMENTS_PER_THREAD=ELEMENTS,
+            WARP_SIZE=WARP_SIZE,
         )
     elif OP == "sum":
-        value = ordered.sum(input, LENGTH, COMPUTE, BLOCK, GROUP, BATCH, ELEMENTS)
+        value = ordered.sum(input, LENGTH, COMPUTE, BLOCK, GROUP, BATCH, ELEMENTS, WARP_SIZE)
     else:
-        value = ordered.product(input, LENGTH, COMPUTE, BLOCK, GROUP, BATCH, ELEMENTS)
+        value = ordered.product(input, LENGTH, COMPUTE, BLOCK, GROUP, BATCH, ELEMENTS, WARP_SIZE)
     gl.static_assert(value.dtype == out.dtype.element_ty, "result precision must precede storage")
     gl.store(out + row, value)
 
 
 @gluon.jit
-def merge_probe(x, out, stride, COUNT: gl.constexpr, OP: gl.constexpr, seed):
+def merge_probe(
+    x, out, stride, COUNT: gl.constexpr, OP: gl.constexpr, seed, WARP_SIZE: gl.constexpr
+):
     row = gl.program_id(0).to(gl.int64)
     if OP == "sum":
-        value = ordered.sum_partials(x + row * stride, COUNT)
+        value = ordered.sum_partials(x + row * stride, COUNT, WARP_SIZE=WARP_SIZE)
     elif OP == "product":
-        value = ordered.product_partials(x + row * stride, COUNT)
+        value = ordered.product_partials(x + row * stride, COUNT, WARP_SIZE=WARP_SIZE)
     else:
-        value = ordered.reduce_partials(x + row * stride, COUNT, xor_pair, seed)
+        value = ordered.reduce_partials(
+            x + row * stride, COUNT, xor_pair, seed, WARP_SIZE=WARP_SIZE
+        )
     gl.store(out + row, value)

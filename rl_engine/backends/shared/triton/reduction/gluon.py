@@ -1,16 +1,22 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 RL-Kernel Contributors
-"""H100 explicit-layout implementation of the shared fixed-order arithmetic.
+"""Shared Gluon implementation of the fixed-order reduction arithmetic.
 
 Adjacent groups fold left to right; group totals halve lower/upper pairs to one.
 Memory vectors use fixed arithmetic tiles followed by an ascending seeded fold.
 Execution batches only overlap independent tile work. They never retile the
 input, insert extra seeds, or replace the final fold with a different tree.
 
-Only H100 is in this implementation's qualification scope. Layouts assume
-32-lane NVIDIA warps. Callers own device selection, streams and math flags;
-use enable_fp_fusion=False when comparing with the fixed-order reference.
-This module must be called from @gluon.jit, not from ordinary @triton.jit.
+WARP_SIZE describes the target's warp/wave width, not an arithmetic group.
+Pass the compilation target's width for AMD or other layouts; the default 32
+retains the measured NVIDIA H100 layout. Batch size, vectorization and the
+enclosing num_warps are independent execution settings. Changing them never
+changes the prescribed operand pairs. Only H100 has GPU validation so far.
+
+Callers own device selection, streams and math flags; use enable_fp_fusion=False
+when comparing with the fixed-order reference. This module must be called from
+@gluon.jit, not from ordinary @triton.jit. Importing the ordinary reduction
+package does not load this optional frontend.
 """
 
 from types import SimpleNamespace
@@ -20,6 +26,8 @@ from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
 from rl_engine.contracts.operators.ordered_reduction import MAX_GROUP_SIZE, TILE_SIZE
+
+__all__ = ["sum", "product", "sum_partials", "product_partials", "reduce", "reduce_partials"]
 
 
 @gluon.jit
@@ -57,7 +65,9 @@ def _group_column(grouped, COLUMN: gl.constexpr):
 
 
 @gluon.jit
-def _reduce_tiles(values, MAX_GROUP_SIZE: gl.constexpr, COMBINE_FN: gl.constexpr):
+def _reduce_tiles(
+    values, MAX_GROUP_SIZE: gl.constexpr, COMBINE_FN: gl.constexpr, WARP_SIZE: gl.constexpr
+):
     """Reduce each independent row of [tiles, width] using the shared tile tree.
 
     Put adjacent group members in the same thread's registers. Threads carry
@@ -71,7 +81,8 @@ def _reduce_tiles(values, MAX_GROUP_SIZE: gl.constexpr, COMBINE_FN: gl.constexpr
     GROUPS: gl.constexpr = WIDTH // GROUP
     grouped = gl.reshape(values, (TILES, GROUPS, GROUP))
     grouped = gl.convert_layout(
-        grouped, gl.BlockedLayout([1, 1, GROUP], [1, 32, 1], [gl.num_warps(), 1, 1], [2, 1, 0])
+        grouped,
+        gl.BlockedLayout([1, 1, GROUP], [1, WARP_SIZE, 1], [gl.num_warps(), 1, 1], [2, 1, 0]),
     )
     subtotal = _group_column(grouped, COLUMN=0)
     for column in gl.static_range(1, GROUP):
@@ -83,7 +94,9 @@ def _reduce_tiles(values, MAX_GROUP_SIZE: gl.constexpr, COMBINE_FN: gl.constexpr
 
 
 @gluon.jit
-def _fold_partials(partials, total, COUNT: gl.constexpr, COMBINE_FN: gl.constexpr):
+def _fold_partials(
+    partials, total, COUNT: gl.constexpr, COMBINE_FN: gl.constexpr, WARP_SIZE: gl.constexpr
+):
     """Consume exactly COUNT partials in index order, carrying the existing seed.
 
     Replicate the small partial vector into registers before its serial fold.
@@ -91,7 +104,9 @@ def _fold_partials(partials, total, COUNT: gl.constexpr, COMBINE_FN: gl.constexp
     preserves seed placement, signed-zero behavior and batch-boundary order.
     """
     WIDTH: gl.constexpr = partials.shape[0]
-    partials = gl.convert_layout(partials, gl.BlockedLayout([WIDTH], [32], [gl.num_warps()], [0]))
+    partials = gl.convert_layout(
+        partials, gl.BlockedLayout([WIDTH], [WARP_SIZE], [gl.num_warps()], [0])
+    )
     grouped = gl.reshape(partials, (1, 1, WIDTH))
     for tile in gl.static_range(COUNT):
         value = gl.reshape(_group_column(grouped, COLUMN=tile), ())
@@ -111,10 +126,11 @@ def _load_batch(
     IDENTITY: gl.constexpr,
     COMPUTE_DTYPE: gl.constexpr,
     ELEMENTS_PER_THREAD: gl.constexpr,
+    WARP_SIZE: gl.constexpr,
 ):
     """Load independent fixed-width tiles; never derive arithmetic width from length."""
     layout: gl.constexpr = gl.BlockedLayout(
-        [1, ELEMENTS_PER_THREAD], [1, 32], [gl.num_warps(), 1], [1, 0]
+        [1, ELEMENTS_PER_THREAD], [1, WARP_SIZE], [gl.num_warps(), 1], [1, 0]
     )
     tiles = gl.arange(0, BATCH, layout=gl.SliceLayout(1, layout))
     columns = gl.arange(0, BLOCK_SIZE, layout=gl.SliceLayout(0, layout))
@@ -122,7 +138,7 @@ def _load_batch(
     valid = offsets < length
     values = gl.load(input_ptr + offsets, valid, other=0).to(COMPUTE_DTYPE)
     values = gl.where(valid, values, gl.full((), IDENTITY, COMPUTE_DTYPE))
-    return _reduce_tiles(values, MAX_GROUP_SIZE, COMBINE_FN)
+    return _reduce_tiles(values, MAX_GROUP_SIZE, COMBINE_FN, WARP_SIZE)
 
 
 @gluon.jit
@@ -136,6 +152,7 @@ def reduce(
     MAX_GROUP_SIZE: gl.constexpr = MAX_GROUP_SIZE,
     TILES_PER_BATCH: gl.constexpr = 32,
     ELEMENTS_PER_THREAD: gl.constexpr = 8,
+    WARP_SIZE: gl.constexpr = 32,
 ):
     """Reduce a loaded Gluon vector or contiguous memory prefix to one scalar.
 
@@ -153,18 +170,26 @@ def reduce(
     Zero-length memory input returns IDENTITY. Tree sizes must be positive
     powers of two and stay identical to the default backend when comparing bits.
 
-    H100 execution options, independent of arithmetic:
+    Execution options, independent of arithmetic:
         TILES_PER_BATCH: Positive power of two, at most 64. Process at most this
             many independent tiles together; default 32. Longer vectors use
             successive batches and carry the same outer accumulator.
         ELEMENTS_PER_THREAD: Positive power of two controlling the initial
             memory layout, default 8. It does not change group membership.
+        WARP_SIZE: Hardware threads per warp/wave, default 32 for compatibility
+            with the measured H100 configuration. The caller must match the
+            compiler target (for example, 64 for a wave64 AMD target). This is
+            a hardware property, not a tuning parameter or arithmetic width.
 
     Enclosing kernels choose num_warps and own launches/math flags. These
     helpers do not allocate or store. They cannot be selected dynamically
     inside an ordinary @triton.jit kernel; host dispatch selects the enclosing
     Gluon kernel. Custom callbacks must use Gluon-compatible operations.
     """
+    gl.static_assert(
+        WARP_SIZE > 0 and (WARP_SIZE & (WARP_SIZE - 1)) == 0,
+        "warp size must be a positive power of two matching the compilation target",
+    )
     gl.static_assert(
         MAX_GROUP_SIZE > 0 and (MAX_GROUP_SIZE & (MAX_GROUP_SIZE - 1)) == 0,
         "maximum group size must be a positive power of two",
@@ -204,8 +229,9 @@ def reduce(
                 IDENTITY,
                 compute_dtype,
                 ELEMENTS_PER_THREAD,
+                WARP_SIZE,
             )
-            total = _fold_partials(partials, total, BATCH, COMBINE_FN)
+            total = _fold_partials(partials, total, BATCH, COMBINE_FN, WARP_SIZE)
         if COUNT % BATCH:
             partials = _load_batch(
                 input,
@@ -218,8 +244,9 @@ def reduce(
                 IDENTITY,
                 compute_dtype,
                 ELEMENTS_PER_THREAD,
+                WARP_SIZE,
             )
-            total = _fold_partials(partials, total, COUNT % BATCH, COMBINE_FN)
+            total = _fold_partials(partials, total, COUNT % BATCH, COMBINE_FN, WARP_SIZE)
         return total
     else:
         gl.static_assert(len(input.shape) == 1, "loaded input must be a vector")
@@ -236,7 +263,8 @@ def reduce(
             columns = gl.arange(0, WIDTH, layout=values.type.layout)
             values = gl.where(columns < length, values, gl.full((), IDENTITY, compute_dtype))
         return gl.reshape(
-            _reduce_tiles(gl.reshape(values, (1, WIDTH)), MAX_GROUP_SIZE, COMBINE_FN), ()
+            _reduce_tiles(gl.reshape(values, (1, WIDTH)), MAX_GROUP_SIZE, COMBINE_FN, WARP_SIZE),
+            (),
         )
 
 
@@ -249,8 +277,9 @@ def sum(
     MAX_GROUP_SIZE: gl.constexpr = MAX_GROUP_SIZE,
     TILES_PER_BATCH: gl.constexpr = 32,
     ELEMENTS_PER_THREAD: gl.constexpr = 8,
+    WARP_SIZE: gl.constexpr = 32,
 ):
-    """H100 fixed-order sum: sum(values) or sum(ptr, length=n).
+    """Fixed-order sum: sum(values) or sum(ptr, length=n).
 
     All arguments follow reduce. Default precision retains input dtype. Batch
     and memory-layout settings affect execution only; block/group sizes define
@@ -266,6 +295,7 @@ def sum(
         MAX_GROUP_SIZE,
         TILES_PER_BATCH,
         ELEMENTS_PER_THREAD,
+        WARP_SIZE,
     )
 
 
@@ -278,8 +308,9 @@ def product(
     MAX_GROUP_SIZE: gl.constexpr = MAX_GROUP_SIZE,
     TILES_PER_BATCH: gl.constexpr = 32,
     ELEMENTS_PER_THREAD: gl.constexpr = 8,
+    WARP_SIZE: gl.constexpr = 32,
 ):
-    """H100 fixed-order product, with the same input/configuration rules as sum.
+    """Fixed-order product, with the same input/configuration rules as sum.
 
     One pads masked lanes and seeds memory-vector accumulation. Loaded vectors
     have no additional seed. Arithmetic precision is explicit or input-derived.
@@ -294,6 +325,7 @@ def product(
         MAX_GROUP_SIZE,
         TILES_PER_BATCH,
         ELEMENTS_PER_THREAD,
+        WARP_SIZE,
     )
 
 
@@ -304,6 +336,7 @@ def reduce_partials(
     COMBINE_FN: gl.constexpr,
     initial,
     COMPUTE_DTYPE: gl.constexpr = None,
+    WARP_SIZE: gl.constexpr = 32,
 ):
     """Fold stored unseeded partials in ascending order from initial, exactly once.
 
@@ -311,7 +344,12 @@ def reduce_partials(
     dtype must equal partial storage dtype. Loads are prefetched in bounded
     windows; the fold carries its accumulator across windows. An empty buffer
     returns initial. The caller must order producers before this helper.
+    WARP_SIZE has the same target-matching requirement as reduce.
     """
+    gl.static_assert(
+        WARP_SIZE > 0 and (WARP_SIZE & (WARP_SIZE - 1)) == 0,
+        "warp size must be a positive power of two matching the compilation target",
+    )
     gl.static_assert(
         partials_ptr.dtype.is_ptr() and len(partials_ptr.shape) == 0,
         "partials must be a scalar pointer",
@@ -322,26 +360,36 @@ def reduce_partials(
         dtype == partials_ptr.dtype.element_ty, "compute dtype must match partial storage dtype"
     )
     WIDTH: gl.constexpr = min(256, triton.next_power_of_2(max(1, n_tiles)))
-    columns = gl.arange(0, WIDTH, layout=gl.BlockedLayout([1], [32], [gl.num_warps()], [0]))
+    columns = gl.arange(0, WIDTH, layout=gl.BlockedLayout([1], [WARP_SIZE], [gl.num_warps()], [0]))
     total = gl.cast(initial, dtype)
     for window in range(n_tiles // WIDTH):
         values = gl.load(partials_ptr + window * WIDTH + columns)
-        total = _fold_partials(values, total, WIDTH, COMBINE_FN)
+        total = _fold_partials(values, total, WIDTH, COMBINE_FN, WARP_SIZE)
     if n_tiles % WIDTH:
         values = gl.load(
             partials_ptr + (n_tiles // WIDTH) * WIDTH + columns, columns < n_tiles % WIDTH, other=0
         )
-        total = _fold_partials(values, total, n_tiles % WIDTH, COMBINE_FN)
+        total = _fold_partials(values, total, n_tiles % WIDTH, COMBINE_FN, WARP_SIZE)
     return total
 
 
 @gluon.jit
-def sum_partials(partials_ptr, n_tiles: gl.constexpr, COMPUTE_DTYPE: gl.constexpr = None):
+def sum_partials(
+    partials_ptr,
+    n_tiles: gl.constexpr,
+    COMPUTE_DTYPE: gl.constexpr = None,
+    WARP_SIZE: gl.constexpr = 32,
+):
     """Sum stored tile results as (((0 + p0) + p1) + ...), without another tree."""
-    return reduce_partials(partials_ptr, n_tiles, reduce_add, 0, COMPUTE_DTYPE)
+    return reduce_partials(partials_ptr, n_tiles, reduce_add, 0, COMPUTE_DTYPE, WARP_SIZE)
 
 
 @gluon.jit
-def product_partials(partials_ptr, n_tiles: gl.constexpr, COMPUTE_DTYPE: gl.constexpr = None):
+def product_partials(
+    partials_ptr,
+    n_tiles: gl.constexpr,
+    COMPUTE_DTYPE: gl.constexpr = None,
+    WARP_SIZE: gl.constexpr = 32,
+):
     """Multiply stored tile results as (((1 * p0) * p1) * ...), without another tree."""
-    return reduce_partials(partials_ptr, n_tiles, reduce_multiply, 1, COMPUTE_DTYPE)
+    return reduce_partials(partials_ptr, n_tiles, reduce_multiply, 1, COMPUTE_DTYPE, WARP_SIZE)

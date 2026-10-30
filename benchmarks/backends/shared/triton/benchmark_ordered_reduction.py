@@ -44,6 +44,13 @@ def positive(value):
     return number
 
 
+def power_of_two(value):
+    number = positive(value)
+    if number & (number - 1):
+        raise argparse.ArgumentTypeError("must be a positive power of two")
+    return number
+
+
 def shape(value):
     try:
         rows, length = value.lower().split("x")
@@ -78,9 +85,22 @@ def parser():
         help="ordinary Triton row pipeline; 0 leaves it unhinted",
     )
     cli.add_argument(
-        "--include-h100-gluon",
+        "--include-gluon",
         action="store_true",
-        help="also compare H100 Gluon row and parallel callers",
+        help="also compare shared Gluon callers on the selected CUDA/ROCm device",
+    )
+    cli.add_argument(
+        "--gluon-elements-per-thread",
+        type=power_of_two,
+        default=8,
+        help="one Gluon load vectorization setting; default matches H100 measurements",
+    )
+    cli.add_argument(
+        "--gluon-tiles-per-batch",
+        type=int,
+        choices=(1, 2, 4, 8, 16, 32, 64),
+        default=32,
+        help="one Gluon execution batch size; leaves the arithmetic tile width unchanged",
     )
     cli.add_argument(
         "--padding", type=int, default=0, help="physical suffix columns, filled with NaN"
@@ -137,22 +157,24 @@ def providers(args, length):
                 merge_unroll=1,
             )
         )
-    if args.include_h100_gluon:
+    if args.include_gluon:
+        elements = args.gluon_elements_per_thread
+        batch = args.gluon_tiles_per_batch
         result.extend(
             [
                 dict(
-                    name=f"ordered_gluon/w{args.warps}/e8/b32",
+                    name=f"ordered_gluon/w{args.warps}/e{elements}/b{batch}",
                     family="ordered_gluon",
                     warps=args.warps,
-                    elements_per_thread=8,
-                    tiles_per_batch=32,
+                    elements_per_thread=elements,
+                    tiles_per_batch=batch,
                 ),
                 dict(
-                    name=f"ordered_gluon_parallel/w{args.warps}/mw{merge}/e8",
+                    name=f"ordered_gluon_parallel/w{args.warps}/mw{merge}/e{elements}",
                     family="ordered_gluon_parallel",
                     warps=args.warps,
                     merge_warps=merge,
-                    elements_per_thread=8,
+                    elements_per_thread=elements,
                 ),
             ]
         )
@@ -274,6 +296,7 @@ def run_case(spec, path):
             cuda=torch.version.cuda,
             hip=torch.version.hip,
             gpu=torch.cuda.get_device_name(device),
+            warp_size=triton.runtime.driver.active.get_current_target().warp_size,
         )
         properties = torch.cuda.get_device_properties(device)
         report["environment"].update(
@@ -427,10 +450,9 @@ def provenance():
     files = [
         Path(__file__),
         Path(__file__).with_name("ordered_reduction_kernels.py"),
-        ROOT / "benchmarks/backends/cuda/ordered_reduction_kernels.py",
+        Path(__file__).with_name("ordered_reduction_gluon_kernels.py"),
         ROOT / "rl_engine/backends/shared/triton/reduction/ordered_reduce.py",
-        ROOT / "rl_engine/backends/cuda/reduction/gluon.py",
-        ROOT / "rl_engine/platforms/hardware.py",
+        ROOT / "rl_engine/backends/shared/triton/reduction/gluon.py",
         ROOT / "rl_engine/reference/reduction/ordered_reduce.py",
         ROOT / "rl_engine/contracts/operators/ordered_reduction.py",
         ROOT / "rl_engine/contracts/profiles/precision/ws1.json",
@@ -455,7 +477,8 @@ def markdown(report):
         "",
         "FP16/BF16/FP32 inputs; all providers accumulate and output FP32. "
         "Eager torch.sum(out=...) and native tl.sum are independent-tree performance baselines.",
-        "Optional ordered_gluon providers are H100-only enclosing Gluon kernels. "
+        "Optional ordered_gluon providers use the compilation target's warp/wave width. "
+        "Only H100 has prior validation; other devices require their own qualification. "
         "They pass the same fixed-order, independent-accuracy and graph replay gates. "
         "Comparing the best measured schedule does not establish an automatic dispatch policy.",
         "Outputs and partial buffers are preallocated. Compilation, validation and graph capture "

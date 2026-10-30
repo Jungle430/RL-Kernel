@@ -118,7 +118,7 @@ jobs:
 
       - name: Run Ordered Reduction References (CPU-safe)
         run: >-
-          python -m pytest tests/reference/reduction tests/platforms/test_hardware.py
+          python -m pytest tests/reference/reduction
           tests/benchmarks/test_ordered_reduction_benchmark.py -q
 
       - name: Run WS2 Vocab-Parallel Logprob Tests (CPU-safe)
