@@ -20,6 +20,103 @@ _TREE_CONFIG = {"max_group_size": 8}
 """Eight-value sequential groups, then one tree over all group totals."""
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="A CUDA or ROCm GPU is required")
+@pytest.mark.parametrize(
+    "dtype",
+    (
+        torch.float16,
+        torch.bfloat16,
+        torch.float32,
+        torch.float64,
+        torch.uint8,
+        torch.int8,
+        torch.int16,
+        torch.int32,
+        torch.int64,
+        torch.bool,
+    ),
+)
+@pytest.mark.parametrize("num_warps", (1, 2, 4))
+@pytest.mark.parametrize(
+    "group_size, row_padding, storage_offset",
+    ((1, 0, 0), (2, 1, 1), (8, 0, 0), (8, 1, 0), (32, 8, 1)),
+)
+def test_group_selection_copies_original_bits(
+    dtype, num_warps, group_size, row_padding, storage_offset
+):
+    """Copy exact bits under aligned, odd-stride and offset-pointer layouts.
+
+    Every column must survive extraction. Raw floating payloads include negative
+    zero, infinities, distinct NaNs, a low mantissa bit and the least subnormal.
+    Integers cover all supported widths, including values beyond FP64's exact
+    integer range. The result must keep both the input dtype and its raw bits.
+    """
+    from tests.helpers.ordered_reduce_kernels import group_column_probe
+
+    floating_payloads = {
+        torch.float16: (
+            torch.uint16,
+            [0x8000, 0x7C00, 0xFC00, 0x7E11, 0xFE22, 0, 0x3C01, 1],
+        ),
+        torch.bfloat16: (
+            torch.uint16,
+            [0x8000, 0x7F80, 0xFF80, 0x7FC1, 0xFFC2, 0, 0x3F81, 1],
+        ),
+        torch.float32: (
+            torch.uint32,
+            [
+                0x80000000,
+                0x7F800000,
+                0xFF800000,
+                0x7FC01234,
+                0xFFC05678,
+                0,
+                0x3F800001,
+                1,
+            ],
+        ),
+        torch.float64: (
+            torch.uint64,
+            [
+                0x8000000000000000,
+                0x7FF0000000000000,
+                0xFFF0000000000000,
+                0x7FF8000000001234,
+                0xFFF8000000005678,
+                0,
+                0x3FF0000000000001,
+                1,
+            ],
+        ),
+    }
+    if dtype.is_floating_point:
+        bit_dtype, payload = floating_payloads[dtype]
+        pattern = torch.tensor(payload, dtype=bit_dtype).view(dtype)
+    elif dtype == torch.bool:
+        pattern = torch.tensor([True, False, True, False, False, True, False, True])
+    elif dtype == torch.int64:
+        pattern = torch.tensor([2**60 + 1, -(2**60) + 3, -1, 0, 1, 7, 2**53 + 1, 31])
+    else:
+        info = torch.iinfo(dtype)
+        pattern = torch.tensor([info.min, info.max, 0, 1, 2, 3, 17, 29], dtype=dtype)
+    source = pattern.repeat((group_size + 7) // 8)[:group_size].repeat(8, 1)
+    source[1::2] = source[1::2].flip(-1)
+    row_stride = group_size + row_padding
+    storage = torch.empty(8 * row_stride + storage_offset, dtype=dtype, device="cuda")
+    values = torch.as_strided(storage, (8, group_size), (row_stride, 1), storage_offset)
+    values.copy_(source)
+    actual = torch.empty((8, group_size), dtype=dtype, device="cuda")
+    group_column_probe[(1,)](
+        values,
+        actual,
+        values.stride(0),
+        GROUP_SIZE=group_size,
+        num_warps=num_warps,
+        enable_fp_fusion=False,
+    )
+    assert_bitwise(actual, values, "group column extraction preserves the source bits")
+
+
 def test_ordered_tree_accepts_interpreter_constexpr_sizes():
     """Exercise the single halving loop with CPU tensors in a fresh interpreter process.
 
@@ -42,18 +139,19 @@ def test_ordered_tree_accepts_interpreter_constexpr_sizes():
         torch.set_num_threads(1)
         generator = torch.Generator().manual_seed(939)
         for width in (1, 8, 16, 64, 1024):
-            for combine, reference in ((caller_add, torch.add), (caller_multiply, torch.mul)):
-                values = 1 + torch.randn((2, width), generator=generator) * 0.01
-                values[0].fill_(-0.0)
-                expected = ordered_tile_reduce(
-                    values, max_group_size=8, combine_fn=reference,
-                )
-                actual = torch.empty((2,), dtype=torch.float32)
-                tile_reduce_probe[(2,)](
-                    values, actual, BLOCK_SIZE=width, MAX_GROUP_SIZE=8,
-                    COMBINE_FN=combine, num_warps=4, enable_fp_fusion=False,
-                )
-                assert_bitwise(actual, expected, f"interpreter tree: {width}")
+            for group in (1, 8, 32):
+                for combine, reference in ((caller_add, torch.add), (caller_multiply, torch.mul)):
+                    values = 1 + torch.randn((2, width), generator=generator) * 0.01
+                    values[0].fill_(-0.0)
+                    expected = ordered_tile_reduce(
+                        values, max_group_size=group, combine_fn=reference,
+                    )
+                    actual = torch.empty((2,), dtype=torch.float32)
+                    tile_reduce_probe[(2,)](
+                        values, actual, BLOCK_SIZE=width, MAX_GROUP_SIZE=group,
+                        COMBINE_FN=combine, num_warps=4, enable_fp_fusion=False,
+                    )
+                    assert_bitwise(actual, expected, f"interpreter tree: {width}/{group}")
 
         from rl_engine.backends.shared.triton import reduction as ordered
         from rl_engine.reference import reduction as reference
@@ -180,10 +278,76 @@ def test_merge_unroll_preserves_left_fold_and_handles_tails(merge_unroll, dtype,
             enable_fp_fusion=False,
         )
         assert_bitwise(
-            actual.cpu(), expected, f"{operation}: unroll={merge_unroll}, tiles={n_tiles}"
+            actual.cpu(),
+            expected,
+            f"{operation}: unroll={merge_unroll}, tiles={n_tiles}",
         )
         assert_bitwise(partials.cpu(), cpu_partials, "merge preserves partials")
     assert_bitwise(initials.cpu(), seeds, "merge preserves runtime seeds")
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="A CUDA or ROCm GPU is required")
+@pytest.mark.parametrize("n_tiles", (63, 64, 65, 255, 256, 257, 513))
+@pytest.mark.parametrize("dtype", (torch.float32, torch.float64))
+@pytest.mark.parametrize("operation", ("sum", "product"))
+@pytest.mark.parametrize("merge_unroll", (1, 3))
+def test_prefetched_merge_preserves_rounding_seed_and_window_boundaries(
+    n_tiles, dtype, operation, merge_unroll
+):
+    """Window reads change neither callback order nor tail/seed arithmetic.
+
+    A separate scalar PyTorch fold supplies the expected bits. Caller-owned
+    callbacks, cancellation, negative zero, nonidentity seeds and graph replay
+    cover the prefetch threshold, full windows and incomplete final windows.
+    """
+    import triton.language as tl
+
+    from tests.helpers.ordered_reduce_kernels import (
+        caller_add,
+        caller_multiply,
+        ordered_reduce_merge_probe,
+    )
+
+    if operation == "sum":
+        combine, reference_combine = caller_add, torch.add
+        large = 2.0 / torch.finfo(dtype).eps
+        pattern = [[large, 1.0, -large, 1.0], [-0.0] * 4, [1.0] * 4]
+        seeds = torch.tensor([0.0, -0.0, large], dtype=dtype)
+    else:
+        combine, reference_combine = caller_multiply, torch.mul
+        pattern = [[2.0, 0.5, 4.0, 0.25], [2.0, 0.5, -2.0, -0.5], [1.0] * 4]
+        seeds = torch.tensor([3.0, -0.0, -2.0], dtype=dtype)
+    cpu_partials = torch.tensor(pattern, dtype=dtype).repeat(1, (n_tiles + 3) // 4)
+    cpu_partials = cpu_partials[:, :n_tiles].contiguous()
+    expected = seeds.clone()
+    for tile in range(n_tiles):
+        expected = reference_combine(expected, cpu_partials[:, tile])
+    partials, initials = cpu_partials.cuda(), seeds.cuda()
+    actual = torch.empty(3, device="cuda", dtype=dtype)
+
+    def call():
+        ordered_reduce_merge_probe[(3,)](
+            partials,
+            initials,
+            actual,
+            N_TILES=n_tiles,
+            MERGE_UNROLL=merge_unroll,
+            COMBINE_FN=combine,
+            COMPUTE_DTYPE=tl.float32 if dtype == torch.float32 else tl.float64,
+            num_warps=4,
+            enable_fp_fusion=False,
+        )
+
+    call()
+    assert_bitwise(actual.cpu(), expected, "prefetched scalar fold")
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        call()
+    graph.replay()
+    graph.replay()
+    assert_bitwise(actual.cpu(), expected, "prefetched graph replay")
+    assert_bitwise(partials.cpu(), cpu_partials, "prefetch preserves partials")
+    assert_bitwise(initials.cpu(), seeds, "prefetch preserves seeds")
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="A CUDA or ROCm GPU is required")
@@ -227,7 +391,7 @@ def test_merge_rejects_nonpositive_unroll(merge_unroll):
     ]
     + [(torch.bool, "xor")],
 )
-@pytest.mark.parametrize("length", (17, 1025))
+@pytest.mark.parametrize("length", (17, 1025, 1033, 1536))
 def test_integer_and_custom_boolean_reductions_across_schedules(dtype, operation, length):
     """Exercise typed seeds, padded tails and partial storage outside floating point."""
     import triton.language as tl
@@ -398,7 +562,12 @@ def test_operations_with_nonidentity_runtime_seeds(
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="A CUDA or ROCm GPU is required")
 @pytest.mark.parametrize(
     "compute_dtype,bits",
-    ((torch.float16, 11), (torch.bfloat16, 8), (torch.float32, 24), (torch.float64, 53)),
+    (
+        (torch.float16, 11),
+        (torch.bfloat16, 8),
+        (torch.float32, 24),
+        (torch.float64, 53),
+    ),
 )
 def test_compute_dtype_rounds_each_add_in_tiles_and_merge(compute_dtype, bits):
     """Both schedules must round at each addition, not just when storing the output."""
@@ -463,9 +632,9 @@ def test_compute_dtype_rounds_each_add_in_tiles_and_merge(compute_dtype, bits):
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="A CUDA or ROCm GPU is required")
 @pytest.mark.parametrize("block_size", (4, 32, 256, 1024))
 @pytest.mark.parametrize("max_group_size", (1, 4, 16, 64))
-@pytest.mark.parametrize("num_warps", (4, 8))
+@pytest.mark.parametrize("num_warps", (1, 2, 4, 8))
 def test_explicit_group_sizes_match_reference(block_size, max_group_size, num_warps):
-    """Group-axis extraction preserves the same tree across layouts and warp counts.
+    """Group-element selection preserves the same tree across layouts and warp counts.
 
     Cover singleton groups, one group, groups shorter than a warp, and groups
     spanning multiple lanes. Distinct random values detect cross-group mixing;
@@ -494,7 +663,7 @@ def test_explicit_group_sizes_match_reference(block_size, max_group_size, num_wa
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="A CUDA or ROCm GPU is required")
-@pytest.mark.parametrize("num_warps", (2, 4, 8))
+@pytest.mark.parametrize("num_warps", (1, 2, 4, 8))
 @pytest.mark.parametrize("seed", (415, 438, 939))
 @pytest.mark.parametrize("block_size", _TILE_WIDTHS)
 def test_production_tile_tree_matches_pytorch_on_identical_fp32_values(num_warps, seed, block_size):
@@ -559,13 +728,42 @@ def test_tile_tree_accepts_other_floating_dtypes(dtype, block_size, num_warps):
 @pytest.mark.parametrize("dtype", _DTYPES)
 @pytest.mark.parametrize(
     "block_size,length",
-    ((1, 1), (4, 17), (16, 48), (32, 128), (1024, 1025), (2048, 6147), (1024, 263169)),
+    (
+        (1, 1),
+        (4, 17),
+        (16, 48),
+        (32, 128),
+        (1024, 1025),
+        (1024, 1031),
+        (1024, 1032),
+        (1024, 1033),
+        (1024, 4095),
+        (1024, 4096),
+        (1024, 4097),
+        (1024, 4104),
+        (1024, 4105),
+        (1024, 1536),
+        (1024, 1537),
+        (1024, 5121),
+        (1024, 8192),
+        (1024, 8193),
+        (1024, 16384),
+        (1024, 16385),
+        (1024, 17408),
+        (1024, 17409),
+        (2048, 6147),
+        (1024, 263169),
+    ),
 )
-def test_serial_and_parallel_sums_share_all_rounding_points(dtype, block_size, length):
+@pytest.mark.parametrize("num_warps", (1, 2, 4))
+def test_serial_and_parallel_sums_share_all_rounding_points(dtype, block_size, length, num_warps):
     """Compare partials/totals across tails, pipelining and merging.
 
     Positive nonassociative values expose a changed addition tree. The source
     buffer already contains the values to reduce; no callback transforms them.
+    Four/five and sixteen/seventeen-tile boundaries cover expanded and rolled
+    loops. Tails cross group and half-tile boundaries. Parallel producers and
+    the independent reference still compute complete padded tiles.
     """
     from rl_engine.backends.shared.triton.reduction.ordered_reduce import reduce_add
     from tests.helpers.ordered_reduce_kernels import (
@@ -598,7 +796,7 @@ def test_serial_and_parallel_sums_share_all_rounding_points(dtype, block_size, l
         MAX_GROUP_SIZE=_TREE_CONFIG["max_group_size"],
         COMBINE_FN=reduce_add,
         IDENTITY=0.0,
-        num_warps=4,
+        num_warps=num_warps,
         **math_options,
     )
     initials = torch.zeros(4, device="cuda")
@@ -625,7 +823,7 @@ def test_serial_and_parallel_sums_share_all_rounding_points(dtype, block_size, l
             N_TILES=n_tiles,
             MERGE_UNROLL=merge_unroll,
             COMBINE_FN=reduce_add,
-            num_warps=4,
+            num_warps=num_warps,
             **math_options,
         )
         assert_bitwise(totals, expected.total, f"merge unroll={merge_unroll}")
@@ -636,9 +834,165 @@ def test_serial_and_parallel_sums_share_all_rounding_points(dtype, block_size, l
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="A CUDA or ROCm GPU is required")
 @pytest.mark.parametrize("operation", ("sum", "product"))
+@pytest.mark.parametrize("length", (1033, 5121, 16385))
+@pytest.mark.parametrize("tile_unroll", (1, 3, 8))
+def test_public_tile_unroll_override_preserves_the_declared_tree(operation, length, tile_unroll):
+    """Explicit and automatic schedules retain every group, tail and seeded fold."""
+    from rl_engine.backends.shared.triton import reduction
+    from rl_engine.reference import reduction as reference
+    from tests.helpers.ordered_reduce_kernels import tile_unroll_probe
+
+    generator = torch.Generator().manual_seed(1059)
+    values = torch.randn((3, length), generator=generator, device="cpu")
+    if operation == "sum":
+        values[0, :4] = torch.tensor([1e20, 1.0, -1e20, 1.0])
+        values[1].fill_(-0.0)
+    else:
+        values.fill_(1.0)
+        values[0, ::2] = 2.0
+        values[0, 1::2] = 0.5
+        values[1, 0] = -0.0
+        values[2, ::2] = -1.0
+    expected = getattr(reference, operation)(values, from_memory=True)
+    values = values.cuda()
+    before = values.clone()
+    actual = torch.empty(3, device="cuda")
+    for warps in (1, 4):
+        for pipeline in (None, 3):
+            tile_unroll_probe[(3,)](
+                values,
+                actual,
+                LENGTH=length,
+                REDUCE_FN=getattr(reduction, operation),
+                TILE_UNROLL=tile_unroll,
+                PIPELINE_STAGES=pipeline,
+                num_warps=warps,
+                enable_fp_fusion=False,
+            )
+            assert_bitwise(actual.cpu(), expected, f"{operation}: unroll={tile_unroll}")
+    assert_bitwise(values, before, "tile-loop expansion preserves inputs")
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="A CUDA or ROCm GPU is required")
+@pytest.mark.parametrize("tile_unroll", (0, -1))
+def test_public_tile_unroll_rejects_nonpositive_factors(tile_unroll):
+    from triton.compiler.errors import CompilationError, CompileTimeAssertionFailure
+
+    from rl_engine.backends.shared.triton import reduction
+    from tests.helpers.ordered_reduce_kernels import tile_unroll_probe
+
+    values = torch.ones((1, 1033), device="cuda")
+    actual = torch.empty(1, device="cuda")
+    with pytest.raises(CompilationError) as error_info:
+        tile_unroll_probe[(1,)](
+            values,
+            actual,
+            LENGTH=1033,
+            REDUCE_FN=reduction.sum,
+            TILE_UNROLL=tile_unroll,
+            PIPELINE_STAGES=None,
+        )
+
+    error = error_info.value
+    while error.__cause__ is not None:
+        error = error.__cause__
+    assert isinstance(error, CompileTimeAssertionFailure)
+    assert error.error_message == "tile unroll must be a positive integer"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="A CUDA or ROCm GPU is required")
+@pytest.mark.parametrize("dtype", (torch.float32, torch.float64))
+@pytest.mark.parametrize("operation,identity", (("sum", 0.0), ("product", 1.0)))
+@pytest.mark.parametrize(
+    "block_size,group_size,length",
+    (
+        (64, 1, 65),
+        (64, 2, 66),
+        (64, 8, 7),
+        (64, 8, 8),
+        (64, 8, 9),
+        (64, 8, 15),
+        (64, 8, 16),
+        (64, 8, 17),
+        (64, 8, 31),
+        (64, 8, 32),
+        (64, 8, 33),
+        (64, 1, 79),
+        (64, 1, 96),
+        (64, 1, 97),
+        (64, 8, 264),
+        (64, 8, 265),
+        (128, 32, 159),
+        (128, 32, 160),
+        (128, 32, 161),
+    ),
+)
+def test_compact_tail_keeps_padding_tree_and_seed(
+    dtype, operation, identity, block_size, group_size, length
+):
+    """A compact tail must match the full padded tree, including signed-zero combines.
+
+    The oracle materializes every padding group; it does not use the optimized
+    compact-tail path. Group and half-tile boundaries select both paths. Nonzero and
+    negative-zero seeds must enter once, after the same per-tile computations.
+    Caller-owned combiners ensure this is not an addition-only shortcut.
+    Padding uses the normal sum/product identities; signed zeros come from
+    input tensors and runtime seeds, not Triton negative-zero literals.
+    """
+    import triton.language as tl
+
+    from tests.helpers.ordered_reduce_kernels import (
+        caller_add,
+        caller_multiply,
+        ordered_reduce_serial_probe,
+    )
+
+    values = torch.ones((4, length), dtype=dtype, device="cuda")
+    values[1].fill_(-0.0)
+    if operation == "sum":
+        combine, reference_combine = caller_add, torch.add
+        values[0, :3] = torch.tensor([2.0 / torch.finfo(dtype).eps, 1.0, 1.0], device="cuda")
+        values[2, 1::2] = -1.0
+    else:
+        combine, reference_combine = caller_multiply, torch.mul
+        values[0, ::2] = 2.0
+        values[0, 1::2] = 0.5
+        values[2, 1::2] = -1.0
+    initials = torch.tensor([3.0, -0.0, -2.0, 0.5], dtype=dtype, device="cuda")
+    expected = ordered_reduce(
+        values,
+        block_size=block_size,
+        max_group_size=group_size,
+        combine_fn=reference_combine,
+        identity=identity,
+        initial=initials,
+        compute_dtype=dtype,
+    ).total
+    actual = torch.empty_like(expected)
+    for warps in (1, 4):
+        for pipeline in (None, 3):
+            ordered_reduce_serial_probe[(4,)](
+                values,
+                initials,
+                actual,
+                LENGTH=length,
+                BLOCK_SIZE=block_size,
+                MAX_GROUP_SIZE=group_size,
+                COMBINE_FN=combine,
+                IDENTITY=identity,
+                COMPUTE_DTYPE=tl.float32 if dtype == torch.float32 else tl.float64,
+                PIPELINE_STAGES=pipeline,
+                num_warps=warps,
+                enable_fp_fusion=False,
+            )
+            assert_bitwise(actual, expected, f"{operation}: tail group, w{warps}/p{pipeline}")
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="A CUDA or ROCm GPU is required")
+@pytest.mark.parametrize("operation", ("sum", "product"))
 @pytest.mark.parametrize("dtype", (torch.float32, torch.float64))
 @pytest.mark.parametrize("block_size", (8, 1024, 2048))
-@pytest.mark.parametrize("num_warps", (2, 4, 8))
+@pytest.mark.parametrize("num_warps", (1, 2, 4, 8))
 def test_eight_lane_extraction_preserves_combiner_order(operation, dtype, block_size, num_warps):
     """Eight-element groups retain sum and product's operand tree across warp counts."""
     from rl_engine.backends.shared.triton.reduction.ordered_reduce import (
@@ -675,7 +1029,7 @@ def test_eight_lane_extraction_preserves_combiner_order(operation, dtype, block_
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="A CUDA or ROCm GPU is required")
 @pytest.mark.parametrize("dtype", (*_DTYPES, torch.float64, torch.int16, torch.int64))
 @pytest.mark.parametrize("operation", ("sum", "product"))
-@pytest.mark.parametrize("num_warps", (2, 4, 8))
+@pytest.mark.parametrize("num_warps", (1, 2, 4, 8))
 def test_two_entry_reduction_matches_custom_combiner_and_reference(dtype, operation, num_warps):
     """Built-in and caller-owned combiners retain the same typed tree.
 
@@ -729,7 +1083,7 @@ def test_two_entry_reduction_matches_custom_combiner_and_reference(dtype, operat
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="A CUDA or ROCm GPU is required")
 @pytest.mark.parametrize("dtype", (*_DTYPES, torch.float64))
 @pytest.mark.parametrize("block_size", (64, 1024, 2048))
-@pytest.mark.parametrize("num_warps", (2, 4, 8))
+@pytest.mark.parametrize("num_warps", (1, 2, 4, 8))
 def test_group_tree_pairs_lower_and_upper_halves_first(dtype, block_size, num_warps):
     """Pin the new pairs with cancellation across halves and an unchanged group fold.
 

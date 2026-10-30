@@ -26,7 +26,9 @@ throughput and peak memory separately. The refactor has no automatic performance
 regression percentage gate.
 
 The [ordered reduction benchmark](../docs/architecture/ordered-reduction.md#performance-comparison)
-compares `torch.sum`, native `tl.sum`, and fixed-order serial/pipelined/parallel
-sum. It supports execution-parameter sweeps, independent accuracy and same-tree
-checks, separate eager/graph timing, and per-case process timeouts. Its CPU-safe
-dry run prints the exact workload before allocating GPU time.
+compares `torch.sum`, native `tl.sum`, and fixed-order Triton row/parallel callers.
+`--include-h100-gluon` adds the corresponding H100 Gluon callers. Each run uses one
+explicit execution configuration per schedule; parameter sweeps and diagnostic
+candidates are excluded. Independent accuracy and same-tree checks, eager/graph
+timing and hard per-case timeouts remain. Its CPU-safe dry run prints the exact
+workload before allocating GPU time.

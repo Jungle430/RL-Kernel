@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Bounded torch.sum / tl.sum / ordered-sum comparison and scheduling sweep.
+"""Reproducible torch.sum / tl.sum / fixed-order Triton and Gluon comparison.
 
 Run as a module from the repository root. Each shape/dtype runs in an isolated
 process with a wall-clock timeout covering initialization, compilation, accuracy
@@ -44,13 +44,6 @@ def positive(value):
     return number
 
 
-def power_of_two(value):
-    number = positive(value)
-    if number & (number - 1):
-        raise argparse.ArgumentTypeError("must be a power of two")
-    return number
-
-
 def shape(value):
     try:
         rows, length = value.lower().split("x")
@@ -64,13 +57,31 @@ def parser():
     cli.add_argument("--shapes", type=shape, nargs="+", default=DEFAULT_SHAPES)
     cli.add_argument("--dtypes", choices=DTYPES, nargs="+", default=list(DTYPES))
     cli.add_argument("--timings", choices=("eager", "graph"), nargs="+", default=["eager", "graph"])
-    cli.add_argument("--warps", type=int, choices=(4, 8), nargs="+", default=[4])
     cli.add_argument(
-        "--pipeline-stages", type=int, choices=(0, 1, 2, 3, 4), nargs="+", default=[0, 3]
+        "--warps",
+        type=int,
+        choices=(1, 2, 4, 8),
+        default=4,
+        help="one warp count for row kernels and parallel producers",
     )
-    cli.add_argument("--merge-unroll", type=positive, nargs="+", default=[1])
-    cli.add_argument("--block-size", type=power_of_two, default=TILE_SIZE)
-    cli.add_argument("--max-group-size", type=power_of_two, default=MAX_GROUP_SIZE)
+    cli.add_argument(
+        "--merge-warps",
+        type=int,
+        choices=(1, 2, 4, 8),
+        help="one parallel merge warp count; defaults to --warps",
+    )
+    cli.add_argument(
+        "--pipeline-stages",
+        type=int,
+        choices=(0, 1, 2, 3, 4),
+        default=0,
+        help="ordinary Triton row pipeline; 0 leaves it unhinted",
+    )
+    cli.add_argument(
+        "--include-h100-gluon",
+        action="store_true",
+        help="also compare H100 Gluon row and parallel callers",
+    )
     cli.add_argument(
         "--padding", type=int, default=0, help="physical suffix columns, filled with NaN"
     )
@@ -100,45 +111,60 @@ def parser():
 
 
 def providers(args, length):
-    """Scheduling candidates share one tree; native baselines have independent trees."""
+    """Compare each schedule once with explicit settings; do not search for a winner.
+
+    Arithmetic sizes always come from the shared contract. These are enclosing
+    benchmark kernels: the reduction library itself performs no backend dispatch.
+    """
     result = [dict(name="torch.sum", family="torch")]
-    for warps in dict.fromkeys(args.warps):
-        for family in ("tl_row", "tl_parallel", "ordered_serial", "ordered_parallel"):
-            if family == "tl_row" and length > ROW_LIMIT:
-                continue
-            pipelines = (
-                list(dict.fromkeys(args.pipeline_stages)) if family == "ordered_serial" else [0]
+    merge = args.merge_warps or args.warps
+    for family in ("tl_row", "tl_parallel", "ordered_serial", "ordered_parallel"):
+        if family == "tl_row" and length > ROW_LIMIT:
+            continue
+        name = f"{family}/w{args.warps}"
+        if family.endswith("parallel"):
+            name += f"/mw{merge}"
+        if family == "ordered_serial":
+            name += f"/p{args.pipeline_stages}"
+        result.append(
+            dict(
+                name=name,
+                family=family,
+                warps=args.warps,
+                merge_warps=merge,
+                pipeline=(args.pipeline_stages or None) if family == "ordered_serial" else None,
+                tile_unroll=None,
+                merge_unroll=1,
             )
-            unrolls = (
-                list(dict.fromkeys(args.merge_unroll)) if family == "ordered_parallel" else [1]
-            )
-            for pipeline in pipelines:
-                for unroll in unrolls:
-                    name = f"{family}/w{warps}"
-                    if family == "ordered_serial":
-                        name += f"/p{pipeline}"
-                    if family == "ordered_parallel":
-                        name += f"/u{unroll}"
-                    result.append(
-                        dict(
-                            name=name,
-                            family=family,
-                            warps=warps,
-                            pipeline=pipeline or None,
-                            merge_unroll=unroll,
-                        )
-                    )
+        )
+    if args.include_h100_gluon:
+        result.extend(
+            [
+                dict(
+                    name=f"ordered_gluon/w{args.warps}/e8/b32",
+                    family="ordered_gluon",
+                    warps=args.warps,
+                    elements_per_thread=8,
+                    tiles_per_batch=32,
+                ),
+                dict(
+                    name=f"ordered_gluon_parallel/w{args.warps}/mw{merge}/e8",
+                    family="ordered_gluon_parallel",
+                    warps=args.warps,
+                    merge_warps=merge,
+                    elements_per_thread=8,
+                ),
+            ]
+        )
     return result
 
 
 def plan(args):
     if args.padding < 0 or args.device < 0:
         raise ValueError("padding and device must be nonnegative")
-    if args.block_size > ROW_LIMIT:
-        raise ValueError(f"benchmark tile size is capped at {ROW_LIMIT} to bound compilation")
     tree = dict(
-        block_size=args.block_size,
-        max_group_size=args.max_group_size,
+        block_size=TILE_SIZE,
+        max_group_size=MAX_GROUP_SIZE,
     )
     cases = []
     for dtype in dict.fromkeys(args.dtypes):
@@ -339,6 +365,16 @@ def run_case(spec, path):
                         extra_peak_bytes=extra_peak,
                         rounds=[],
                     )
+            # Compilation and CPU reference work can leave the GPU idle. Warm
+            # every schedule together before comparing microsecond kernels;
+            # a few per-provider calls alone can measure different clock states.
+            checkpoint("common warmup")
+            warmup_started = time.monotonic()
+            while time.monotonic() - warmup_started < 0.25:
+                for call, _, _buffer_owner in calls.values():
+                    call()
+                torch.cuda.synchronize()
+            report["common_warmup_seconds"] = time.monotonic() - warmup_started
             keys = list(calls)
             for round_index in range(spec["rounds"]):
                 random.Random(spec["seed"] + round_index).shuffle(keys)
@@ -391,7 +427,10 @@ def provenance():
     files = [
         Path(__file__),
         Path(__file__).with_name("ordered_reduction_kernels.py"),
+        ROOT / "benchmarks/backends/cuda/ordered_reduction_kernels.py",
         ROOT / "rl_engine/backends/shared/triton/reduction/ordered_reduce.py",
+        ROOT / "rl_engine/backends/cuda/reduction/gluon.py",
+        ROOT / "rl_engine/platforms/hardware.py",
         ROOT / "rl_engine/reference/reduction/ordered_reduce.py",
         ROOT / "rl_engine/contracts/operators/ordered_reduction.py",
         ROOT / "rl_engine/contracts/profiles/precision/ws1.json",
@@ -416,8 +455,13 @@ def markdown(report):
         "",
         "FP16/BF16/FP32 inputs; all providers accumulate and output FP32. "
         "Eager torch.sum(out=...) and native tl.sum are independent-tree performance baselines.",
+        "Optional ordered_gluon providers are H100-only enclosing Gluon kernels. "
+        "They pass the same fixed-order, independent-accuracy and graph replay gates. "
+        "Comparing the best measured schedule does not establish an automatic dispatch policy.",
         "Outputs and partial buffers are preallocated. Compilation, validation and graph capture "
-        "are excluded. Inputs are reused without cache eviction. Eager event latency can include "
+        "are excluded. All schedules share at least 250 ms of untimed warmup before sampling, "
+        "in addition to per-provider warmup. Inputs are reused without cache eviction. "
+        "Eager event latency can include "
         "host dispatch gaps; graph samples replay a batch and report time per invocation. "
         "Timing modes must be compared separately.",
         "",

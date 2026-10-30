@@ -57,6 +57,39 @@ def _reduction_callback(combine_fn):
 
 
 @triton.jit
+def _split_group_column(grouped, COLUMN: tl.constexpr):
+    """Extract one compile-time column from every group without arithmetic.
+
+    grouped has shape [N_GROUPS, GROUP_SIZE], with power-of-two GROUP_SIZE.
+    Reshape adjacent entries into pairs and split their even/odd positions.
+    Each low-to-high bit of COLUMN chooses which half to keep. For COLUMN=5
+    in an eight-entry group: keep [1, 3, 5, 7], then [1, 5], then [5].
+    A one-entry group returns its only column without entering the split loop.
+
+    Return [N_GROUPS] in the original dtype, preserving signed zero, NaN
+    payloads, subnormal bits and large integers. No identity, marked-value
+    reduction, bitcast or floating-point operation participates in extraction.
+
+    These splits only extract group columns. The arithmetic tree below still
+    uses two-entry reductions; it does not split or permute its tree levels.
+    Layout conversion and compile cost remain compiler decisions, so both
+    generated code and pipelined callers need bounded GPU qualification.
+    """
+    N_GROUPS: tl.constexpr = grouped.shape[0]
+    GROUP_SIZE: tl.constexpr = grouped.shape[1]
+    tl.static_assert(COLUMN >= 0, "group column must be nonnegative")
+    tl.static_assert(COLUMN < GROUP_SIZE, "group column must be smaller than group size")
+    for bit in tl.static_range(int(GROUP_SIZE).bit_length() - 1):
+        pairs = tl.reshape(grouped, (N_GROUPS, GROUP_SIZE >> (bit + 1), 2))
+        even, odd = tl.split(pairs)
+        if COLUMN & (1 << bit):
+            grouped = odd
+        else:
+            grouped = even
+    return tl.reshape(grouped, (N_GROUPS,))
+
+
+@triton.jit
 def ordered_tile_reduce(
     values,
     MAX_GROUP_SIZE: tl.constexpr,
@@ -98,8 +131,9 @@ def ordered_tile_reduce(
            totals, pair 0+4, 1+5, 2+6, 3+7 first, then 0+2, 1+3, then 0+1.
            One group returns directly without inserting an identity operand.
 
-    Every tree step combines only the prescribed left/right pair through a
-    two-entry reduction, for both built-in and caller-owned JIT combiners.
+    Group columns are extracted by reshape/split without arithmetic or dtype
+    conversion. Every arithmetic tree step combines the prescribed left/right
+    pair through a two-entry reduction, for built-in and caller-owned JIT combiners.
     Each reshape fixes the reduced axis at length two. This exposes the pair
     to Triton's reduction lowering without requiring permute/split layouts
     or letting the compiler choose a larger reduction tree.
@@ -129,20 +163,12 @@ def ordered_tile_reduce(
     )
     GROUP_SIZE: tl.constexpr = min(BLOCK_SIZE, MAX_GROUP_SIZE)
     N_GROUPS: tl.constexpr = BLOCK_SIZE // GROUP_SIZE
-    # Keep each adjacent group on its own row. Gather along that short axis,
-    # so the compiler sees that extraction never reaches another group. A flat
-    # gather hides this bound and can repeatedly stage the whole tile in shared
-    # memory. This is a layout change only: group g still folds g*GROUP_SIZE+k
-    # for k=0, 1, ..., GROUP_SIZE-1, with the same dtype and rounding points.
-    # Avoid split-based extraction, which previously caused LLVM O3 timeouts
-    # with three-stage pipelining on H100/Triton 3.7.1.
+    # Only extraction changes: the fold consumes columns 0, 1, ... in order.
     grouped = tl.reshape(values, (N_GROUPS, GROUP_SIZE))
-    first = tl.full((N_GROUPS, 1), 0, tl.int32)
-    subtotal = tl.gather(grouped, first, axis=1)
+    subtotal = _split_group_column(grouped, COLUMN=0)
     for offset in tl.static_range(1, GROUP_SIZE):
-        index = tl.full((N_GROUPS, 1), offset, tl.int32)
-        subtotal = COMBINE_FN(subtotal, tl.gather(grouped, index, axis=1))
-    subtotal = tl.reshape(subtotal, (N_GROUPS,))
+        value = _split_group_column(grouped, COLUMN=offset)
+        subtotal = COMBINE_FN(subtotal, value)
     # Combine the lower and upper halves of all remaining group totals.
     # Each reduced axis has exactly two entries, so every operand pair is fixed.
     # int() also supports interpreter constexpr wrappers before bit_length().
@@ -184,6 +210,107 @@ def ordered_reduce_partial(
     )
 
 
+@triton.constexpr_function
+def _can_compact_tail(length, block_size, max_group_size):
+    """Decide at compile time whether the final tile can use a smaller vector.
+
+    length is the full vector length. A nonempty tail must be at most half a
+    tile, and its original group size must leave room to shrink the tile.
+    The caller validates the length and power-of-two configuration first.
+    This decision depends only on metadata and performs no GPU computation.
+    """
+    tail_length = length % block_size
+    group_size = min(block_size, max_group_size)
+    return 0 < tail_length <= block_size // 2 and group_size < block_size
+
+
+@triton.constexpr_function
+def _resolve_tile_unroll_factor(loop_tiles, block_size, compute_bitwidth, tile_unroll):
+    """Resolve the requested tile-loop unroll factor at compile time.
+
+    Args:
+        loop_tiles: Number of tiles in the ordinary loop, excluding a separately
+            compacted tail. For zero tiles, the automatic policy returns one.
+        block_size: Number of element positions in each ordinary arithmetic tile.
+        compute_bitwidth: Bits per value in the computation dtype, not the input
+            storage dtype. This estimates code expansion, not allocated memory.
+        tile_unroll: Caller-selected positive factor, or None for the automatic
+            policy. An explicit factor overrides both automatic limits.
+
+    With no override, fully unroll only when there are at most sixteen tiles
+    and their logical compute values occupy at most 64 KiB. Otherwise return
+    one, requesting no loop expansion. These are execution heuristics, not
+    hardware limits; they do not change tile boundaries or combine order.
+    The JIT caller checks positivity with tl.static_assert so invalid overrides
+    retain Triton's compile-time assertion diagnostics.
+    """
+    if tile_unroll is not None:
+        return tile_unroll
+
+    operand_bits = loop_tiles * block_size * compute_bitwidth
+    if loop_tiles <= 16 and operand_bits <= 64 * 1024 * 8:
+        return max(loop_tiles, 1)
+    return 1
+
+
+@triton.jit
+def _ordered_reduce_compact_tail(
+    input_ptr,
+    length: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    MAX_GROUP_SIZE: tl.constexpr,
+    COMBINE_FN: tl.constexpr,
+    IDENTITY: tl.constexpr,
+    COMPUTE_DTYPE: tl.constexpr,
+):
+    """Return the final tile's unseeded scalar using its original padded tree.
+
+    input_ptr addresses the full contiguous vector of length elements. Call
+    only when _can_compact_tail is true. Load a power-of-two prefix containing
+    all active groups, while keeping the original group size and column fold.
+
+    Missing upper halves contain only padding. Compute their common subtree
+    value once per level, but retain every combine on the active groups' paths.
+    Combine active groups only after these padding levels, preserving each
+    operand pair and rounding point of the full-width tree.
+
+    The returned scalar has COMPUTE_DTYPE. It contains neither the caller's
+    initial value nor any earlier tile; the serial caller merges it once.
+    This helper runs inside the caller's program and launches no new kernel.
+    """
+    GROUP_SIZE: tl.constexpr = min(BLOCK_SIZE, MAX_GROUP_SIZE)
+    tail_length: tl.constexpr = length % BLOCK_SIZE
+    tail_index: tl.constexpr = length // BLOCK_SIZE
+    TAIL_WIDTH: tl.constexpr = max(GROUP_SIZE, triton.next_power_of_2(tail_length))
+    TAIL_GROUPS: tl.constexpr = TAIL_WIDTH // GROUP_SIZE
+    offsets = tl.arange(0, TAIL_WIDTH)
+    mask = offsets < tail_length
+    tail_ptr = input_ptr + tl.cast(tail_index, tl.int64) * BLOCK_SIZE
+    values = tl.load(tail_ptr + offsets, mask=mask, other=0).to(COMPUTE_DTYPE)
+    identity = tl.full((), IDENTITY, COMPUTE_DTYPE)
+    values = tl.where(mask, values, identity)
+    grouped = tl.reshape(values, (TAIL_GROUPS, GROUP_SIZE))
+    subtotal = _split_group_column(grouped, COLUMN=0)
+    for column in tl.static_range(1, GROUP_SIZE):
+        subtotal = COMBINE_FN(subtotal, _split_group_column(grouped, COLUMN=column))
+
+    # Missing upper halves contain only padding. Evaluate their common value
+    # once, but retain every original combine on each active group's path.
+    padding_subtree = identity
+    for _ in tl.static_range(1, GROUP_SIZE):
+        padding_subtree = COMBINE_FN(padding_subtree, identity)
+    for _ in tl.static_range(int(BLOCK_SIZE // TAIL_WIDTH).bit_length() - 1):
+        subtotal = COMBINE_FN(subtotal, padding_subtree)
+        padding_subtree = COMBINE_FN(padding_subtree, padding_subtree)
+
+    # The active groups may combine only after the original padding levels.
+    # Combining them first would introduce a different floating-point tree.
+    for shift in tl.static_range(int(TAIL_GROUPS).bit_length() - 2, -1, -1):
+        pairs = tl.reshape(subtotal, (2, 1 << shift))
+        subtotal = tl.reduce(pairs, axis=0, combine_fn=_reduction_callback(COMBINE_FN).combine)
+    return tl.reshape(subtotal, ())
+
+
 @triton.jit
 def ordered_reduce_serial(
     input_ptr,
@@ -195,6 +322,7 @@ def ordered_reduce_serial(
     IDENTITY: tl.constexpr,
     COMPUTE_DTYPE: tl.constexpr,
     PIPELINE_STAGES: tl.constexpr,
+    TILE_UNROLL: tl.constexpr,
 ):
     """Reduce a contiguous vector in one program, one tile at a time.
 
@@ -204,6 +332,18 @@ def ordered_reduce_serial(
     parallel merge receives the same initial and COMBINE_FN. PIPELINE_STAGES
     changes scheduling, not combine pairs. Length zero returns initial.
     No global partial buffer is needed. Elementwise transforms are not applied.
+
+    BLOCK_SIZE is the arithmetic tile width. Within each tile, adjacent groups
+    contain min(BLOCK_SIZE, MAX_GROUP_SIZE) elements; neither size denotes a
+    GPU thread count. Both sizes must be positive powers of two.
+
+    _resolve_tile_unroll_factor applies the bounded automatic expansion policy
+    or the explicit TILE_UNROLL factor. The arithmetic tile width, group size
+    and ascending partial fold never change.
+
+    _can_compact_tail selects eligible tails at compile time. Their partial
+    comes from _ordered_reduce_compact_tail, which preserves the full padded
+    tree. This function merges that partial after all ordinary tiles.
     """
     tl.static_assert(length >= 0, "vector length must be nonnegative")
     tl.static_assert(
@@ -218,7 +358,18 @@ def ordered_reduce_serial(
     # Construct constants directly in the chosen dtype; a scalar cast can first
     # materialize a Python float as FP32 and lose bits before conversion to FP64.
     total = tl.full((), initial, COMPUTE_DTYPE)
-    for tile in tl.range(0, n_tiles, num_stages=PIPELINE_STAGES):
+    compact_tail: tl.constexpr = _can_compact_tail(length, BLOCK_SIZE, MAX_GROUP_SIZE)
+    loop_tiles: tl.constexpr = n_tiles - 1 if compact_tail else n_tiles
+    unroll_factor: tl.constexpr = _resolve_tile_unroll_factor(
+        loop_tiles=loop_tiles,
+        block_size=BLOCK_SIZE,
+        compute_bitwidth=COMPUTE_DTYPE.primitive_bitwidth,
+        tile_unroll=TILE_UNROLL,
+    )
+    tl.static_assert(unroll_factor > 0, "tile unroll must be a positive integer")
+    for tile in tl.range(
+        0, loop_tiles, num_stages=PIPELINE_STAGES, loop_unroll_factor=unroll_factor
+    ):
         partial = ordered_reduce_partial(
             input_ptr,
             length,
@@ -229,6 +380,41 @@ def ordered_reduce_serial(
             IDENTITY=IDENTITY,
             COMPUTE_DTYPE=COMPUTE_DTYPE,
         )
+        total = COMBINE_FN(total, partial)
+    if compact_tail:
+        partial = _ordered_reduce_compact_tail(
+            input_ptr,
+            length,
+            BLOCK_SIZE=BLOCK_SIZE,
+            MAX_GROUP_SIZE=MAX_GROUP_SIZE,
+            COMBINE_FN=COMBINE_FN,
+            IDENTITY=IDENTITY,
+            COMPUTE_DTYPE=COMPUTE_DTYPE,
+        )
+        total = COMBINE_FN(total, partial)
+    return total
+
+
+@triton.jit
+def _ordered_merge_window(
+    partials_ptr,
+    total,
+    COUNT: tl.constexpr,
+    COMBINE_FN: tl.constexpr,
+):
+    """Prefetch at most 256 partials, then consume exactly COUNT in index order.
+
+    Loading a vector exposes independent memory reads together. Extraction
+    performs no arithmetic: each partial still meets the previous accumulator,
+    never another partial. Masked lanes are never combined, so this helper
+    needs no padding identity and inserts no extra rounding points.
+    """
+    WIDTH: tl.constexpr = triton.next_power_of_2(COUNT)
+    offsets = tl.arange(0, WIDTH)
+    values = tl.load(partials_ptr + offsets, offsets < COUNT, other=0)
+    grouped = tl.reshape(values, (1, WIDTH))
+    for offset in tl.static_range(COUNT):
+        partial = tl.reshape(_split_group_column(grouped, COLUMN=offset), ())
         total = COMBINE_FN(total, partial)
     return total
 
@@ -247,8 +433,11 @@ def ordered_reduce_merge(
     A parallel producer stores tile k at partials_ptr+k. Its completion order
     does not select the reduction order. Apply initial once, before tile zero,
     exactly as the serial schedule does. MERGE_UNROLL is any positive integer:
-    it expands that many load/combine steps per loop iteration at compile time.
-    It need not be a power of two. Combines remain left-associated, including
+    it controls loop expansion and need not be a power of two. Short merges
+    retain scalar loads. At 64 or more partials, bounded windows of at most
+    256 values are prefetched and folded locally; MERGE_UNROLL expands the
+    outer window loop. These are execution heuristics, not arithmetic tiles.
+    Combines remain left-associated, including
     incomplete tails; changing the unroll factor does not change their order.
     This is not a balanced tree over partials. No padding/identity is needed
     in this stage. Zero partials return initial without a load or combine.
@@ -260,16 +449,36 @@ def ordered_reduce_merge(
     tl.static_assert(n_tiles >= 0, "partial count must be nonnegative")
     total = tl.full((), initial, COMPUTE_DTYPE)
     tl.static_assert(
-        partials_ptr.dtype.element_ty == COMPUTE_DTYPE, "partial storage must match compute dtype"
+        partials_ptr.dtype.element_ty == COMPUTE_DTYPE,
+        "partial storage must match compute dtype",
     )
     tl.static_assert(MERGE_UNROLL > 0, "merge unroll must be a positive integer")
-    full_tiles: tl.constexpr = (n_tiles // MERGE_UNROLL) * MERGE_UNROLL
-    for tile in range(0, full_tiles, MERGE_UNROLL):
-        for offset in tl.static_range(MERGE_UNROLL):
-            partial = tl.load(partials_ptr + tile + offset)
-            total = COMBINE_FN(total, partial)
-    for tile in tl.static_range(full_tiles, n_tiles):
-        total = COMBINE_FN(total, tl.load(partials_ptr + tile))
+    if n_tiles >= 64:
+        # Bound both live values and straight-line callback expansion. A long
+        # merge uses repeated windows rather than compiling its entire length.
+        WINDOW: tl.constexpr = 256
+        for window in tl.range(n_tiles // WINDOW, loop_unroll_factor=MERGE_UNROLL):
+            total = _ordered_merge_window(
+                partials_ptr + tl.cast(window, tl.int64) * WINDOW,
+                total,
+                COUNT=WINDOW,
+                COMBINE_FN=COMBINE_FN,
+            )
+        if n_tiles % WINDOW:
+            total = _ordered_merge_window(
+                partials_ptr + (n_tiles // WINDOW) * WINDOW,
+                total,
+                COUNT=n_tiles % WINDOW,
+                COMBINE_FN=COMBINE_FN,
+            )
+    else:
+        full_tiles: tl.constexpr = (n_tiles // MERGE_UNROLL) * MERGE_UNROLL
+        for tile in range(0, full_tiles, MERGE_UNROLL):
+            for offset in tl.static_range(MERGE_UNROLL):
+                partial = tl.load(partials_ptr + tile + offset)
+                total = COMBINE_FN(total, partial)
+        for tile in tl.static_range(full_tiles, n_tiles):
+            total = COMBINE_FN(total, tl.load(partials_ptr + tile))
     return total
 
 
@@ -283,6 +492,7 @@ def reduce(
     BLOCK_SIZE: tl.constexpr = TILE_SIZE,
     MAX_GROUP_SIZE: tl.constexpr = MAX_GROUP_SIZE,
     PIPELINE_STAGES: tl.constexpr = None,
+    TILE_UNROLL: tl.constexpr = None,
 ):
     """Reduce loaded values or a memory vector with a caller-owned binary function.
 
@@ -315,6 +525,10 @@ def reduce(
             default 8. Group totals follow the fixed halving tree to one value.
         PIPELINE_STAGES: Pointer-only software-pipeline hint; None is unhinted.
             It changes scheduling, not the order of combines.
+        TILE_UNROLL: Pointer-only tile-loop expansion factor. None uses bounded
+            automatic expansion; one disables it. Any explicit factor must be
+            positive. This is an execution override for other devices/compilers,
+            not a change to tile width, group size or the partial fold.
 
     Loaded values follow the seedless tile tree. Optional prefix masking retains
     their width. Pointers load fixed tiles, then fold unseeded partials in ascending
@@ -347,6 +561,7 @@ def reduce(
             IDENTITY=IDENTITY,
             COMPUTE_DTYPE=compute_dtype,
             PIPELINE_STAGES=PIPELINE_STAGES,
+            TILE_UNROLL=TILE_UNROLL,
         )
     else:
         tl.static_assert(len(input.shape) == 1, "loaded input must be a vector")
@@ -376,6 +591,7 @@ def sum(
     BLOCK_SIZE: tl.constexpr = TILE_SIZE,
     MAX_GROUP_SIZE: tl.constexpr = MAX_GROUP_SIZE,
     PIPELINE_STAGES: tl.constexpr = None,
+    TILE_UNROLL: tl.constexpr = None,
 ):
     """Sum loaded values or a contiguous memory vector in a prescribed order.
 
@@ -405,6 +621,9 @@ def sum(
             Group totals follow the fixed lower-half/upper-half tree to one value.
         PIPELINE_STAGES: Pointer path only: optional tl.range loop-pipeline hint.
             None leaves it unhinted. Scheduling does not change combine order.
+        TILE_UNROLL: Pointer-only positive tile-loop expansion factor, or None
+            for bounded automatic expansion. One disables unrolling. Loaded
+            values have no tile loop, so this option does not affect them.
 
     Returns a scalar in the compute dtype; no store, allocation or kernel launch
     occurs. The pointer path pads the final tile with zero, then adds tile sums
@@ -426,6 +645,7 @@ def sum(
         BLOCK_SIZE=BLOCK_SIZE,
         MAX_GROUP_SIZE=MAX_GROUP_SIZE,
         PIPELINE_STAGES=PIPELINE_STAGES,
+        TILE_UNROLL=TILE_UNROLL,
     )
 
 
@@ -437,6 +657,7 @@ def product(
     BLOCK_SIZE: tl.constexpr = TILE_SIZE,
     MAX_GROUP_SIZE: tl.constexpr = MAX_GROUP_SIZE,
     PIPELINE_STAGES: tl.constexpr = None,
+    TILE_UNROLL: tl.constexpr = None,
 ):
     """Multiply loaded values or a contiguous memory vector in a prescribed order.
 
@@ -448,6 +669,8 @@ def product(
     then multiplies partials left to right starting from one. Empty prefixes
     return one. Pointer inputs require length; loaded prefixes cannot exceed
     the vector width. All lengths are compile-time values.
+    TILE_UNROLL mirrors sum: None selects bounded automatic expansion, one
+    disables it, and other positive values set the tile-loop expansion factor.
 
     COMPUTE_DTYPE=None retains the input dtype, without widening. BLOCK_SIZE
     (default 1024) and PIPELINE_STAGES (default None) affect only pointer input.
@@ -468,6 +691,7 @@ def product(
         BLOCK_SIZE=BLOCK_SIZE,
         MAX_GROUP_SIZE=MAX_GROUP_SIZE,
         PIPELINE_STAGES=PIPELINE_STAGES,
+        TILE_UNROLL=TILE_UNROLL,
     )
 
 

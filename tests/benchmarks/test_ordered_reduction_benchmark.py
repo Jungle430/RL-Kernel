@@ -29,10 +29,30 @@ def test_dry_run_needs_no_triton_or_gpu(monkeypatch, capsys):
     assert main(["--dry-run", "--shapes", "1x1025", "--dtypes", "bf16"]) == 0
     result = json.loads(capsys.readouterr().out)
     assert result["case_count"] == 1
-    assert result["measurement_count"] == 12
+    assert result["measurement_count"] == 10
 
 
-def test_scheduling_sweep_preserves_one_tree_and_deduplicates_baselines():
+def test_gluon_plan_is_opt_in_and_keeps_the_same_arithmetic(monkeypatch):
+    """The dry run stays usable without installing or initializing either frontend."""
+
+    def unexpected_gpu_query(*args, **kwargs):
+        pytest.fail("planning must not initialize CUDA")
+
+    monkeypatch.setattr(torch.cuda, "get_device_name", unexpected_gpu_query)
+    ordinary = plan(parser().parse_args(["--shapes", "128x4105", "--dtypes", "bf16"]))
+    assert not any(
+        p["family"].startswith("ordered_gluon") for p in ordinary["cases"][0]["providers"]
+    )
+    candidate = plan(
+        parser().parse_args(["--shapes", "128x4105", "--dtypes", "bf16", "--include-h100-gluon"])
+    )["cases"][0]
+    assert candidate["tree"] == ordinary["cases"][0]["tree"]
+    schedules = [p for p in candidate["providers"] if p["family"].startswith("ordered_gluon")]
+    assert {p["family"] for p in schedules} == {"ordered_gluon", "ordered_gluon_parallel"}
+    assert len(schedules) == 2
+
+
+def test_comparison_has_one_config_per_schedule_and_bounds_full_row_compilation():
     args = parser().parse_args(
         [
             "--shapes",
@@ -41,37 +61,38 @@ def test_scheduling_sweep_preserves_one_tree_and_deduplicates_baselines():
             "--dtypes",
             "fp32",
             "--warps",
-            "4",
-            "8",
-            "--pipeline-stages",
-            "0",
-            "2",
-            "3",
-            "3",
-            "--merge-unroll",
             "1",
+            "--merge-warps",
+            "2",
+            "--pipeline-stages",
             "3",
-            "--block-size",
-            "2048",
             "--padding",
             "37",
+            "--include-h100-gluon",
         ]
     )
     report = plan(args)
     for case in report["cases"]:
-        assert case["tree"] == dict(block_size=2048, max_group_size=8)
+        assert case["tree"] == dict(block_size=1024, max_group_size=8)
         assert case["padding"] == 37
-        names = [p["name"] for p in case["providers"]]
-        assert len(names) == len(set(names))
-        assert names.count("torch.sum") == 1
-        assert any(p["family"] == "tl_parallel" for p in case["providers"])
+        schedules = case["providers"]
+        assert len({p["family"] for p in schedules}) == len(schedules)
+        assert all(p["warps"] == 1 for p in schedules if p["family"] != "torch")
+        assert all(p["merge_warps"] == 2 for p in schedules if p["family"].endswith("parallel"))
+        assert next(p for p in schedules if p["family"] == "ordered_serial")["pipeline"] == 3
     assert any(p["family"] == "tl_row" for p in report["cases"][0]["providers"])
     assert not any(p["family"] == "tl_row" for p in report["cases"][1]["providers"])
 
 
 @pytest.mark.parametrize(
     "option,value",
-    [("--shapes", "0x32"), ("--block-size", "3"), ("--repeat", "0"), ("--case-timeout", "0")],
+    [
+        ("--shapes", "0x32"),
+        ("--warps", "3"),
+        ("--repeat", "0"),
+        ("--case-timeout", "0"),
+        ("--merge-warps", "0"),
+    ],
 )
 def test_invalid_workloads_are_rejected(option, value):
     with pytest.raises(SystemExit):

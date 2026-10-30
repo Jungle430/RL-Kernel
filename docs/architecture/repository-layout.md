@@ -104,11 +104,15 @@ MUSA kernel. Docker images and CI jobs are added only when executable support ex
 ## Device-local reduction helpers
 
 Reusable embedded Triton reductions live in `backends/shared/triton/reduction`.
+The H100 Gluon implementation lives in `backends/cuda/reduction/gluon.py`, following
+platform/operator ownership. Gluon is Triton's explicit-layout frontend, not an
+additional hardware platform. Its enclosing kernels require `@gluon.jit`; the
+upper layer chooses them explicitly instead of switching inside `@triton.jit`.
 Their eager fixed-order PyTorch counterparts live in `reference/reduction`, and
 shared arithmetic defaults live in `contracts/operators/ordered_reduction.py`.
-They are kernel building blocks, not model-specific operators, standalone Tensor
-launchers or distributed collectives. See [Ordered reductions](ordered-reduction.md)
-for the public functions, arithmetic contract and validation boundaries.
+These helpers do not register standalone Tensor operators or distributed
+collectives. See [Ordered reductions](ordered-reduction.md) for the six public
+functions, caller-owned dispatch, arithmetic contract and validation boundaries.
 
 ## Where overlapping attention and GEMM implementations belong
 

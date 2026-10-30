@@ -7,11 +7,24 @@ import triton.language as tl
 from rl_engine.backends.shared.triton.reduction import reduce as public_reduce
 from rl_engine.backends.shared.triton.reduction import reduce_partials as public_reduce_partials
 from rl_engine.backends.shared.triton.reduction.ordered_reduce import (
+    _split_group_column,
     ordered_reduce_merge,
     ordered_reduce_partial,
     ordered_reduce_serial,
     ordered_tile_reduce,
 )
+
+
+@triton.jit
+def group_column_probe(values_ptr, output_ptr, row_stride, GROUP_SIZE: tl.constexpr):
+    """Copy every group column through the internal extraction helper."""
+    rows = tl.arange(0, 8)
+    cols = tl.arange(0, GROUP_SIZE)
+    values = tl.load(values_ptr + rows[:, None] * row_stride + cols[None, :])
+    for column in tl.static_range(GROUP_SIZE):
+        selected = _split_group_column(values, COLUMN=column)
+        tl.static_assert(selected.dtype == values.dtype, "extraction must not convert values")
+        tl.store(output_ptr + rows * GROUP_SIZE + column, selected)
 
 
 @triton.jit
@@ -100,6 +113,7 @@ def ordered_reduce_serial_probe(
     IDENTITY: tl.constexpr,
     PIPELINE_STAGES: tl.constexpr,
     COMPUTE_DTYPE: tl.constexpr = tl.float32,
+    TILE_UNROLL: tl.constexpr = None,
 ):
     """Expose the full-vector reduction with a row-dependent initial value."""
     row = tl.program_id(0).to(tl.int64)
@@ -109,12 +123,34 @@ def ordered_reduce_serial_probe(
         BLOCK_SIZE=BLOCK_SIZE,
         MAX_GROUP_SIZE=MAX_GROUP_SIZE,
         PIPELINE_STAGES=PIPELINE_STAGES,
+        TILE_UNROLL=TILE_UNROLL,
         COMBINE_FN=COMBINE_FN,
         IDENTITY=IDENTITY,
         initial=tl.load(initials_ptr + row),
         COMPUTE_DTYPE=COMPUTE_DTYPE,
     )
     tl.store(totals_ptr + row, total)
+
+
+@triton.jit
+def tile_unroll_probe(
+    values_ptr,
+    output_ptr,
+    LENGTH: tl.constexpr,
+    REDUCE_FN: tl.constexpr,
+    TILE_UNROLL: tl.constexpr,
+    PIPELINE_STAGES: tl.constexpr,
+):
+    """Exercise the public serial execution override without changing its tree."""
+    row = tl.program_id(0).to(tl.int64)
+    total = REDUCE_FN(
+        values_ptr + row * LENGTH,
+        length=LENGTH,
+        COMPUTE_DTYPE=tl.float32,
+        TILE_UNROLL=TILE_UNROLL,
+        PIPELINE_STAGES=PIPELINE_STAGES,
+    )
+    tl.store(output_ptr + row, total)
 
 
 @triton.jit

@@ -194,7 +194,7 @@ def ordered_reduce_merge(
 ) -> torch.Tensor:
     """Fold stored [..., n_tiles] partials in ascending order, starting at initial.
 
-    Mirrors Triton's ordered_reduce_merge, including its unrolled groups and
+    Mirrors Triton's ordered_reduce_merge arithmetic, including its scalar groups and
     incomplete tail. Storage must already have compute_dtype; no hidden cast
     changes partials. Every combine is left-associated. Empty partials return
     initial. Leading dimensions batch independent merges; inputs are not mutated.
