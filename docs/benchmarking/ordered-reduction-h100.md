@@ -102,13 +102,13 @@ for every input, or substitute a different arithmetic tree for performance.
 
 ## Evidence and reproduction
 
-The repository retains compact evidence at
-`reports/experiments/ordered-reduction/h100-20261030/measurements.json`: the 39
-broad-case comparisons, all 15 confirmation measurements, exact configurations,
-round medians, variation, errors, environment and measured-source hashes.
-Full raw-sample archives remain separate from the source tree; their SHA256
-identities are recorded in that file. Historical source paths identify the
-measured snapshot before cleanup. The evidence also records the mapping to the
+Measurement files and raw-sample archives are kept outside the source tree for
+attachment to the [PR discussion](https://github.com/RL-Align/RL-Kernel/pull/595).
+The evidence includes the 39 broad-case comparisons, all 15 confirmation
+measurements, exact configurations, round medians, variation, errors, environment
+and measured-source hashes. Its manifest records the raw archives' SHA256
+identities. Historical source paths identify the measured snapshot before cleanup.
+The evidence also records the mapping to the
 earlier namespace cleanup: executable ASTs of the two implementations, reference,
 metadata predicate and benchmark kernel modules matched after normalizing import
 paths and docstrings. The subsequent shared-Gluon revision moves that implementation
