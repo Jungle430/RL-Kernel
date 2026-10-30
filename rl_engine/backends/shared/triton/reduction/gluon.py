@@ -214,10 +214,12 @@ def reduce(
             ELEMENTS_PER_THREAD > 0 and (ELEMENTS_PER_THREAD & (ELEMENTS_PER_THREAD - 1)) == 0,
             "elements per thread must be a positive power of two",
         )
-        COUNT: gl.constexpr = triton.cdiv(length, BLOCK_SIZE)
-        BATCH: gl.constexpr = min(TILES_PER_BATCH, triton.next_power_of_2(max(1, COUNT)))
+        n_tiles: gl.constexpr = triton.cdiv(length, BLOCK_SIZE)
+        BATCH: gl.constexpr = min(TILES_PER_BATCH, triton.next_power_of_2(max(1, n_tiles)))
+        n_full_batches: gl.constexpr = n_tiles // BATCH
+        n_tail_tiles: gl.constexpr = n_tiles % BATCH
         total = gl.full((), IDENTITY, compute_dtype)
-        for batch in range(COUNT // BATCH):
+        for batch in range(n_full_batches):
             partials = _load_batch(
                 input,
                 length,
@@ -232,11 +234,13 @@ def reduce(
                 WARP_SIZE,
             )
             total = _fold_partials(partials, total, BATCH, COMBINE_FN, WARP_SIZE)
-        if COUNT % BATCH:
+        if n_tail_tiles > 0:
+            first_tail_tile: gl.constexpr = n_full_batches * BATCH
+            # Keep the batch layout; fold only the remaining valid tile results below.
             partials = _load_batch(
                 input,
                 length,
-                (COUNT // BATCH) * BATCH,
+                first_tail_tile,
                 BLOCK_SIZE,
                 BATCH,
                 MAX_GROUP_SIZE,
@@ -246,7 +250,7 @@ def reduce(
                 ELEMENTS_PER_THREAD,
                 WARP_SIZE,
             )
-            total = _fold_partials(partials, total, COUNT % BATCH, COMBINE_FN, WARP_SIZE)
+            total = _fold_partials(partials, total, n_tail_tiles, COMBINE_FN, WARP_SIZE)
         return total
     else:
         gl.static_assert(len(input.shape) == 1, "loaded input must be a vector")
