@@ -107,8 +107,9 @@ Reusable embedded Triton reductions live in `backends/shared/triton/reduction`.
 The optional Gluon implementation lives alongside them in
 `backends/shared/triton/reduction/gluon.py`. Gluon is Triton's explicit-layout
 frontend, not an additional hardware platform. The shared arithmetic accepts
-the target's warp/wave width and execution settings; only H100 has been validated
-so far. Future device-specific algorithms may live under their platform, while
+the target's warp/wave width and execution settings. GPU correctness has been
+validated on H100 and A40; the reported performance measurements are from H100.
+Future device-specific algorithms may live under their platform, while
 layout tuning can reuse this shared implementation. Enclosing Gluon kernels
 require `@gluon.jit`; the upper layer chooses them explicitly instead of switching
 inside `@triton.jit`.

@@ -11,7 +11,8 @@ WARP_SIZE describes the target's warp/wave width, not an arithmetic group.
 Pass the compilation target's width for AMD or other layouts; the default 32
 retains the measured NVIDIA H100 layout. Batch size, vectorization and the
 enclosing num_warps are independent execution settings. Changing them never
-changes the prescribed operand pairs. Only H100 has GPU validation so far.
+changes the prescribed operand pairs. GPU correctness has been validated on H100
+and A40; the reported performance measurements are from H100.
 
 Callers own device selection, streams and math flags; use enable_fp_fusion=False
 when comparing with the fixed-order reference. This module must be called from
