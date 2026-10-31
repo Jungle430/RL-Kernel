@@ -217,6 +217,51 @@ def test_custom_partial_merge_carries_runtime_seed_once(
     assert_bitwise(initial.cpu(), seeds)
 
 
+@pytest.mark.parametrize("count", (0, 1, 257))
+@pytest.mark.parametrize("runtime_seed", (False, True), ids=("constexpr", "runtime"))
+def test_fp64_partial_merge_preserves_seed_precision(
+    gluon_device, warp_size, math_options, count, runtime_seed
+):
+    """FP64 seeds retain low bits through empty, single-partial and cross-window folds."""
+    from rl_engine.backends.shared.triton.reduction import gluon as ordered
+    from tests.helpers.ordered_reduce_gluon_kernels import (
+        constexpr_seeded_merge_probe,
+        seeded_merge_probe,
+    )
+
+    seed = 1 + 2**-35
+    # These binary fractions and their sums are exactly representable in FP64.
+    partials = torch.full((1, max(count, 1)), 2**-40, device=gluon_device, dtype=torch.float64)
+    initial = torch.tensor([seed], device=gluon_device, dtype=torch.float64)
+    out = torch.empty_like(initial)
+    if runtime_seed:
+        seeded_merge_probe[(1,)](
+            partials,
+            out,
+            initial,
+            partials.stride(0),
+            count,
+            ordered.reduce_add,
+            warp_size,
+            num_warps=4,
+            **math_options,
+        )
+    else:
+        constexpr_seeded_merge_probe[(1,)](
+            partials,
+            out,
+            partials.stride(0),
+            count,
+            seed,
+            warp_size,
+            num_warps=4,
+            **math_options,
+        )
+    expected = torch.tensor([seed + count * 2**-40], dtype=torch.float64)
+    assert_bitwise(out.cpu(), expected)
+    assert_bitwise(initial.cpu(), torch.tensor([seed], dtype=torch.float64))
+
+
 @pytest.mark.parametrize("dtype", (torch.float16, torch.bfloat16, torch.float32))
 @pytest.mark.parametrize("length", (9, 1025, 4105, 262144, 262145))
 def test_parallel_composition_preserves_all_rows_and_replay(gluon_device, dtype, length):

@@ -365,7 +365,9 @@ def reduce_partials(
     )
     WIDTH: gl.constexpr = min(256, triton.next_power_of_2(max(1, n_tiles)))
     columns = gl.arange(0, WIDTH, layout=gl.BlockedLayout([1], [WARP_SIZE], [gl.num_warps()], [0]))
-    total = gl.cast(initial, dtype)
+    # Construct constants directly in compute precision; cast could first round
+    # a Python float to FP32. full also accepts a runtime scalar tensor seed.
+    total = gl.full((), initial, dtype)
     for window in range(n_tiles // WIDTH):
         # Widen before multiplying: the element offset can exceed int32.
         values = gl.load(partials_ptr + gl.cast(window, gl.int64) * WIDTH + columns)

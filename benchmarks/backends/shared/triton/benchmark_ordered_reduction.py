@@ -276,7 +276,7 @@ def run_case(spec, path):
 
     from benchmarks.backends.shared.triton.ordered_reduction_kernels import make_call
 
-    report = dict(spec=spec, complete=False, phase="setup", results=[])
+    report = dict(spec=spec, complete=False, phase="setup", results=[], round_orders=[])
 
     def checkpoint(phase):
         report["phase"] = phase
@@ -371,6 +371,8 @@ def run_case(spec, path):
                             for _ in range(spec["graph_calls"]):
                                 call()
                         timed_call, divisor = graph.replay, spec["graph_calls"]
+                        # A replay that misses out must not pass using the eager result.
+                        out.fill_(float("nan"))
                         graph.replay()
                         torch.cuda.synchronize()
                         if not torch.equal(out.cpu().view(torch.int32), actual.view(torch.int32)):
@@ -401,6 +403,7 @@ def run_case(spec, path):
             keys = list(calls)
             for round_index in range(spec["rounds"]):
                 random.Random(spec["seed"] + round_index).shuffle(keys)
+                report["round_orders"].append([list(key) for key in keys])
                 for key in keys:
                     checkpoint(f"timing round {round_index + 1}: {key[0]} {key[1]}")
                     call, divisor, _buffer_owner = calls[key]

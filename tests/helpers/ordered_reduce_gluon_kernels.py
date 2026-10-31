@@ -85,3 +85,20 @@ def seeded_merge_probe(
         x + row * stride, COUNT, COMBINE_FN, initial, WARP_SIZE=WARP_SIZE
     )
     gl.store(out + row, value)
+
+
+@gluon.jit
+def constexpr_seeded_merge_probe(
+    x,
+    out,
+    stride,
+    COUNT: gl.constexpr,
+    INITIAL: gl.constexpr,
+    WARP_SIZE: gl.constexpr,
+):
+    """Pass a Python float seed without first materializing it as a device tensor."""
+    row = gl.program_id(0).to(gl.int64)
+    value = ordered.reduce_partials(
+        x + row * stride, COUNT, ordered.reduce_add, INITIAL, WARP_SIZE=WARP_SIZE
+    )
+    gl.store(out + row, value)
