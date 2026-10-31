@@ -5,6 +5,7 @@ import pytest
 import torch
 
 from rl_engine.reference.reduction import product as ordered_product
+from rl_engine.reference.reduction import reduce_partials
 from rl_engine.reference.reduction import sum as ordered_sum
 from rl_engine.reference.reduction.ordered_reduce import (
     ordered_reduce_merge,
@@ -149,6 +150,51 @@ def test_empty_stage_inputs_preserve_typed_seed_bits():
         )
         assert_bitwise(serial, expected)
         assert_bitwise(merged, expected)
+
+
+@pytest.mark.parametrize("fold", ("serial", "partials"))
+@pytest.mark.parametrize("seed_shape", ((), (3,), (2, 3)))
+@pytest.mark.parametrize("requires_grad", (False, True))
+def test_empty_folds_return_independent_seed_values(fold, seed_shape, requires_grad):
+    """Empty results are writable without changing the seed or detaching its graph.
+
+    Cover scalar, broadcast and shape-matched seeds in their compute dtype, so
+    dtype conversion cannot hide the storage alias. Empty inputs contribute no
+    autograd dependency even when they require gradients.
+    """
+    seed_value = 1 + 2**-35
+    initial = torch.full(seed_shape, seed_value, dtype=torch.float64, requires_grad=requires_grad)
+    initial_before = initial.detach().clone()
+    values = torch.empty((2, 3, 0), dtype=torch.float64, requires_grad=True)
+    if fold == "serial":
+        actual = ordered_reduce_serial(
+            values,
+            initial,
+            block_size=16,
+            max_group_size=8,
+            combine_fn=reduce_add,
+            identity=0,
+            compute_dtype=torch.float64,
+        )
+    else:
+        actual = reduce_partials(values, combine_fn=reduce_add, initial=initial)
+
+    expected = torch.full((2, 3), seed_value, dtype=torch.float64)
+    assert_bitwise(actual, expected)
+    assert actual.requires_grad == requires_grad
+    actual[0, 0].add_(2)
+    expected[0, 0] += 2
+    assert_bitwise(actual, expected)
+    assert_bitwise(initial, initial_before)
+
+    if requires_grad:
+        seed_grad, input_grad = torch.autograd.grad(
+            actual, (initial, values), torch.ones_like(actual), allow_unused=True
+        )
+        # Each seed element is reused once, twice, or six times by broadcasting.
+        expected_grad = torch.full_like(initial, actual.numel() // initial.numel())
+        assert_bitwise(seed_grad, expected_grad)
+        assert input_grad is None
 
 
 def test_partial_merge_rejects_storage_casts_and_invalid_unroll():

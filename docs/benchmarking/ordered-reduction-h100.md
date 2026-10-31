@@ -9,8 +9,9 @@ speedup baseline.
 This page reports the post-review H100 regression at
 `6b37d4dcac32ba37fedba010b7826b36d201d600`, also reported in
 [PR #595](https://github.com/RL-Align/RL-Kernel/pull/595). It supersedes the earlier
-confirmation run. All counts and timings below describe that measured revision;
-subsequent report-only updates do not change the measured kernels.
+confirmation run. H100 counts and timings below describe that measured revision;
+the later PyTorch-reference fix described below does not change the timed
+kernels or native baselines.
 
 ## Environment and scope
 
@@ -62,6 +63,14 @@ launched result. The full H100 regression at the measured revision passed
 errors**, covering references, Triton/Gluon helpers and benchmark tests. This
 includes six FP64 merge-seed regressions (constexpr/runtime seeds and 0/1/257
 partials), plus benchmark replay and per-round execution-order checks.
+
+A subsequent reference-only fix makes empty folds return independent copies of
+their broadcast seeds while retaining autograd. Its A40 regression passed
+**2601 tests, with zero skips, failures or errors**, including 12 new cases for
+scalar, broadcast and shape-matched seeds, with and without gradients. The tested
+environment used Python 3.12.3, PyTorch 2.13.0+cu130 and Triton 3.7.1. Benchmark
+timings were not rerun: the changed fixed-tree reference is checked before timing,
+and the timed providers are unchanged. The A40 evidence is attached to PR #595.
 
 ## Representative results
 

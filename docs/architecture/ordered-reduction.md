@@ -26,8 +26,9 @@ implementations share the arithmetic contract. The Gluon source parameterizes
 warp/wave width instead of assuming every device has NVIDIA's 32-lane warps.
 The caller supplies the compiler target's width and can tune batch size,
 vectorization and launch warps without copying the reduction algorithm.
-Only H100 has GPU validation so far. Support for configuring an AMD wave layout
-is not a claim of validated ROCm execution or equal bits across different GPUs.
+GPU correctness has been validated on H100 and A40; the reported performance
+measurements are from H100. Support for configuring an AMD wave layout is not a
+claim of validated ROCm execution or equal bits across different GPUs.
 
 Both frontends expose the same six device functions. The upper layer chooses an
 entire enclosing kernel and its execution settings. Neither frontend automatically
@@ -284,6 +285,8 @@ stages; the diagnostic collector belongs in `tests/helpers`, not the public API.
 Reference operations preserve PyTorch autograd. Forward order does **not** promise
 that PyTorch-generated backward reductions use this tree. A fused operator that
 needs backward conformance must explicitly define and test its backward order.
+Empty serial and partial folds return independent, writable copies of the
+broadcast seed, retaining its autograd connection without sharing its storage.
 
 For prefix invariance, use the same effective values and arithmetic configuration
 when physical storage, batch membership or masked suffix length changes. Pointer
@@ -306,7 +309,8 @@ Validation has separate layers:
 
 Tests also cover extraction of signed zero, NaN payloads, subnormals and large
 integers; tail compression; merge-window boundaries; configuration validation;
-and the JIT/interpreter callback adapter. Same-tree equality does not replace
+the JIT/interpreter callback adapter; and empty-fold storage independence with
+scalar, broadcast and shape-matched seeds. Same-tree equality does not replace
 independent accuracy, and helper-level tests do not qualify a full model or
 training/rollout engine integration. No cross-device/compiler bitwise guarantee
 is made.

@@ -157,7 +157,8 @@ def ordered_reduce_serial(
     Mirrors Triton's ordered_reduce_serial. Construct initial directly in
     compute_dtype and apply it once, before tile zero. It can be a scalar or a
     tensor broadcastable to the leading dimensions; it is never mutated. Empty
-    vectors return initial. PyTorch has no pipeline_stages scheduling parameter.
+    vectors return an independent copy of the broadcast initial value, retaining
+    any autograd connection to it. PyTorch has no pipeline_stages parameter.
     """
     if values.ndim == 0:
         raise ValueError("ordered_reduce_serial requires at least one dimension")
@@ -169,7 +170,8 @@ def ordered_reduce_serial(
     length = values.shape[-1]
     n_tiles = (length + block_size - 1) // block_size
     total = torch.as_tensor(initial, device=values.device, dtype=compute_dtype)
-    total = torch.broadcast_to(total, values.shape[:-1])
+    # Materialize the broadcast so even an empty fold owns its result storage.
+    total = torch.broadcast_to(total, values.shape[:-1]).clone()
     for tile in range(0, n_tiles):
         partial = ordered_reduce_partial(
             values,
@@ -197,12 +199,14 @@ def ordered_reduce_merge(
     Mirrors Triton's ordered_reduce_merge arithmetic, including its scalar groups and
     incomplete tail. Storage must already have compute_dtype; no hidden cast
     changes partials. Every combine is left-associated. Empty partials return
-    initial. Leading dimensions batch independent merges; inputs are not mutated.
+    an independent copy of the broadcast initial value, retaining its autograd
+    connection. Leading dimensions batch independent merges; inputs are not mutated.
     """
     if partials.ndim == 0:
         raise ValueError("ordered_reduce_merge requires at least one dimension")
     total = torch.as_tensor(initial, device=partials.device, dtype=compute_dtype)
-    total = torch.broadcast_to(total, partials.shape[:-1])
+    # clone preserves the seed's graph while preventing aliasing on empty input.
+    total = torch.broadcast_to(total, partials.shape[:-1]).clone()
     if partials.dtype != compute_dtype:
         raise ValueError("partial storage must match compute dtype")
     if merge_unroll <= 0:
@@ -395,8 +399,9 @@ def reduce_partials(
     storage; no cast silently changes partials. Positive merge_unroll changes
     only loop expansion. Inputs are preserved. Differentiable partials and tensor
     seeds retain ordinary PyTorch autograd connections; backward reduction order
-    is not prescribed. An empty fold returns the broadcast seed without reading
-    partials, so only a differentiable seed contributes an autograd connection.
+    is not prescribed. An empty fold returns an independent copy of the broadcast
+    seed without reading partials, so only a differentiable seed contributes an
+    autograd connection. Writing to that result does not modify the seed.
     """
     _validate_public_inputs(partials)
     compute_dtype = partials.dtype if compute_dtype is None else compute_dtype
