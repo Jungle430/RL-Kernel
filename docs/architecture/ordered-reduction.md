@@ -356,14 +356,16 @@ than hiding slower results. The two-stage ordered paths include both launches.
 
 Inputs, outputs and partial buffers are preallocated. Compilation, validation
 and Graph capture are excluded. All providers receive common warmup and shuffled
-round ordering; reports preserve samples, round medians, spread, environment,
-source hashes, scratch bytes and extra peak allocation. Inputs are reused without
-explicit cache eviction. Graph timing divides batched replay time by its call
-count; eager event timings may include host dispatch gaps. Compare timing modes
-separately. `torch.compile` is not used.
+round ordering; reports preserve the executed order for each round, samples,
+round medians, spread, environment, source hashes, scratch bytes and extra peak
+allocation. Inputs are reused without explicit cache eviction. Graph timing
+divides batched replay time by its call count; eager event timings may include
+host dispatch gaps. Compare timing modes separately. `torch.compile` is not used.
 
 Independent accuracy and same-tree checks run before timing; all rows are checked
 across ordered schedules and sampled rows against the CPU fixed reference. Graph
-replay must preserve output bits. Each case runs in an isolated process with a
-hard timeout covering compilation, and partial reports survive failure. Local
-outputs default to `artifacts/benchmarks/`; reviewed data belongs under `reports/`.
+replay must overwrite NaN-poisoned output and preserve the eager output bits.
+Each case runs in an isolated process with a hard timeout covering compilation,
+and partial reports survive failure. Local outputs default to
+`artifacts/benchmarks/`; measured evidence is published as PR attachments rather
+than committed to the source tree.
