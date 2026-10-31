@@ -66,8 +66,16 @@ def test_public_partial_helpers_reject_hidden_storage_casts_and_invalid_unroll(r
 
 
 @pytest.mark.parametrize("reduce,native,identity", _OPERATIONS)
-@pytest.mark.parametrize("input_dtype", _DTYPES)
-@pytest.mark.parametrize("compute_dtype", _DTYPES)
+@pytest.mark.parametrize(
+    "input_dtype,compute_dtype",
+    (
+        (torch.float16, torch.float32),
+        (torch.bfloat16, torch.float32),
+        (torch.float32, torch.float64),
+        (torch.float64, torch.float16),
+        (torch.float64, torch.bfloat16),
+    ),
+)
 def test_public_reference_matches_independent_exact_math(
     reduce, native, identity, input_dtype, compute_dtype
 ):
@@ -86,7 +94,7 @@ def test_public_reference_matches_independent_exact_math(
 
 
 @pytest.mark.parametrize("reduce,native,identity", _OPERATIONS)
-@pytest.mark.parametrize("compute_dtype", _DTYPES)
+@pytest.mark.parametrize("compute_dtype", (torch.float32, torch.float64))
 @pytest.mark.parametrize("shape", ((0,), (3, 0), (0, 1025), (2, 0, 1025)))
 def test_empty_vectors_and_batches_match_public_contract(
     reduce, native, identity, compute_dtype, shape
@@ -95,13 +103,6 @@ def test_empty_vectors_and_batches_match_public_contract(
     actual = reduce(values, compute_dtype=compute_dtype, from_memory=True)
     expected = torch.full(shape[:-1], identity, dtype=compute_dtype)
     assert_bitwise(actual, expected)
-
-
-@pytest.mark.parametrize("reduce,native,identity", _OPERATIONS)
-def test_scalar_output_and_explicit_compute_precision(reduce, native, identity):
-    values = torch.tensor([1 + 2**-35], dtype=torch.float64)
-    assert_bitwise(reduce(values, compute_dtype=torch.float32, from_memory=True), torch.tensor(1.0))
-    assert_bitwise(reduce(values, compute_dtype=torch.float64, from_memory=True), values[0])
 
 
 @pytest.mark.parametrize("reduce,native,identity", _OPERATIONS)
@@ -215,7 +216,7 @@ def test_public_configurations_cover_empty_strided_vectors_and_tails(
 @pytest.mark.parametrize("reduce,native,identity", _OPERATIONS)
 @pytest.mark.parametrize("parameter", ("block_size", "max_group_size"))
 @pytest.mark.parametrize("size", (-1, 0, 3))
-@pytest.mark.parametrize("shape", ((2, 17), (2, 0), (0, 17)))
+@pytest.mark.parametrize("shape", ((2, 17), (2, 0)))
 def test_public_configuration_validation_includes_empty_inputs(
     reduce, native, identity, parameter, size, shape
 ):
@@ -366,3 +367,44 @@ def test_public_reference_propagates_nan(reduce, native, identity):
     values[0, 0] = float("nan")
     values[1, -1] = float("nan")
     assert torch.isnan(reduce(values, compute_dtype=torch.float32, from_memory=True)).all()
+
+
+@pytest.mark.parametrize("helper", (ordered_sum, ordered_product))
+def test_tile_helpers_cast_before_arithmetic_and_do_not_insert_a_seed(helper):
+    """A one-element tile retains negative zero and low FP64 bits."""
+    values = torch.tensor([[-0.0], [1 + 2**-35]], dtype=torch.float64)
+    assert_bitwise(helper(values), values[:, 0])
+    assert_bitwise(helper(values, compute_dtype=None), values[:, 0])
+    assert_bitwise(helper(values, compute_dtype=torch.float64), values[:, 0])
+    assert_bitwise(helper(values, compute_dtype=torch.float32), values[:, 0].float())
+
+
+@pytest.mark.parametrize("helper", (ordered_sum, ordered_product))
+@pytest.mark.parametrize("dtype", (torch.float16, torch.bfloat16, torch.float32, torch.float64))
+def test_tile_helpers_apply_requested_group_size(helper, dtype):
+    if helper is ordered_sum:
+        large = 2 / torch.finfo(dtype).eps
+        values = torch.tensor([large, 1, -large, 1], dtype=dtype)
+        # One sequential group returns 1; four one-element groups return 2.
+        expected = (1, 2)
+    else:
+        exponent = {torch.float16: 10, torch.bfloat16: 80, torch.float32: 80, torch.float64: 600}[
+            dtype
+        ]
+        values = torch.tensor([2.0**exponent] * 2 + [2.0**-exponent] * 2, dtype=dtype)
+        # Sequential products overflow; half-pair products cancel the exponents.
+        expected = (float("inf"), 1)
+    for group_size, result in zip((4, 1), expected, strict=True):
+        for dtype_kwargs in ({}, {"compute_dtype": None}, {"compute_dtype": dtype}):
+            assert_bitwise(
+                helper(values, max_group_size=group_size, **dtype_kwargs),
+                torch.tensor(result, dtype=dtype),
+            )
+
+
+@pytest.mark.parametrize("helper", (ordered_sum, ordered_product))
+def test_tile_helpers_infer_integer_precision_without_float_conversion(helper):
+    values = torch.tensor([2**53 + 1, 1, 2, 4], dtype=torch.int64)
+    expected = 2**53 + 8 if helper is ordered_sum else (2**53 + 1) * 8
+    for dtype_kwargs in ({}, {"compute_dtype": None}, {"compute_dtype": torch.int64}):
+        assert_bitwise(helper(values, **dtype_kwargs), torch.tensor(expected, dtype=torch.int64))

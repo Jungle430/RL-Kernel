@@ -280,7 +280,8 @@ The reference exports the same six names, uses lowercase option names, and
 supports leading batch dimensions and strided tensors. `from_memory=True` is
 reference-only: a Torch Tensor does not distinguish a loaded JIT value from a
 scalar pointer. Generic stages correspond to Triton's tile/partial/serial/merge
-stages; the diagnostic collector belongs in `tests/helpers`, not the public API.
+stages. Tests inspect partials and totals through these stage references directly;
+there is no separate diagnostic collector API.
 
 Reference operations preserve PyTorch autograd. Forward order does **not** promise
 that PyTorch-generated backward reductions use this tree. A fused operator that
@@ -314,6 +315,28 @@ scalar, broadcast and shape-matched seeds. Same-tree equality does not replace
 independent accuracy, and helper-level tests do not qualify a full model or
 training/rollout engine integration. No cross-device/compiler bitwise guarantee
 is made.
+
+Each suite owns a different part of that coverage:
+
+| Suite | Responsibility |
+| --- | --- |
+| `tests/reference/reduction` | Explicit pairs and frozen expected values; public dtype/shape/custom-callback contracts and autograd |
+| Triton `test_ordered_reduce.py` | Internal extraction, compact-tail and merge-window boundaries; serial/parallel scheduling equivalence |
+| Triton `test_public_api.py` and `test_input_dispatch.py` | Caller options, loaded/pointer dispatch, independent accuracy and batch/padding invariance |
+| `test_public_compile.py` | CPU-side JIT compilation and interpreter checks, independent of GPU availability |
+| `test_gluon_ordered_reduction.py` | Gluon layouts, batching, same-tree bits and replay/inference equivalence |
+| `test_ordered_reduction_benchmark.py` | Planning, reporting, timeout/replay failure gates and real GPU benchmark smoke tests |
+
+Shared dtype and boundary properties are tested at the public interface rather
+than repeated through every internal helper. Internal cases target distinct
+branches; scheduling tests vary execution settings while keeping arithmetic
+fixed. Historical GPU test counts in the H100 report refer to the recorded run,
+not the current collection after test consolidation.
+
+Test launchers live beside the backend suite in `_kernels.py` and
+`_gluon_kernels.py` and are imported lazily. `tests/helpers/reduction_inputs.py`
+contains shared input data only; `tensor_checks.py` provides the byte comparison.
+Backend tests do not depend on benchmark launchers or another operator's tests.
 
 ```bash
 python -m pytest tests/reference/reduction tests/backends/shared/triton/reduction \
@@ -362,7 +385,9 @@ Inputs, outputs and partial buffers are preallocated. Compilation, validation
 and Graph capture are excluded. All providers receive common warmup and shuffled
 round ordering; reports preserve the executed order for each round, samples,
 round medians, spread, environment, source hashes, scratch bytes and extra peak
-allocation. Inputs are reused without explicit cache eviction. Graph timing
+allocation. Raw samples appear once, in each result's `samples_ms[round][sample]`;
+`round_orders` records the provider and timing mode measured in each round.
+Inputs are reused without explicit cache eviction. Graph timing
 divides batched replay time by its call count; eager event timings may include
 host dispatch gaps. Compare timing modes separately. `torch.compile` is not used.
 

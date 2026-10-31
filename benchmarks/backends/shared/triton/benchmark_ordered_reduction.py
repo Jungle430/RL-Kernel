@@ -270,6 +270,18 @@ def measure(call, warmup, repeat, divisor):
     return [start.elapsed_time(end) / divisor for start, end in events]
 
 
+def check_replay(replay, output, expected, name):
+    """Require replay to overwrite poisoned output with the saved eager FP32 bits.
+
+    Copying to CPU waits for device work before comparison. A no-op replay must
+    fail even if the eager call left a correct result in the same output buffer.
+    """
+    output.fill_(float("nan"))
+    replay()
+    if not torch.equal(output.cpu().view(torch.int32), expected.view(torch.int32)):
+        raise AssertionError(f"{name}: graph replay changed output bits")
+
+
 def run_case(spec, path):
     """Validate all candidates before interleaved timing; checkpoint each phase."""
     import triton
@@ -371,12 +383,7 @@ def run_case(spec, path):
                             for _ in range(spec["graph_calls"]):
                                 call()
                         timed_call, divisor = graph.replay, spec["graph_calls"]
-                        # A replay that misses out must not pass using the eager result.
-                        out.fill_(float("nan"))
-                        graph.replay()
-                        torch.cuda.synchronize()
-                        if not torch.equal(out.cpu().view(torch.int32), actual.view(torch.int32)):
-                            raise AssertionError(f"{name}: graph replay changed output bits")
+                        check_replay(graph.replay, out, actual, name)
                     key = (name, timing)
                     # A graph stores addresses, not ownership of the original
                     # tensors. Retain the callable owning out/partials even
@@ -388,7 +395,7 @@ def run_case(spec, path):
                         accuracy=check,
                         scratch_bytes=scratch_bytes,
                         extra_peak_bytes=extra_peak,
-                        rounds=[],
+                        samples_ms=[],
                     )
             # Compilation and CPU reference work can leave the GPU idle. Warm
             # every schedule together before comparing microsecond kernels;
@@ -403,15 +410,16 @@ def run_case(spec, path):
             keys = list(calls)
             for round_index in range(spec["rounds"]):
                 random.Random(spec["seed"] + round_index).shuffle(keys)
-                report["round_orders"].append([list(key) for key in keys])
+                report["round_orders"].append([])
                 for key in keys:
+                    report["round_orders"][-1].append(list(key))
                     checkpoint(f"timing round {round_index + 1}: {key[0]} {key[1]}")
                     call, divisor, _buffer_owner = calls[key]
                     record = records[key]
-                    rounds = record["rounds"] + [
+                    rounds = record["samples_ms"] + [
                         measure(call, spec["warmup"], spec["repeat"], divisor)
                     ]
-                    record.update(rounds=rounds, **summarize(rounds))
+                    record.update(**summarize(rounds))
                     record["effective_gb_s"] = (rows * length * x.element_size() + rows * 4) / (
                         record["median_ms"] * 1e6
                     )

@@ -5,8 +5,17 @@ import pytest
 import torch
 
 from rl_engine.reference import reduction as reference
-from tests.helpers.ordered_reduce_prefix_cases import prefix_storage
+from tests.helpers.reduction_inputs import prefix_storage
 from tests.helpers.tensor_checks import assert_bitwise
+
+# Keep CPU collection independent of optional GPU frontends.
+if torch.cuda.is_available():
+    pytest.importorskip("triton.experimental.gluon")
+    from triton import language as tl
+    from triton.experimental.gluon import language as gl
+
+    from tests.backends.shared.triton.reduction import _gluon_kernels as gluon_kernels
+    from tests.backends.shared.triton.reduction import _kernels as kernels
 
 
 @pytest.fixture
@@ -39,12 +48,8 @@ def math_options():
 def test_memory_cross_frontend_and_execution_bits(
     gluon_device, warp_size, math_options, dtype, operation, length
 ):
-    from triton import language as tl
-    from triton.experimental.gluon import language as gl
 
     from rl_engine.backends.shared.triton import reduction as default
-    from tests.helpers.ordered_reduce_gluon_kernels import reduction_probe
-    from tests.helpers.ordered_reduce_kernels import input_dispatch_probe
 
     width = 1 << max(0, (max(length, 1) - 1).bit_length())
     generator = torch.Generator().manual_seed(841)
@@ -61,7 +66,7 @@ def test_memory_cross_frontend_and_execution_bits(
     native = torch.empty(3, device=gluon_device)
     ignored = torch.empty_like(native)
     # This probe supports contiguous rows; use a separate copy for its stride.
-    input_dispatch_probe[(3,)](
+    kernels.input_dispatch_probe[(3,)](
         x.contiguous(),
         ignored,
         native,
@@ -78,7 +83,7 @@ def test_memory_cross_frontend_and_execution_bits(
         out = torch.empty_like(native)
 
         def call(out=out, batch=batch, elements=elements, warps=warps):
-            reduction_probe[(3,)](
+            gluon_kernels.reduction_probe[(3,)](
                 x,
                 out,
                 x.stride(0),
@@ -124,7 +129,6 @@ def test_memory_cross_frontend_and_execution_bits(
 def test_loaded_and_custom_operation_keep_tree_and_dtype(
     gluon_device, warp_size, math_options, operation, width, group, length
 ):
-    from tests.helpers.ordered_reduce_gluon_kernels import reduction_probe
 
     dtype = torch.int64 if operation == "xor" else torch.float32
     values = torch.arange(3 * width).reshape(3, width).to(dtype)
@@ -138,7 +142,7 @@ def test_loaded_and_custom_operation_keep_tree_and_dtype(
         expected = getattr(reference, operation)(values, length=length, max_group_size=group)
     x = values.to(gluon_device)
     out = torch.empty(3, device=gluon_device, dtype=dtype)
-    reduction_probe[(3,)](
+    gluon_kernels.reduction_probe[(3,)](
         x,
         out,
         width,
@@ -164,14 +168,15 @@ def test_builtin_partial_merge_uses_identity_across_windows(
     gluon_device, warp_size, math_options, operation, count
 ):
     """Sum/product convenience APIs use zero/one, including for empty partials."""
-    from tests.helpers.ordered_reduce_gluon_kernels import merge_probe
 
     values = torch.arange(3 * max(count, 1), dtype=torch.float32).reshape(3, -1)
     values = values % 9 - 4 if operation == "sum" else torch.ones_like(values) * 1.00001
     expected = getattr(reference, operation + "_partials")(values[:, :count])
     x = values.to(gluon_device)
     out = torch.empty(3, device=gluon_device, dtype=values.dtype)
-    merge_probe[(3,)](x, out, x.stride(0), count, operation, warp_size, num_warps=4, **math_options)
+    gluon_kernels.merge_probe[(3,)](
+        x, out, x.stride(0), count, operation, warp_size, num_warps=4, **math_options
+    )
     assert_bitwise(out.cpu(), expected)
 
 
@@ -182,13 +187,12 @@ def test_custom_partial_merge_carries_runtime_seed_once(
 ):
     """Nonidentity row seeds survive empty input, window boundaries and tails."""
     from rl_engine.backends.shared.triton.reduction import gluon as ordered
-    from tests.helpers.ordered_reduce_gluon_kernels import seeded_merge_probe, xor_pair
 
     dtype = torch.int64 if operation == "xor" else torch.float32
     values = torch.arange(3 * max(count, 1)).reshape(3, -1).to(dtype)
     if operation == "xor":
         values += 2**60
-        combine, callback = torch.bitwise_xor, xor_pair
+        combine, callback = torch.bitwise_xor, gluon_kernels.xor_pair
     elif operation == "sum":
         values = values % 9 - 4
         combine, callback = torch.add, ordered.reduce_add
@@ -201,7 +205,7 @@ def test_custom_partial_merge_carries_runtime_seed_once(
     initial = seeds.to(gluon_device)
     before = x.clone()
     out = torch.empty(3, device=gluon_device, dtype=dtype)
-    seeded_merge_probe[(3,)](
+    gluon_kernels.seeded_merge_probe[(3,)](
         x,
         out,
         initial,
@@ -224,10 +228,6 @@ def test_fp64_partial_merge_preserves_seed_precision(
 ):
     """FP64 seeds retain low bits through empty, single-partial and cross-window folds."""
     from rl_engine.backends.shared.triton.reduction import gluon as ordered
-    from tests.helpers.ordered_reduce_gluon_kernels import (
-        constexpr_seeded_merge_probe,
-        seeded_merge_probe,
-    )
 
     seed = 1 + 2**-35
     # These binary fractions and their sums are exactly representable in FP64.
@@ -235,7 +235,7 @@ def test_fp64_partial_merge_preserves_seed_precision(
     initial = torch.tensor([seed], device=gluon_device, dtype=torch.float64)
     out = torch.empty_like(initial)
     if runtime_seed:
-        seeded_merge_probe[(1,)](
+        gluon_kernels.seeded_merge_probe[(1,)](
             partials,
             out,
             initial,
@@ -247,7 +247,7 @@ def test_fp64_partial_merge_preserves_seed_precision(
             **math_options,
         )
     else:
-        constexpr_seeded_merge_probe[(1,)](
+        gluon_kernels.constexpr_seeded_merge_probe[(1,)](
             partials,
             out,
             partials.stride(0),
@@ -264,9 +264,10 @@ def test_fp64_partial_merge_preserves_seed_precision(
 
 @pytest.mark.parametrize("dtype", (torch.float16, torch.bfloat16, torch.float32))
 @pytest.mark.parametrize("length", (9, 1025, 4105, 262144, 262145))
-def test_parallel_composition_preserves_all_rows_and_replay(gluon_device, dtype, length):
+def test_parallel_composition_preserves_all_rows_and_replay(
+    gluon_device, warp_size, math_options, dtype, length
+):
     """Embedded public helpers retain the tree across producer/merge schedules."""
-    from benchmarks.backends.shared.triton.ordered_reduction_kernels import make_call
 
     generator = torch.Generator().manual_seed(938)
     values = torch.randn((3, length), generator=generator).to(dtype)
@@ -274,17 +275,35 @@ def test_parallel_composition_preserves_all_rows_and_replay(gluon_device, dtype,
     x[:, :length].copy_(values)
     before = x.clone()
     expected = reference.sum(values, from_memory=True, compute_dtype=torch.float32)
-    tree = dict(block_size=1024, max_group_size=8)
+    n_tiles = (length + 1023) // 1024
+    partials = torch.empty((3, n_tiles), device=gluon_device, dtype=torch.float32)
     for producer, merge, elements in ((1, 4, 4), (4, 1, 8)):
         out = torch.empty(3, device=gluon_device)
-        provider = dict(
-            family="ordered_gluon_parallel",
-            warps=producer,
-            merge_warps=merge,
-            elements_per_thread=elements,
-        )
-        call, scratch = make_call(x, out, length, provider, tree)
-        assert scratch == 3 * ((length + 1023) // 1024) * 4
+
+        def call(out=out, producer=producer, merge=merge, elements=elements):
+            gluon_kernels.partial_probe[(3, n_tiles)](
+                x,
+                partials,
+                x.stride(0),
+                LENGTH=length,
+                BLOCK=1024,
+                GROUP=8,
+                ELEMENTS=elements,
+                WARP_SIZE=warp_size,
+                num_warps=producer,
+                **math_options,
+            )
+            gluon_kernels.merge_probe[(3,)](
+                partials,
+                out,
+                n_tiles,
+                COUNT=n_tiles,
+                OP="sum",
+                WARP_SIZE=warp_size,
+                num_warps=merge,
+                **math_options,
+            )
+
         call()
         assert_bitwise(out.cpu(), expected)
         with torch.inference_mode():
@@ -311,7 +330,6 @@ def test_inferred_precision_and_prefix_do_not_depend_on_batch(
     target row and physical row stride vary; poisoned suffixes must be ignored.
     Other rows contain different data, and every output is checked separately.
     """
-    from tests.helpers.ordered_reduce_gluon_kernels import reduction_probe
 
     values = torch.randn(129, generator=torch.Generator().manual_seed(17))
     if operation == "product":
@@ -331,7 +349,7 @@ def test_inferred_precision_and_prefix_do_not_depend_on_batch(
         x = storage.to(gluon_device)
         before = x.clone()
         out = torch.empty(batch_size, device=gluon_device, dtype=dtype)
-        reduction_probe[(batch_size,)](
+        gluon_kernels.reduction_probe[(batch_size,)](
             x,
             out,
             x.stride(0),

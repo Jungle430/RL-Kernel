@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Gluon conformance kernels with an explicit target warp/wave width."""
+"""Suite-local Gluon callers, imported only after checking frontend availability."""
 
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
@@ -54,6 +54,27 @@ def reduction_probe(
         value = ordered.product(input, LENGTH, COMPUTE, BLOCK, GROUP, BATCH, ELEMENTS, WARP_SIZE)
     gl.static_assert(value.dtype == out.dtype.element_ty, "result precision must precede storage")
     gl.store(out + row, value)
+
+
+@gluon.jit
+def partial_probe(
+    x,
+    partials,
+    stride,
+    LENGTH: gl.constexpr,
+    BLOCK: gl.constexpr,
+    GROUP: gl.constexpr,
+    ELEMENTS: gl.constexpr,
+    WARP_SIZE: gl.constexpr,
+):
+    """Embed the public loaded helper in independent, masked tile producers."""
+    row = gl.program_id(0).to(gl.int64)
+    tile = gl.program_id(1).to(gl.int64)
+    layout: gl.constexpr = gl.BlockedLayout([ELEMENTS], [WARP_SIZE], [gl.num_warps()], [0])
+    columns = tile * BLOCK + gl.arange(0, BLOCK, layout=layout)
+    values = gl.load(x + row * stride + columns, columns < LENGTH, other=0).to(gl.float32)
+    total = ordered.sum(values, MAX_GROUP_SIZE=GROUP, WARP_SIZE=WARP_SIZE)
+    gl.store(partials + row * gl.cdiv(LENGTH, BLOCK) + tile, total)
 
 
 @gluon.jit

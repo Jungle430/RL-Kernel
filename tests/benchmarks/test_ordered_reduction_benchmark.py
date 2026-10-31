@@ -16,6 +16,7 @@ import torch
 from benchmarks.backends.shared.triton.benchmark_ordered_reduction import (
     MODULE,
     accuracy,
+    check_replay,
     main,
     markdown,
     parser,
@@ -231,136 +232,16 @@ def test_round_aggregation_keeps_raw_samples_and_exposes_variation():
             summarize(samples)
 
 
-@pytest.fixture
-def cpu_benchmark_worker(monkeypatch):
-    """Run real worker validation/reporting with CPU tensors and a simulated CUDA graph.
-
-    Only device execution and timing are replaced. This lets the replay gate
-    reject a deliberately broken replay without requiring a GPU in unit CI.
-    """
-    from benchmarks.backends.shared.triton import benchmark_ordered_reduction as benchmark
-
-    state = SimpleNamespace(capturing=None, omit_replay=False, measured=[])
-    call_keys = {}
-
-    class Graph:
-        def __init__(self):
-            self.calls = []
-
-        def replay(self):
-            if not state.omit_replay:
-                for call in self.calls:
-                    call()
-
-    @contextmanager
-    def capture(graph):
-        state.capturing = graph
-        try:
-            yield
-        finally:
-            state.capturing = None
-        call_keys[graph.replay] = [call_keys[graph.calls[0]][0], "graph"]
-
-    class CpuTorch:
-        cuda = SimpleNamespace(
-            is_available=lambda: True,
-            set_device=lambda device: None,
-            get_device_name=lambda device: "CPU test double",
-            get_device_capability=lambda device: (0, 0),
-            get_device_properties=lambda device: SimpleNamespace(
-                multi_processor_count=1, total_memory=2**30
-            ),
-            mem_get_info=lambda device: (2**30, 2**30),
-            synchronize=lambda: None,
-            reset_peak_memory_stats=lambda: None,
-            memory_allocated=lambda: 0,
-            max_memory_allocated=lambda: 0,
-            CUDAGraph=Graph,
-            graph=capture,
-        )
-
-        def device(self, *args):
-            return torch.device("cpu")
-
-        def __getattr__(self, name):
-            return getattr(torch, name)
-
-    def make_call(x, out, length, provider, tree):
-        def call():
-            if state.capturing is not None:
-                state.capturing.calls.append(call)
-            out.copy_(torch.sum(x[:, :length], dim=-1, dtype=torch.float32))
-
-        call_keys[call] = [provider["name"], "eager"]
-        return call, 0
-
-    def measure(call, warmup, repeat, divisor):
-        state.measured.append(call_keys[call])
-        call()
-        return [0.001] * repeat
-
-    triton = ModuleType("triton")
-    triton.__version__ = "test-double"
-    triton.runtime = SimpleNamespace(
-        driver=SimpleNamespace(
-            active=SimpleNamespace(get_current_target=lambda: SimpleNamespace(warp_size=32))
-        )
-    )
-    kernels = ModuleType("ordered_reduction_kernels")
-    kernels.make_call = make_call
-    monkeypatch.setitem(sys.modules, "triton", triton)
-    monkeypatch.setitem(
-        sys.modules, "benchmarks.backends.shared.triton.ordered_reduction_kernels", kernels
-    )
-    monkeypatch.setattr(benchmark, "torch", CpuTorch())
-    # Device-to-host copies own their storage; CPU Tensor.cpu() normally aliases it.
-    monkeypatch.setattr(torch.Tensor, "cpu", lambda self: self.clone())
-    monkeypatch.setattr(benchmark, "measure", measure)
-    clock = iter(range(1000))
-    monkeypatch.setattr(benchmark, "time", SimpleNamespace(monotonic=lambda: next(clock)))
-    spec = plan(
-        parser().parse_args(
-            ["--shapes", "3x9", "--dtypes", "fp32", "--rounds", "3", "--graph-calls", "2"]
-        )
-    )["cases"][0]
-    spec["providers"] = [dict(name=name, family="torch") for name in ("first", "second")]
-    return benchmark, state, spec
-
-
-@pytest.mark.parametrize("omit_replay", (False, True))
-def test_worker_replay_check_rejects_unchanged_eager_output(
-    cpu_benchmark_worker, tmp_path, omit_replay
-):
-    """A no-op replay must fail even though eager execution left a correct result."""
-    benchmark, state, spec = cpu_benchmark_worker
-    state.omit_replay = omit_replay
-    path = tmp_path / "result.json"
-    if omit_replay:
-        with pytest.raises(AssertionError, match="graph replay changed output bits"):
-            benchmark.run_case(spec, path)
-    else:
-        benchmark.run_case(spec, path)
-    report = json.loads(path.read_text())
-    assert report["complete"] is not omit_replay
-    if omit_replay:
-        assert "graph replay changed output bits" in report["error"]
-        assert state.measured == []
-    else:
-        assert state.measured
-
-
-def test_worker_records_actual_measurement_order_each_round(cpu_benchmark_worker, tmp_path):
-    """Saved order must match actual timing calls, including their eager/graph mode."""
-    benchmark, state, spec = cpu_benchmark_worker
-    path = tmp_path / "result.json"
-    benchmark.run_case(spec, path)
-    report = json.loads(path.read_text())
-    orders = report["round_orders"]
-    assert len(orders) == spec["rounds"]
-    expected_keys = {(p["name"], timing) for p in spec["providers"] for timing in spec["timings"]}
-    assert all(len(order) == len(expected_keys) for order in orders)
-    assert all({tuple(key) for key in order} == expected_keys for order in orders)
-    assert [key for order in orders for key in order] == state.measured
+def test_replay_check_rejects_stale_output():
+    """Test the failure gate directly; real capture/replay is covered on GPU below."""
+    expected = torch.tensor([1.0, -0.0])
+    output = expected.clone()
+    with pytest.raises(AssertionError, match="graph replay changed output bits"):
+        check_replay(lambda: None, output, expected, "no-op")
+    check_replay(lambda: output.copy_(expected), output, expected, "valid")
+    wrong_sign = torch.tensor([1.0, 0.0])
+    with pytest.raises(AssertionError, match="graph replay changed output bits"):
+        check_replay(lambda: output.copy_(wrong_sign), output, expected, "wrong-result")
 
 
 def test_worker_timeout_returns_control_and_preserves_log(tmp_path):
@@ -463,8 +344,10 @@ def test_markdown_compares_matching_timing_modes_and_hides_incomplete_results():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA/ROCm GPU is required")
-@pytest.mark.parametrize("timings", (["graph"], ["eager", "graph"]))
-def test_gpu_benchmark_smoke_checks_all_providers_and_replays(tmp_path, timings):
+@pytest.mark.parametrize("timings,include_gluon", ((["graph"], False), (["eager", "graph"], True)))
+def test_gpu_benchmark_smoke_checks_all_providers_and_replays(tmp_path, timings, include_gluon):
+    if include_gluon:
+        pytest.importorskip("triton.experimental.gluon")
     args = parser().parse_args(
         [
             "--shapes",
@@ -483,6 +366,7 @@ def test_gpu_benchmark_smoke_checks_all_providers_and_replays(tmp_path, timings)
             "2",
             "--pipeline-stages",
             "0",
+            *(["--include-gluon"] if include_gluon else []),
             "--timings",
             *timings,
         ]
@@ -502,3 +386,7 @@ def test_gpu_benchmark_smoke_checks_all_providers_and_replays(tmp_path, timings)
     assert len(result["round_orders"]) == spec["rounds"]
     assert all({tuple(key) for key in order} == expected_keys for order in result["round_orders"])
     assert all(row["accuracy"]["passed"] and row["median_ms"] > 0 for row in result["results"])
+    for row in result["results"]:
+        assert len(row["samples_ms"]) == spec["rounds"]
+        assert all(len(samples) == spec["repeat"] for samples in row["samples_ms"])
+        assert "rounds" not in row  # Raw samples have one report field, not two copies.

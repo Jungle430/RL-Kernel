@@ -1,5 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Launch adapters for device-local reduction tests; no operator dependencies."""
+"""Small JIT callers shared by this backend's GPU and compiler tests.
+
+Imported lazily so CPU reference tests never need a Triton installation. These
+adapters exercise the real helpers; they contain no second reduction algorithm.
+"""
 
 import triton
 import triton.language as tl
@@ -133,43 +137,26 @@ def ordered_reduce_serial_probe(
 
 
 @triton.jit
-def tile_unroll_probe(
-    values_ptr,
-    output_ptr,
-    LENGTH: tl.constexpr,
-    REDUCE_FN: tl.constexpr,
-    TILE_UNROLL: tl.constexpr,
-    PIPELINE_STAGES: tl.constexpr,
-):
-    """Exercise the public serial execution override without changing its tree."""
-    row = tl.program_id(0).to(tl.int64)
-    total = REDUCE_FN(
-        values_ptr + row * LENGTH,
-        length=LENGTH,
-        COMPUTE_DTYPE=tl.float32,
-        TILE_UNROLL=TILE_UNROLL,
-        PIPELINE_STAGES=PIPELINE_STAGES,
-    )
-    tl.store(output_ptr + row, total)
-
-
-@triton.jit
 def ordered_reduce_partial_probe(
     input_ptr,
     partials_ptr,
+    row_stride,
     LENGTH: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     MAX_GROUP_SIZE: tl.constexpr,
     COMBINE_FN: tl.constexpr,
     IDENTITY: tl.constexpr,
+    REVERSE_TILES: tl.constexpr,
     COMPUTE_DTYPE: tl.constexpr = tl.float32,
 ):
-    """Expose the parallel schedule's independently computed partials."""
+    """Write fixed tile slots from contiguous or padded rows, in either producer order."""
     row = tl.program_id(0).to(tl.int64)
     tile = tl.program_id(1).to(tl.int64)
     n_tiles: tl.constexpr = (LENGTH + BLOCK_SIZE - 1) // BLOCK_SIZE
+    if REVERSE_TILES:
+        tile = n_tiles - 1 - tile
     partial = ordered_reduce_partial(
-        input_ptr + row * LENGTH,
+        input_ptr + row * row_stride,
         LENGTH,
         tile,
         BLOCK_SIZE=BLOCK_SIZE,
@@ -191,7 +178,7 @@ def ordered_reduce_merge_probe(
     COMBINE_FN: tl.constexpr,
     COMPUTE_DTYPE: tl.constexpr = tl.float32,
 ):
-    """Expose the ordered merge without any subsequent logarithm."""
+    """Merge fixed row slots with a loaded seed, without extra output arithmetic."""
     row = tl.program_id(0).to(tl.int64)
     total = ordered_reduce_merge(
         partials_ptr + row * N_TILES,
@@ -231,22 +218,25 @@ def ordered_reduce_constexpr_seed_probe(
 def configured_vector_probe(
     input_ptr,
     output_ptr,
+    row_stride,
     LENGTH: tl.constexpr,
     COMPUTE_DTYPE: tl.constexpr,
     REDUCE_FN: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     MAX_GROUP_SIZE: tl.constexpr,
     PIPELINE_STAGES: tl.constexpr,
+    TILE_UNROLL: tl.constexpr,
 ):
     """Exercise a public vector helper with explicit arithmetic and loop scheduling."""
     row = tl.program_id(0).to(tl.int64)
     total = REDUCE_FN(
-        input_ptr + row * LENGTH,
+        input_ptr + row * row_stride,
         LENGTH,
         COMPUTE_DTYPE=COMPUTE_DTYPE,
         BLOCK_SIZE=BLOCK_SIZE,
         MAX_GROUP_SIZE=MAX_GROUP_SIZE,
         PIPELINE_STAGES=PIPELINE_STAGES,
+        TILE_UNROLL=TILE_UNROLL,
     )
     tl.store(output_ptr + row, total)
 
