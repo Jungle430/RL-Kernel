@@ -2,6 +2,7 @@
 """Benchmark planning, validation, timeout recovery and GPU smoke coverage."""
 
 import json
+import subprocess
 import sys
 import time
 from contextlib import contextmanager
@@ -19,6 +20,7 @@ from benchmarks.backends.shared.triton.benchmark_ordered_reduction import (
     markdown,
     parser,
     plan,
+    provenance,
     run_isolated,
     summarize,
 )
@@ -240,6 +242,65 @@ def test_worker_timeout_returns_control_and_preserves_log(tmp_path):
     assert code != 0 and timed_out
     assert time.monotonic() - started < 10
     assert "compile" in log.read_text()
+
+
+@pytest.mark.parametrize("git_failure", ("missing", "not-checkout", "timeout"))
+def test_unavailable_git_keeps_benchmark_running_and_marks_metadata_unknown(
+    monkeypatch, tmp_path, git_failure
+):
+    """A completed worker stays reportable even when source Git metadata is unavailable."""
+    from benchmarks.backends.shared.triton import benchmark_ordered_reduction as benchmark
+
+    def unavailable_git(command, **kwargs):
+        if git_failure == "missing":
+            raise FileNotFoundError("git executable is not installed")
+        if git_failure == "not-checkout":
+            raise subprocess.CalledProcessError(128, command, stderr="not a git repository")
+        raise subprocess.TimeoutExpired(command, kwargs["timeout"])
+
+    def completed_worker(command, log, timeout):
+        # Stub only GPU execution; exercise real planning, provenance and report writing.
+        spec = json.loads(command[-2])
+        Path(command[-1]).write_text(json.dumps(dict(spec=spec, complete=True, results=[])))
+        return 0, False
+
+    monkeypatch.setattr(subprocess, "check_output", unavailable_git)
+    monkeypatch.setattr(benchmark, "run_isolated", completed_worker)
+    folder = tmp_path / "results"
+    assert main(["--shapes", "1x1025", "--dtypes", "bf16", "--output-dir", str(folder)]) == 0
+    report = json.loads((folder / "results.json").read_text())
+    assert report["complete"] and len(report["cases"]) == 1
+    source = report["source"]
+    assert source["commit"] is None and source["worktree"] is None
+    assert set(source["git_errors"]) == {"commit", "worktree"}
+    assert all(source["git_errors"].values())
+    assert source["source_sha256"]
+    assert all(len(digest) == 64 for digest in source["source_sha256"].values())
+    rendered = (folder / "report.md").read_text()
+    assert "Source commit: `unavailable`; dirty worktree: unknown." in rendered
+    assert "dirty worktree: False" not in rendered
+    assert "Git metadata unavailable (commit)" in rendered
+
+
+@pytest.mark.parametrize("worktree", ("", " M measured.py\n", None))
+def test_provenance_retains_available_git_fields(monkeypatch, worktree):
+    """A failed status query must not erase a known revision or imply a clean worktree."""
+
+    def git_output(command, **kwargs):
+        if command[1:] == ["rev-parse", "HEAD"]:
+            return "measured-revision\n"
+        if worktree is None:
+            raise subprocess.CalledProcessError(128, command)
+        return worktree
+
+    monkeypatch.setattr(subprocess, "check_output", git_output)
+    source = provenance()
+    assert source["commit"] == "measured-revision"
+    assert source["worktree"] == worktree
+    assert set(source["git_errors"]) == ({"worktree"} if worktree is None else set())
+    rendered = markdown(dict(complete=True, cases=[], source=source))
+    expected_dirty = "unknown" if worktree is None else str(bool(worktree))
+    assert f"dirty worktree: {expected_dirty}." in rendered
 
 
 def test_markdown_compares_matching_timing_modes_and_hides_incomplete_results():

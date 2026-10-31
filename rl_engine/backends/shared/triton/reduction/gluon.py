@@ -367,7 +367,8 @@ def reduce_partials(
     columns = gl.arange(0, WIDTH, layout=gl.BlockedLayout([1], [WARP_SIZE], [gl.num_warps()], [0]))
     total = gl.cast(initial, dtype)
     for window in range(n_tiles // WIDTH):
-        values = gl.load(partials_ptr + window * WIDTH + columns)
+        # Widen before multiplying: the element offset can exceed int32.
+        values = gl.load(partials_ptr + gl.cast(window, gl.int64) * WIDTH + columns)
         total = _fold_partials(values, total, WIDTH, COMBINE_FN, WARP_SIZE)
     if n_tiles % WIDTH:
         values = gl.load(

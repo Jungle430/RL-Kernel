@@ -29,6 +29,7 @@ def reduction_probe(
     COMPUTE: gl.constexpr,
     WARP_SIZE: gl.constexpr,
 ):
+    """Reduce one logical row per program through the public loaded/pointer APIs."""
     row = gl.program_id(0).to(gl.int64)
     input = x + row * stride
     if LOADED:
@@ -56,16 +57,31 @@ def reduction_probe(
 
 
 @gluon.jit
-def merge_probe(
-    x, out, stride, COUNT: gl.constexpr, OP: gl.constexpr, seed, WARP_SIZE: gl.constexpr
-):
+def merge_probe(x, out, stride, COUNT: gl.constexpr, OP: gl.constexpr, WARP_SIZE: gl.constexpr):
+    """Exercise convenience merges, which always use their operation's identity."""
+    gl.static_assert(OP == "sum" or OP == "product", "expected sum or product")
     row = gl.program_id(0).to(gl.int64)
     if OP == "sum":
         value = ordered.sum_partials(x + row * stride, COUNT, WARP_SIZE=WARP_SIZE)
-    elif OP == "product":
-        value = ordered.product_partials(x + row * stride, COUNT, WARP_SIZE=WARP_SIZE)
     else:
-        value = ordered.reduce_partials(
-            x + row * stride, COUNT, xor_pair, seed, WARP_SIZE=WARP_SIZE
-        )
+        value = ordered.product_partials(x + row * stride, COUNT, WARP_SIZE=WARP_SIZE)
+    gl.store(out + row, value)
+
+
+@gluon.jit
+def seeded_merge_probe(
+    x,
+    out,
+    initial_ptr,
+    stride,
+    COUNT: gl.constexpr,
+    COMBINE_FN: gl.constexpr,
+    WARP_SIZE: gl.constexpr,
+):
+    """Pass a distinct runtime seed per row through the generic merge API."""
+    row = gl.program_id(0).to(gl.int64)
+    initial = gl.load(initial_ptr + row)
+    value = ordered.reduce_partials(
+        x + row * stride, COUNT, COMBINE_FN, initial, WARP_SIZE=WARP_SIZE
+    )
     gl.store(out + row, value)

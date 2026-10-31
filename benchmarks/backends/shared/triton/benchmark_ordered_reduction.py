@@ -447,6 +447,12 @@ def run_isolated(command, log, timeout):
 
 
 def provenance():
+    """Hash measured sources and collect best-effort Git metadata.
+
+    Source archives and minimal GPU images may lack a Git checkout or binary.
+    Preserve missing fields as None, with an explicit reason, rather than
+    aborting measurements or presenting an unknown worktree as clean.
+    """
     files = [
         Path(__file__),
         Path(__file__).with_name("ordered_reduction_kernels.py"),
@@ -457,9 +463,26 @@ def provenance():
         ROOT / "rl_engine/contracts/operators/ordered_reduction.py",
         ROOT / "rl_engine/contracts/profiles/precision/ws1.json",
     ]
+    metadata: dict[str, str | None] = dict(commit=None, worktree=None)
+    git_errors = {}
+    for field, arguments in (
+        ("commit", ["rev-parse", "HEAD"]),
+        ("worktree", ["status", "--short"]),
+    ):
+        try:
+            output = subprocess.check_output(
+                ["git", *arguments],
+                cwd=ROOT,
+                text=True,
+                stderr=subprocess.PIPE,
+                timeout=5,
+            )
+            metadata[field] = output.strip() if field == "commit" else output
+        except (OSError, subprocess.SubprocessError) as error:
+            git_errors[field] = str(error)
     return dict(
-        commit=subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip(),
-        worktree=subprocess.check_output(["git", "status", "--short"], cwd=ROOT, text=True),
+        **metadata,
+        git_errors=git_errors,
         source_sha256={
             str(p.relative_to(ROOT)): hashlib.sha256(p.read_bytes()).hexdigest() for p in files
         },
@@ -467,13 +490,19 @@ def provenance():
 
 
 def markdown(report):
+    """Render completed timings and explicitly distinguish unknown source metadata."""
+    source = report["source"]
+    dirty = "unknown" if source["worktree"] is None else str(bool(source["worktree"]))
     lines = [
         "# Ordered sum benchmark",
         "",
         f"Complete: {report['complete']}",
         "",
-        f"Source commit: `{report['source']['commit']}`; "
-        f"dirty worktree: {bool(report['source']['worktree'])}.",
+        f"Source commit: `{source['commit'] or 'unavailable'}`; dirty worktree: {dirty}.",
+        *[
+            f"Git metadata unavailable ({field}): {error}"
+            for field, error in source.get("git_errors", {}).items()
+        ],
         "",
         "FP16/BF16/FP32 inputs; all providers accumulate and output FP32. "
         "Eager torch.sum(out=...) and native tl.sum are independent-tree performance baselines.",
