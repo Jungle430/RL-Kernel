@@ -6,18 +6,18 @@ The benchmark compares them with **ordinary `torch.sum`** and **native `tl.sum`*
 the explicit same-tree PyTorch implementation is a correctness reference, not a
 speedup baseline.
 
-This page reports the final H100 confirmation at
-`1a2063b595f2154b677238911e74352ce1a95835`, also reported in
+This page reports the post-review H100 regression at
+`4fd7469e7e273adb3bc82adbe547705c336caeec`, also reported in
 [PR #595](https://github.com/RL-Align/RL-Kernel/pull/595). It supersedes the earlier
-tuning snapshot. All counts and timings below describe that measured revision,
-not a GPU rerun of subsequent changes.
+confirmation run. All counts and timings below describe that measured revision;
+subsequent report-only updates do not change the measured kernels.
 
 ## Environment and scope
 
-- GPU: NVIDIA H100 80GB HBM3, compute capability 9.0, 132 SMs; PCI bus `00000000:BB:00.0`.
+- GPU: NVIDIA H100 80GB HBM3, compute capability 9.0, 132 SMs; PCI bus `00000000:65:00.0`.
 - NVIDIA driver: 595.91.07; PyTorch CUDA runtime: 13.0.
 - Python 3.12.3, PyTorch 2.13.0+cu130, Triton 3.7.1.
-- Run completed on 2026-10-30 at 16:14:46 UTC (2026-10-31 in Asia/Shanghai).
+- Run completed on 2026-10-31 at 07:11:11 UTC (15:11:11 Asia/Shanghai).
 
 The run covered **39 shape/dtype cases and 159 provider measurements**. Inputs
 are FP16/BF16/FP32; all providers accumulate and output FP32. Arithmetic tiles
@@ -55,7 +55,7 @@ measurement's maximum/minimum round-median ratio exceeded 1.15.
 Before timing, candidates passed independent FP64 accuracy, sampled fixed-tree
 PyTorch bitwise checks and all-row equality across ordered schedules. Graph
 replay was checked against the eagerly launched result. The full H100 regression
-at the measured revision passed **2562 tests, with zero skips, failures or
+at the measured revision passed **2580 tests, with zero skips, failures or
 errors**, covering references, Triton/Gluon helpers and benchmark tests.
 
 ## Representative results
@@ -67,21 +67,21 @@ rows use one program per input row.
 
 | Shape | Input | torch.sum | Native tl.sum | Ordered Triton | Ordered Gluon |
 | --- | --- | ---: | ---: | ---: | ---: |
-| 128×8193 | FP16 | 3.017 | 1.856 | 3.157 | 2.040 |
-| 128×8193 | BF16 | 3.076 | 1.856 | 3.196 | 2.053 |
-| 128×8193 | FP32 | 3.334 | 2.009 | 3.300 | 2.294 |
-| 16×262144 | FP16 | 8.989 | 4.589 | 5.124 | 5.008 |
-| 16×262144 | BF16 | 8.965 | 4.574 | 5.122 | 5.022 |
-| 16×262144 | FP32 | 10.178 | 4.732 | 5.489 | 5.287 |
-| 1024×262144 | FP16 | 174.754 | 177.344 | 178.551 | 186.751 |
-| 1024×262144 | BF16 | 174.793 | 177.270 | 178.399 | 186.450 |
-| 1024×262144 | FP32 | 345.174 | 348.223 | 348.358 | 344.869 |
+| 128×8193 | FP16 | 3.027 | 1.855 | 3.169 | 2.034 |
+| 128×8193 | BF16 | 3.008 | 1.870 | 3.216 | 2.035 |
+| 128×8193 | FP32 | 3.332 | 2.006 | 3.317 | 2.267 |
+| 16×262144 | FP16 | 8.958 | 4.588 | 5.110 | 4.983 |
+| 16×262144 | BF16 | 8.975 | 4.570 | 5.126 | 5.020 |
+| 16×262144 | FP32 | 10.068 | 4.742 | 5.480 | 5.283 |
+| 1024×262144 | FP16 | 171.620 | 173.295 | 173.158 | 172.051 |
+| 1024×262144 | BF16 | 171.664 | 173.185 | 173.170 | 171.772 |
+| 1024×262144 | FP32 | 338.087 | 338.964 | 337.432 | 335.560 |
 
-For `[128,8193]`, Gluon latency exceeds native Triton by 9.9% (FP16), 10.6%
-(BF16) and 14.2% (FP32). Here and below, percent overhead means
+For `[128,8193]`, Gluon latency exceeds native Triton by 9.7% (FP16), 8.9%
+(BF16) and 13.0% (FP32). Here and below, percent overhead means
 `100 × (ordered latency / baseline latency - 1)`. On the largest matrices,
-ordinary Triton stays close to native Triton, while Gluon ranges from about
-1% faster to 5.3% slower. Gluon is not consistently faster for every small input.
+ordinary Triton stays close to native Triton, while Gluon is about 0.7–1.0%
+faster on this run. Gluon is not consistently faster for every small input.
 
 Few rows and a very long reduction require enough independent programs. For
 `[16,262144]`, a row-only Gluon launch creates just 16 programs; the parallel caller
@@ -105,26 +105,30 @@ wider allowance applies. Each baseline is assessed separately.
 | Implementation | Against torch.sum | Against native tl.sum |
 | --- | ---: | ---: |
 | Ordered Triton | 39/39 | 16/39 |
-| Ordered Gluon | 39/39 | 37/39 |
+| Ordered Gluon | 39/39 | 38/39 |
 
-Two Gluon cases remain outside the strict native-Triton gate:
+One Gluon case remains outside the strict native-Triton gate:
 
 | Input / shape | Overhead | Extra latency | Beyond the allowance |
 | --- | ---: | ---: | ---: |
-| FP32 128×16385 | +19.01% | +0.502375 µs | 0.002375 µs |
-| FP32 16×262144 | +11.72% | +0.554750 µs | 0.054750 µs |
+| FP32 16×262144 | +11.39% | +0.540375 µs | 0.040375 µs |
 
-These near-boundary results were accepted for the current work, but remain
-explicitly recorded as misses rather than counted as passing the strict gate.
+This remains a near-boundary miss, rather than a strict pass. The other previous
+boundary case, FP32 `[128,16385]`, falls inside the gate on this run; the changed
+pass count is not evidence of a new kernel optimization. With the identical
+frozen plan, the largest per-case latency increase from the preceding run was
+1.76% for ordinary Triton and 1.83% for Gluon. The attachment records both runs'
+comparison and all current measurements.
+
 Upper layers can keep ordinary Triton or choose a separately qualified Gluon
 kernel. The library does not select a backend, promise these speedups for every
 input, or substitute a different arithmetic tree for performance.
 
 ## Evidence and reproduction
 
-Download the [H100 test and benchmark bundle](https://github.com/user-attachments/files/34192793/ordered-reduction-h100-final-20261031.zip).
+Download the [H100 test and benchmark bundle](https://github.com/user-attachments/files/34211949/ordered-reduction-h100-review-20261031.zip).
 Its ZIP SHA256 is
-`c551e209dd9a21cbe41f4e045fa90bab2b5add9081f50897dac3633309fd1bc9`.
+`1a94ba54fba5e9519f480122117b5e30ba6e3915de044d997e4a4b5b4ea96b66`.
 Measurements and archives are PR attachments, outside the source diff.
 
 The bundle contains:
@@ -137,25 +141,23 @@ The bundle contains:
   `raw/nvidia-smi.txt`, `raw/packages.txt`: measured source and hardware/software identity.
 - `latency.csv`, `summary.json`, the figures and `SHA256SUMS`: selected results,
   acceptance calculations and attachment checksums.
-- `raw/run_final.py` and `raw/setup.sh`: the original run driver and environment setup.
-- `historical/`: the earlier tuning snapshot, kept separately from the final run.
+- `raw/run_final.py`, `raw/setup.sh`, `raw/run_all.sh` and `raw/reproduce.sh`: the
+  measured driver, setup, timeout/packaging wrapper and pinned-revision replay.
+- `comparison.json`: per-case changes from the preceding confirmation run, with
+  both source revisions and unchanged provider settings.
 
-The driver uses fixed `/root` paths. To repeat the recorded run, prepare the
-versions listed above using the package commands in `raw/setup.sh`, install the
-repository at `/root/RL-Kernel-ordered-final`, and select the measured revision
-explicitly. The original setup script's shallow branch clone now follows a newer
-head; it must not be mistaken for a checkout of the measured commit.
-
-From the extracted bundle directory, the reproduction command is:
+The driver uses fixed `/root` paths. On a fresh H100 host with Git, Python 3.12
+and uv installed, run the following from the extracted bundle directory:
 
 ```bash
-git -C /root/RL-Kernel-ordered-final checkout --detach \
-  1a2063b595f2154b677238911e74352ce1a95835
-mkdir -p /root/ordered-reduction-final
-cp raw/run_final.py raw/frozen-plan.json /root/ordered-reduction-final/
-cd /root/RL-Kernel-ordered-final
-/root/ordered-final-py/bin/python -u /root/ordered-reduction-final/run_final.py
+bash raw/reproduce.sh
 ```
+
+This fetches the measured commit directly, rather than following the moving
+branch head, installs the recorded PyTorch/Triton versions, and then runs the
+regression and frozen benchmark. It refuses to overwrite existing source or
+result directories. Results are written to `/root/ordered-reduction-review` and
+packaged as `/root/ordered-reduction-review-20261031.tar.gz`.
 
 The driver first runs the following regression with a 1200-second overall timeout
 and a 90-second per-test timeout, then invokes the maintained benchmark worker
@@ -164,7 +166,7 @@ for each frozen case with a 180-second per-case timeout:
 ```bash
 python -m pytest tests/reference/reduction tests/backends/shared/triton/reduction \
   tests/benchmarks/test_ordered_reduction_benchmark.py -q -rs -x \
-  --timeout=90 --junitxml=/root/ordered-reduction-final/pytest.xml
+  --timeout=90 --junitxml=/root/ordered-reduction-review/pytest.xml
 ```
 
 The maintained benchmark CLI uses one explicit configuration per schedule. A
