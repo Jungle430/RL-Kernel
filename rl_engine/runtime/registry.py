@@ -219,6 +219,8 @@ class OpBackend(Enum, metaclass=_KernelEnumMeta):
     TRITON_INDEX_SELECT = (
         "rl_engine.backends.shared.triton.embedding.index_select.TritonIndexSelectOp"
     )
+    CUDA_INDEX_SELECT = "rl_engine.backends.cuda.embedding.index_select.CudaIndexSelectOp"
+    CUDA_H100_INDEX_SELECT = "rl_engine.backends.cuda.embedding.index_select.H100IndexSelectOp"
     CUDA_SM90_LM_HEAD = "rl_engine.kernels.ops.cuda.linear.lm_head.SM90LMHeadOp"
     CUDA_SM90_EMBEDDING = "rl_engine.kernels.ops.cuda.linear.embedding.SM90EmbeddingOp"
 
@@ -428,6 +430,39 @@ def _default_semantic_descriptors() -> tuple[OperatorBackendDescriptor, ...]:
             implementation_class_or_factory=OpBackend.TRITON_INDEX_SELECT.value,
             fallback_policy=OperatorFallbackPolicy.ERROR,
             version_or_build_fingerprint="rlkernel-index-select-explicit-dim-ordered-fp32-v1",
+        ),
+        OperatorBackendDescriptor(
+            semantic_op="index_select",
+            backend_id="cuda-h100-index-select",
+            supported_targets=frozenset({"rollout", "training"}),
+            supported_devices=frozenset({"cuda"}),
+            supported_dtypes=frozenset({"float32", "float16", "bfloat16"}),
+            supported_topologies={
+                "rollout": {
+                    "world_size": (1,),
+                    "tensor_parallel_size": (1,),
+                    "context_parallel_size": (1,),
+                },
+                "training": {"world_size": (1,), "sharding": ("unsharded",)},
+            },
+            determinism_or_alignment_properties={
+                "algorithm": "stable_segment_sequential_fp32_cast_once",
+                "index_order": "increasing_occurrence_per_source_coordinate",
+                "accumulator_dtype": "float32",
+                "gpu_names": ("NVIDIA H100 NVL",),
+                "cuda_sm": 90,
+                "rank_max": 32,
+                "logical_elements_max_exclusive": 2**31 - 1,
+                "integer_workspace_max_bytes": 128 * 1024 * 1024,
+                "deterministic": True,
+                "batch_invariant": True,
+                "strict_observable": True,
+                "split_policy": "none",
+            },
+            lifecycle=OperatorLifecycle.REQUEST,
+            implementation_class_or_factory=OpBackend.CUDA_H100_INDEX_SELECT.value,
+            fallback_policy=OperatorFallbackPolicy.ERROR,
+            version_or_build_fingerprint="rlkernel-index-select-h100-ordered-fp32-v1",
         ),
         OperatorBackendDescriptor(
             semantic_op="video_patch_pack_unpack",
@@ -898,7 +933,9 @@ class KernelRegistry:
                 "rms_norm": [OpBackend.PYTORCH_NATIVE_RMS_NORM],
                 "lm_head": [OpBackend.PYTORCH_NATIVE_LM_HEAD],
                 "embedding": [OpBackend.PYTORCH_NATIVE_EMBEDDING],
-                "index_select": [OpBackend.TRITON_INDEX_SELECT],
+                # Actual tensor-device gating happens at call time, not through
+                # the process-global device probe in _adjust_priority_for_hardware.
+                "index_select": [OpBackend.CUDA_INDEX_SELECT, OpBackend.TRITON_INDEX_SELECT],
                 "silu": [
                     OpBackend.CUDA_SILU,
                     OpBackend.TRITON_SILU,

@@ -41,6 +41,7 @@ OP_SPECS = {
         candidate_paths={
             "pytorch": "rl_engine.reference.embedding.index_select.NativeIndexSelectOp",
             "triton": "rl_engine.backends.shared.triton.embedding.index_select.TritonIndexSelectOp",
+            "cuda": "rl_engine.backends.cuda.embedding.index_select.H100IndexSelectOp",
         },
         grad_input_names=("x",),
     ),

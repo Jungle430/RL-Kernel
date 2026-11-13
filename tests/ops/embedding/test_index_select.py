@@ -22,6 +22,20 @@ requires_cuda = pytest.mark.skipif(
 )
 
 
+def _has_h100_backend():
+    if not torch.cuda.is_available() or torch.version.hip is not None:
+        return False
+    from rl_engine.backends.cuda.embedding.index_select import (
+        _qualified_device,
+        index_select_h100_available,
+    )
+
+    return index_select_h100_available() and _qualified_device(torch.cuda.current_device())
+
+
+requires_h100 = pytest.mark.skipif(not _has_h100_backend(), reason="requires compiled H100 backend")
+
+
 def assert_bits(actual, expected):
     assert actual.shape == expected.shape and actual.dtype == expected.dtype
     assert torch.equal(
@@ -97,15 +111,24 @@ class TestReference:
             op(x, index, 0)
 
 
-@pytest.mark.parametrize("backend", ["pytorch", pytest.param("triton", marks=requires_cuda)])
+@pytest.mark.parametrize(
+    "backend",
+    [
+        "pytorch",
+        pytest.param("triton", marks=requires_cuda),
+        pytest.param("cuda", marks=requires_h100),
+    ],
+)
 class TestSharedAxes:
     @staticmethod
     def operator(backend):
         if backend == "pytorch":
             return NativeIndexSelectOp(), torch.device("cpu")
-        from rl_engine.backends.shared.triton.embedding.index_select import (
-            TritonIndexSelectOp,
-        )
+        if backend == "cuda":
+            from rl_engine.backends.cuda.embedding.index_select import H100IndexSelectOp
+
+            return H100IndexSelectOp(), torch.device("cuda")
+        from rl_engine.backends.shared.triton.embedding.index_select import TritonIndexSelectOp
 
         return TritonIndexSelectOp(), torch.device("cuda")
 
@@ -204,12 +227,18 @@ class TestSharedAxes:
 
 @requires_cuda
 @pytest.mark.cuda_only
+@pytest.mark.parametrize("backend", ["triton", pytest.param("cuda", marks=requires_h100)])
 class TestCuda:
-    @staticmethod
-    def op():
-        from rl_engine.backends.shared.triton.embedding.index_select import (
-            TritonIndexSelectOp,
-        )
+    @pytest.fixture(autouse=True)
+    def set_backend(self, backend):
+        self.backend = backend
+
+    def op(self):
+        if self.backend == "cuda":
+            from rl_engine.backends.cuda.embedding.index_select import H100IndexSelectOp
+
+            return H100IndexSelectOp()
+        from rl_engine.backends.shared.triton.embedding.index_select import TritonIndexSelectOp
 
         return TritonIndexSelectOp()
 
@@ -229,9 +258,9 @@ class TestCuda:
         self, count, axis_size, index_dtype
     ):
         """Exercise small-sort tails, its size boundary, and packed-key overflow."""
-        from rl_engine.backends.shared.triton.embedding.index_select import (
-            _sort_index_occurrences,
-        )
+        if self.backend == "cuda":
+            pytest.skip("Triton integer-sort helper; shared contract is tested separately")
+        from rl_engine.backends.shared.triton.embedding.index_select import _sort_index_occurrences
 
         choices = torch.tensor(
             [0, axis_size - 1, 0, 0, 0, axis_size // 2, 0, axis_size - 1],
@@ -302,6 +331,8 @@ class TestCuda:
     @pytest.mark.parametrize("dtype", DTYPES)
     def test_bounded_metadata_keeps_gradient_order(self, dtype, monkeypatch):
         """Four/128 slots and stable-sort fallback must produce identical bits."""
+        if self.backend == "cuda":
+            pytest.skip("Triton workspace policy; native workspace has its own boundary test")
         import rl_engine.backends.shared.triton.embedding.index_select as implementation
 
         generator = torch.Generator().manual_seed(682)
@@ -518,7 +549,8 @@ class TestCuda:
         for a, b in zip(actual, expected, strict=True):
             assert_bits(a, b)
         event = snapshot_backward_runtime()["index_select"]
-        assert event["family"] == "triton" and "stable_segment" in event["impl"]
+        assert event["family"] == ("cuda" if _has_h100_backend() else "triton")
+        assert "stable_segment" in event["impl"]
         with pytest.raises(ValueError, match="same device"):
             op(x, index.cpu(), dim=1)
         with pytest.raises(RuntimeError, match="NVIDIA CUDA"):
@@ -551,12 +583,13 @@ class TestCuda:
         ],
     )
     def test_invalid_cuda_index_fails_in_isolated_process(self, shape, bad_index):
+        implementation = type(self.op())
         code = f"""
 import torch
-from rl_engine.backends.shared.triton.embedding.index_select import TritonIndexSelectOp
+from {implementation.__module__} import {implementation.__name__}
 x = torch.zeros({shape!r}, device='cuda')
 i = torch.tensor([{bad_index}], device='cuda')
-TritonIndexSelectOp()(x, i, dim=1)
+{implementation.__name__}()(x, i, dim=1)
 torch.cuda.synchronize()
 """
         result = subprocess.run(

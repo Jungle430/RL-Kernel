@@ -13,7 +13,13 @@ def test_index_select_dispatch_and_fail_closed(monkeypatch):
     assert descriptor.supported_devices == frozenset({"cuda"})
     assert descriptor.supported_dtypes == frozenset({"float32", "float16", "bfloat16"})
     assert descriptor.fallback_policy.value == "error"
-    assert registry._priority_map["cuda"]["index_select"] == [OpBackend.TRITON_INDEX_SELECT]
+    assert registry._priority_map["cuda"]["index_select"] == [
+        OpBackend.CUDA_INDEX_SELECT,
+        OpBackend.TRITON_INDEX_SELECT,
+    ]
+    native = registry.semantic.backend_descriptor("index_select", "cuda-h100-index-select")
+    assert native.fallback_policy.value == "error"
+    assert native.determinism_or_alignment_properties["gpu_names"] == ("NVIDIA H100 NVL",)
     for platform in ("cpu", "rocm", "musa"):
         monkeypatch.setattr(registry, "_platform_for_device", lambda _device, p=platform: p)
         with pytest.raises(RuntimeError, match="NVIDIA CUDA"):

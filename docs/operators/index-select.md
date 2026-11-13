@@ -66,7 +66,9 @@ isolated subprocesses.
 
 The Triton backend retains the original NVIDIA CUDA SM80+ eligibility.
 Model generalization does not qualify ROCm or other hardware. Production
-dispatch fails closed on unsupported platforms or a missing Triton backend.
+dispatch fails closed on unsupported platforms. On H100 NVL, a compiled exact-math
+CUDA backend is preferred for eager calls in its bounded native subset. CUDA
+Graph-captured forward calls and other eligible CUDA inputs use the shared Triton backend. A missing native extension preserves that fallback.
 The PyTorch reference can be called explicitly, including on CPU:
 
 ```python
@@ -75,8 +77,10 @@ from rl_engine.reference.embedding.index_select import NativeIndexSelectOp
 y = NativeIndexSelectOp()(x, index, dim=0)
 ```
 
-Only first-order autograd is supported. Distributed selection, compilation/
-export, and CUDA Graph capture are not qualified.
+Only first-order autograd is supported. Distributed selection and compilation/
+export are not qualified. Fixed-input CUDA Graph forward, backward, and combined
+replay are exercised by the operator benchmark; this does not qualify arbitrary
+application graph integration.
 
 ## Computation and fixed accumulation order
 
@@ -159,16 +163,57 @@ FP32 selection and CPU FP64 `index_add_`, cast to the input leaf's dtype.
 Accuracy tests use FP32 leaves for this oracle, so low-precision gradients are
 compared with an FP32 result. These references are not performance baselines.
 
+## H100 NVL native backend
+
+`H100IndexSelectOp` implements the same public contract through the precompiled
+`rl_engine._C` extension. Build it with exact CUDA math:
+
+```bash
+RL_KERNEL_REQUIRE_EXT=1 python -m pip install --no-build-isolation -e .
+```
+
+The build omits this backend when fast math or FTZ is requested, including
+relaxed options supplied through NVCC environment flags. A lightweight Python
+autograd wrapper saves the index and shape; C++ owns validation, allocation,
+device guards and kernel submission. Importing the backend does not compile it.
+
+Native dispatch is limited to the tested `NVIDIA H100 NVL` device name and SM90,
+rank at most 32, logical element counts below `2**31 - 1`, and bounded integer
+workspace. Other CUDA devices or larger shapes retain the shared implementation.
+The legacy registry selects from the actual input tensor's device at call time;
+it does not cache the process's current GPU as the dispatch decision. Native
+eager execution reduces host submission overhead. During CUDA Graph capture the
+registry uses Triton for forward calls, whose combined device replay is faster
+on most measured workloads. A backward-only capture retains the backend of its
+earlier eager forward; capture does not replace an existing autograd node.
+The strict native implementation also supports the tested Graph captures and is
+available for explicit comparisons. The explicit semantic backend `cuda-h100-index-select` fails on unsupported hardware.
+
+Small selections scan the original index with warp ballots. Larger selections
+build bounded integer occurrence slots, sort those positions, then load gradients
+in increasing original position. Large outputs separate short and queued long
+groups to keep the common path's register use low. Contiguous forward copies and
+short-group gradient reads/writes use aligned 16-byte storage packs; each element
+still has its own FP32 accumulator. Overflow groups prefetch index windows and
+scan the original vector instead of splitting the FP32 sum. Every coordinate has a single writer. Sequential
+`__fadd_rn` operations preserve the FP32 rounding boundary, including subnormals;
+the only cast to the input dtype occurs at the final store.
+
 ## Validation
 
 ```bash
 export PYTHONPATH=.
 python -m pytest -q tests/ops/embedding/test_index_select.py \
+  tests/ops/embedding/test_index_select_h100_dispatch.py \
   tests/benchmarks/test_index_select_benchmark.py
 python -m pytest -q tests/runtime/test_kernel_registry.py \
   tests/validation/operators/test_operator_inputs.py -k index_select
 python tools/validation/operators/check_operator.py \
   --op index_select --candidate triton --device cuda --dtype bf16 \
+  --select-shape 129 4 128 --select-dim 0 --check-grad --grad-mode random
+# Explicit native backend on H100 NVL after building the extension
+python tools/validation/operators/check_operator.py \
+  --op index_select --candidate cuda --device cuda --dtype bf16 \
   --select-shape 129 4 128 --select-dim 0 --check-grad --grad-mode random
 ```
 
@@ -206,6 +251,12 @@ timeout 1200 python benchmarks/operators/embedding/benchmark_index_select.py \
 timeout 1200 python benchmarks/operators/embedding/benchmark_index_select.py \
   --shapes 129x3584 4097x28x128 --dim 0 \
   --duplicates 0 0.25 --dtype bfloat16 --output reports/index-select/bagel.json
+# H100 native and actual registry dispatch, including CUDA Graph replay
+timeout 1200 python benchmarks/operators/embedding/benchmark_index_select.py \
+  --shapes 1x129x32 1x38734x96 1x110750x32 --dim 1 \
+  --duplicates 0 0.25 --dtype float32 --mode both \
+  --providers torch torch_deterministic triton cuda auto \
+  --output reports/index-select/h100.json
 ```
 
 `timeout` above is GNU timeout on the GPU host. Shapes, selected axis and
@@ -213,7 +264,8 @@ duplicate fraction are explicit; repeat with FP16/FP32/BF16 as needed. Inputs
 select about half the axis, with synthetic duplicate distributions.
 
 Compare eager `torch.index_select` + autograd, its deterministic-mode variant,
-and the ordered Triton operator. Time forward, backward and forward+backward,
+and the ordered Triton operator. `cuda` explicitly selects the H100 native
+backend; `auto` measures the real registry dispatcher. Time forward, backward and forward+backward,
 including allocation, validation, wrappers, zero fill and backward index grouping.
 Backward reuses a retained graph; combined calls construct a fresh graph.
 Input creation, reference checks, compilation and warmup are outside timing.
@@ -222,11 +274,15 @@ synchronization. Incremental peak allocated memory measures the combined call,
 excluding inputs and the already-retained graph.
 
 Before timing, compare all elements with the independent accuracy oracle;
-Triton must also match the ordered FP32 VJP bitwise and repeat exactly. Failed
+Triton, native CUDA and registry dispatch must also match the ordered FP32 VJP
+bitwise and repeat exactly. All providers retain their accuracy, repeatability
+and order mismatches in the report, including PyTorch baselines. Failed
 candidate checks stop timing and retain an incomplete report. JSON includes
 raw samples, medians, memory, source hashes, environment and completeness.
 
-An H100 NVL diagnostic on 2026-11-13 covered 13 shapes/layouts in FP32, FP16
+### Shared Triton baseline
+
+An earlier H100 NVL diagnostic on 2026-11-13 covered 13 shapes/layouts in FP32, FP16
 and BF16 (39 input combinations). The previous ordered implementation is the
 local snapshot at the beginning of this H100 run, already containing earlier
 A40 optimizations. Source fingerprints and raw measurements are retained in
@@ -288,3 +344,36 @@ The 128 MiB dense-metadata cap limits this tradeoff; it does not cap all
 operator memory or stable-sort workspace. This optimization is not a universal
 memory reduction. Keep raw reports and plots as external PR attachments rather
 than committed source.
+
+### H100 NVL native comparison
+
+The native run used the same 13 shapes/distributions across FP32, FP16 and BF16,
+with Python 3.12.3, PyTorch 2.8.0+cu128 and Triton 3.4.0. The final GPU suite
+passed 285 tests; 8 two-GPU cases and 10 Triton-only helper cases were skipped.
+Six unified-checker runs covered both H3/BAGEL axes and all three dtypes.
+Native CUDA, shared Triton and actual registry dispatch passed every benchmark
+accuracy, occurrence-order and repeat check. Ordinary/deterministic PyTorch
+retained 5/2 accuracy-failing cases and 9/0 repeat-failing cases.
+
+Measured geometric-mean speedup over shared Triton, **forward / backward / combined**
+(ratios above one mean faster; two reversed rounds using the method above):
+
+| Entry | Eager wall | CUDA Graph device |
+| --- | --- | --- |
+| Explicit native CUDA | 2.13 / 2.62 / 2.91 | 0.95 / 0.79 / 0.80 |
+| Actual registry dispatch | 1.77 / 2.58 / 2.87 | 1.00 / 0.79 / 1.00 |
+
+Native combined eager was faster than Triton in 39/39 cases, but only 8/39
+against ordinary PyTorch; actual registry dispatch was faster than ordinary
+PyTorch in 11/39. Host noise remained substantial: native combined round
+medians differed by up to 6.31x. These observations do not establish universal
+or full-model speedups. Native combined Graph replay beat Triton in only 9/39
+cases, which motivates retaining Triton for forward calls inside capture.
+Backward-only capture retains its earlier eager forward's native autograd node.
+
+Extra peak allocation also varies by shape. FP32 `[1,367986,96]`, dim=1,
+K=183993, no duplicates used 249.23 MiB native versus 212.03 MiB shared
+(+37.20 MiB). FP32 `[65537]`, dim=0, K=32768, duplicate fraction 0.25 used
+1.65 versus 33.03 MiB. The 128 MiB native limit covers integer workspace,
+not outputs or total extra allocation. Full shapes, samples, baseline failures,
+source hashes and memory measurements remain in the external evidence archive.

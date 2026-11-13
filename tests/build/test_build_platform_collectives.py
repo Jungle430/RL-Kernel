@@ -91,6 +91,18 @@ def test_cuda_build_keeps_existing_ipc_collective(monkeypatch) -> None:
     assert "-lcuda" in extension["extra_link_args"]
 
 
+@pytest.mark.parametrize(
+    "hip,fast_math,enabled", [(None, False, True), (None, True, False), ("test", False, False)]
+)
+def test_index_select_native_requires_exact_cuda_math(monkeypatch, hip, fast_math, enabled):
+    _clear_nvcc_env(monkeypatch)
+    if fast_math:
+        monkeypatch.setenv("KERNEL_ALIGN_USE_FAST_MATH", "1")
+    extension = _load_extension_config(monkeypatch, hip=hip)
+    assert (extensions.INDEX_SELECT_SOURCE in extension["sources"]) is enabled
+    assert (extensions.INDEX_SELECT_DEFINE in extension["extra_compile_args"]["cxx"]) is enabled
+
+
 def test_force_musa_enables_cross_compile_without_visible_device(monkeypatch) -> None:
     fake_torch = SimpleNamespace(musa=SimpleNamespace(is_available=lambda: False))
     monkeypatch.setitem(sys.modules, "torch_musa", SimpleNamespace())
@@ -172,10 +184,13 @@ def test_relaxed_math_nvcc_flags_from_the_environment_exclude_bitwise_h3_kernels
     assert _relaxed_math_reason() is None  # a leaked variable would fail the control, not the flags
     control = _load_extension_config(monkeypatch, hip=None)
     assert set(H3_BITWISE_SOURCES) <= set(control["sources"])  # the flags are the only difference
+    assert extensions.INDEX_SELECT_SOURCE in control["sources"]
 
     monkeypatch.setenv(variable, flags)
     with pytest.warns(RuntimeWarning, match="bitwise MiniMax-H3 kernels"):
         extension = _load_extension_config(monkeypatch, hip=None)
+    assert extensions.INDEX_SELECT_SOURCE not in extension["sources"]
+    assert extensions.INDEX_SELECT_DEFINE not in extension["extra_compile_args"]["cxx"]
 
     assert not [s for s in extension["sources"] if s.startswith("csrc/cuda/h3/")]
     assert H3_KERNELS_DEFINE not in extension["extra_compile_args"]["cxx"]

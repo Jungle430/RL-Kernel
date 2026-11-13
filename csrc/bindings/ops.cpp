@@ -561,9 +561,24 @@ torch::Tensor h3_gate_residual_backward_dy(torch::Tensor grad, torch::Tensor gat
                                            torch::Tensor index);
 #endif
 
+#if defined(KERNEL_ALIGN_WITH_INDEX_SELECT_H100)
+torch::Tensor index_select_h100_forward(torch::Tensor x, torch::Tensor index, int64_t dim);
+torch::Tensor index_select_h100_backward(torch::Tensor grad, torch::Tensor index,
+                                         std::vector<int64_t> input_shape, int64_t dim);
+#endif
+
 // PyBind11 Module Registration
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.doc() = "RL-Kernel High-Performance Operator Extension Library";
+
+#if defined(KERNEL_ALIGN_WITH_INDEX_SELECT_H100)
+    m.def("index_select_h100_forward", &index_select_h100_forward,
+          "H100 NVL index_select bit-preserving forward", py::arg("x"), py::arg("index"),
+          py::arg("dim"));
+    m.def("index_select_h100_backward", &index_select_h100_backward,
+          "H100 NVL original-order FP32 input gradient", py::arg("grad"), py::arg("index"),
+          py::arg("input_shape"), py::arg("dim"));
+#endif
 
     m.def("fused_logp", &fused_logp_forward, "Fused logp forward fallback");
 #if !defined(USE_ROCM) && !defined(KERNEL_ALIGN_WITH_ROCM)

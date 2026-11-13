@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 RL-Kernel Contributors
 
-"""Eager index_select/autograd vs ordered Triton, with all-element accuracy gates.
+"""Public index_select/autograd benchmarks with all-element accuracy gates.
 
-Run from the checkout with PYTHONPATH=.; no extension build is required.
+Run from the checkout with PYTHONPATH=.; --providers cuda requires the extension.
 JSON includes every sample, source hashes, environment and failing comparisons.
 Native PyTorch and its deterministic-mode variant are performance baselines;
 the CPU FP64 reference is an accuracy oracle and is never timed.
@@ -32,6 +32,8 @@ ROOT = Path(__file__).resolve().parents[3]
 SOURCE_PATHS = (
     "rl_engine/reference/embedding/index_select.py",
     "rl_engine/backends/shared/triton/embedding/index_select.py",
+    "rl_engine/backends/cuda/embedding/index_select.py",
+    "csrc/cuda/embedding/index_select_h100.cu",
     "benchmarks/operators/embedding/benchmark_index_select.py",
     "rl_engine/contracts/profiles/precision/ws1.json",
 )
@@ -141,6 +143,61 @@ def measure(op, x, index, grad, warmup, samples):
     return timings
 
 
+def measure_graph(op, x, index, grad, expected_y, expected_dx, *, samples=5, calls=4, replays=10):
+    """Separate device replay time from the public eager API's host overhead.
+
+    Capture the same public forward/autograd calls as measure(). Allocations,
+    validation and grouping kernels belong to the capture; Python dispatch and
+    host allocation do not run during replay. Compare captured/replayed results
+    with independent supplied references. Native PyTorch failures stay visible.
+    """
+    leaf = x.detach().requires_grad_(True)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    measurements = {}
+    with torch.cuda.stream(stream):
+        output = op(leaf, index)
+        callbacks = {
+            "forward": lambda: op(leaf, index),
+            "backward": lambda: torch.autograd.grad(output, leaf, grad, retain_graph=True)[0],
+            "forward_backward": lambda: torch.autograd.grad(op(leaf, index), leaf, grad)[0],
+        }
+        for phase, callback in callbacks.items():
+            for _ in range(3):
+                callback()
+            stream.synchronize()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph, stream=stream):
+                for _ in range(calls):
+                    captured = callback()
+            for _ in range(3):
+                graph.replay()
+            stream.synchronize()
+            expected = expected_y if phase == "forward" else expected_dx
+            before = bit_mismatches(captured, expected)
+            times = []
+            for _ in range(samples):
+                start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(
+                    enable_timing=True
+                )
+                start.record()
+                for _ in range(replays):
+                    graph.replay()
+                end.record()
+                end.synchronize()
+                times.append(start.elapsed_time(end) * 1000 / (calls * replays))
+            measurements[phase] = {
+                "samples_us": times,
+                "median_us": statistics.median(times),
+                "min_us": min(times),
+                "max_us": max(times),
+                "ordered_bit_mismatches_before": before,
+                "ordered_bit_mismatches_after": bit_mismatches(captured, expected),
+            }
+    torch.cuda.current_stream().wait_stream(stream)
+    return measurements
+
+
 def command_output(*args):
     try:
         result = subprocess.run(args, cwd=ROOT, capture_output=True, text=True, timeout=30)
@@ -197,6 +254,13 @@ def parse_args(argv=None):
     parser.add_argument("--dtype", choices=["float32", "float16", "bfloat16"], default="float32")
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--samples", type=int, default=30)
+    parser.add_argument(
+        "--providers",
+        nargs="+",
+        choices=["torch", "torch_deterministic", "triton", "cuda", "auto"],
+        default=["torch", "torch_deterministic", "triton"],
+    )
+    parser.add_argument("--mode", choices=["eager", "graph", "both"], default="eager")
     parser.add_argument("--seed", type=int, default=420)
     parser.add_argument("--output", type=Path, default=Path("reports/index-select/results.json"))
     parser.add_argument("--dry-run", action="store_true", help="Print the case plan without a GPU.")
@@ -219,7 +283,16 @@ def main():
     ]
     if args.dry_run:
         print(
-            json.dumps({"cases": case_plan, "measurement_count": len(case_plan) * 3 * 3}, indent=2)
+            json.dumps(
+                {
+                    "cases": case_plan,
+                    "measurement_count": len(case_plan)
+                    * len(args.providers)
+                    * 3
+                    * (2 if args.mode == "both" else 1),
+                },
+                indent=2,
+            )
         )
         return
     if not torch.cuda.is_available() or torch.version.hip is not None:
@@ -230,16 +303,26 @@ def main():
     tolerance = resolve_tolerance(
         load_contract(), judgment="gradient_accuracy", op_class="reduction", dtype=dtype
     )
-    implementations = (
+    implementations = [
         ("torch", lambda x, index: x.index_select(args.dim, index), False),
         ("torch_deterministic", lambda x, index: x.index_select(args.dim, index), True),
         ("triton", partial(TritonIndexSelectOp(), dim=args.dim), False),
-    )
+    ]
+    if "cuda" in args.providers:
+        from rl_engine.backends.cuda.embedding.index_select import H100IndexSelectOp
+
+        implementations.append(("cuda", partial(H100IndexSelectOp(), dim=args.dim), False))
+    if "auto" in args.providers:
+        from rl_engine.runtime.registry import KernelRegistry
+
+        selected = KernelRegistry().get_op("index_select", device="cuda")
+        implementations.append(("auto", partial(selected, dim=args.dim), False))
+    implementations = [entry for entry in implementations if entry[0] in args.providers]
     report = {
         "environment": environment(),
         "arguments": {**vars(args), "output": str(args.output)},
         "method": {
-            "mode": "eager, autograd-enabled forward; no CUDA Graph replay",
+            "mode": args.mode + ", autograd-enabled forward",
             "included": "validation, allocations, wrappers, backward index grouping and zero fill",
             "excluded": "inputs, reference, JIT compilation, warmups",
             "backward": "prebuilt retained graph; index grouping repeated on each backward",
@@ -248,6 +331,7 @@ def main():
             "reference": "CPU FP64 accuracy oracle and ordered FP32 VJP reference, neither timed",
             "comparison": "all elements; shared WS1 gradient_accuracy/reduction thresholds",
             "selection": "synthetic half-axis selection; explicit shapes and dim are recorded",
+            "graph": "four captured calls/replay; ten replays/sample; five samples; device only",
         },
         "complete": False,
         "case_plan": case_plan,
@@ -265,7 +349,7 @@ def main():
             gold = run_vjp(
                 partial(reference.forward_fp32, dim=args.dim), x.float(), index, grad.float()
             )[1]
-            ordered_dx = run_vjp(partial(reference, dim=args.dim), x, index, grad)[1]
+            ordered_y, ordered_dx = run_vjp(partial(reference, dim=args.dim), x, index, grad)
             for name, op, deterministic in implementations:
                 torch.use_deterministic_algorithms(deterministic)
                 checks = check_result(
@@ -276,7 +360,7 @@ def main():
                     gold,
                     tolerance,
                     dim=args.dim,
-                    ordered_dx=ordered_dx if name == "triton" else None,
+                    ordered_dx=ordered_dx,
                 )
                 result = {
                     **case,
@@ -287,10 +371,22 @@ def main():
                     "checks": checks,
                 }
                 report["results"].append(result)
-                if name == "triton" and checks_failed(checks):
+                if name in ("triton", "cuda", "auto") and checks_failed(checks):
                     args.output.write_text(json.dumps(report, indent=2) + "\n")
                     raise RuntimeError(f"candidate checks failed before timing: {args.output}")
-                result["timings"] = measure(op, x, index, grad, args.warmup, args.samples)
+                if args.mode in ("eager", "both"):
+                    result["timings"] = measure(op, x, index, grad, args.warmup, args.samples)
+                if args.mode in ("graph", "both"):
+                    result["graph_timings"] = measure_graph(
+                        op, x, index, grad, ordered_y, ordered_dx
+                    )
+                    if name in ("triton", "cuda", "auto") and any(
+                        phase["ordered_bit_mismatches_before"]
+                        or phase["ordered_bit_mismatches_after"]
+                        for phase in result["graph_timings"].values()
+                    ):
+                        args.output.write_text(json.dumps(report, indent=2) + "\n")
+                        raise RuntimeError(f"captured candidate checks failed: {args.output}")
                 report["backward_runtime"] = snapshot_backward_runtime()
                 args.output.write_text(json.dumps(report, indent=2) + "\n")
                 print(json.dumps({k: v for k, v in result.items() if k != "timings"}), flush=True)
