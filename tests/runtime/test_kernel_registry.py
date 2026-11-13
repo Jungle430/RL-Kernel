@@ -7,25 +7,21 @@ from rl_engine.runtime import registry as registry_module
 from rl_engine.runtime.registry import KernelRegistry, OpBackend
 
 
-def test_packed_index_select_dispatch_and_fail_closed(monkeypatch):
+def test_index_select_dispatch_and_fail_closed(monkeypatch):
     registry = KernelRegistry()
-    descriptor = registry.semantic.backend_descriptor(
-        "packed_index_select", "triton-packed-index-select"
-    )
+    descriptor = registry.semantic.backend_descriptor("index_select", "triton-index-select")
     assert descriptor.supported_devices == frozenset({"cuda"})
     assert descriptor.supported_dtypes == frozenset({"float32", "float16", "bfloat16"})
     assert descriptor.fallback_policy.value == "error"
-    assert registry._priority_map["cuda"]["packed_index_select"] == [
-        OpBackend.TRITON_PACKED_INDEX_SELECT
-    ]
+    assert registry._priority_map["cuda"]["index_select"] == [OpBackend.TRITON_INDEX_SELECT]
     for platform in ("cpu", "rocm", "musa"):
         monkeypatch.setattr(registry, "_platform_for_device", lambda _device, p=platform: p)
         with pytest.raises(RuntimeError, match="NVIDIA CUDA"):
-            registry.get_op("packed_index_select")
+            registry.get_op("index_select")
     monkeypatch.setattr(registry, "_platform_for_device", lambda _device: "cuda")
     monkeypatch.setattr(registry, "_get_or_create_backend", lambda _backend: None)
     with pytest.raises(RuntimeError, match="No functional backend"):
-        registry.get_op("packed_index_select")
+        registry.get_op("index_select")
 
 
 def test_video_input_projection_default_and_strict_scope():

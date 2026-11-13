@@ -38,16 +38,18 @@ def _args(**overrides):
     return argparse.Namespace(**values)
 
 
-def test_packed_index_select_validation_entry():
+@pytest.mark.parametrize("shape,dim", [((2, 7, 32), 1), ((7, 32), 0), ((7, 4, 8), 0), ((2, 7), -1)])
+def test_index_select_validation_entry(shape, dim):
     from rl_engine.validation.operators.op_checks import run_operator_suite
 
-    args = _args(op="packed_index_select", candidate="pytorch", batch=2, seq=7, n_dim=32)
-    inputs = make_operator_inputs("packed_index_select", args, torch.float32, torch.device("cpu"))
-    assert inputs["x"].shape == (2, 7, 32)
+    args = _args(op="index_select", candidate="pytorch", select_shape=shape, select_dim=dim)
+    inputs = make_operator_inputs("index_select", args, torch.float32, torch.device("cpu"))
+    assert inputs["x"].shape == shape
+    assert inputs["dim"] == dim
     assert inputs["index"].tolist() == [3, 3, 2, 2, 1, 1, 0]
-    assert operator_shape_name("packed_index_select", args) == "2x7x32"
+    assert operator_shape_name("index_select", args) == f"{'x'.join(map(str, shape))}-dim{dim}"
     report = run_operator_suite(
-        "packed_index_select",
+        "index_select",
         candidates=[make_candidate(args)],
         cases=[make_operator_case(args, torch.float32, torch.device("cpu"))],
         check_grad=True,

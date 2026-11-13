@@ -305,7 +305,7 @@ Keep generated reports, raw JSON, and plots outside tracked source files.
 
 GPU qualification targets one H20 with CUDA SM90. Distributed parameter
 gradients, higher-order derivatives, and complete training CUDA Graph require
-separate integration contracts. The formal `packed_index_select` backend is an
+separate integration contracts. The shared [`index_select`](index-select.md) backend is an
 integration dependency; the current selection composition uses a PyTorch test
 reference. Operator evidence covers this output head, while full Transformer
 and RL trajectory acceptance remain model-level gates.
