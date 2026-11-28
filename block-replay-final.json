@@ -9,7 +9,7 @@
     }
   },
   "reference_commit": "f53d552036a0d1bd5570782a39cd40cfabf112bc",
-  "rl_kernel_commit": "2c536198e9b9e46c2073d1554110524ba5193067",
+  "rl_kernel_commit": "ef578bd5489945ca692555c5750d92ca8be7e9d0",
   "tracked_tree_dirty": false,
   "environment": {
     "gpu": "NVIDIA A40",
@@ -1005,19 +1005,19 @@
       "leaves": {
         "adaln_proj.linear.weight": {
           "repeat_bitwise_equal": true,
-          "candidate_rel_err_vs_golden": 0.013878806329971143,
-          "provider_rel_err_vs_golden": 0.017892492569773166,
+          "candidate_rel_err_vs_golden": 0.013879012400085588,
+          "provider_rel_err_vs_golden": 0.017363638108501587,
           "storage_dtype": "bfloat16",
-          "candidate_ulps_vs_golden": 3.354217529296875,
-          "provider_ulps_vs_golden": 4.324241638183594
+          "candidate_ulps_vs_golden": 3.354267120361328,
+          "provider_ulps_vs_golden": 4.196428298950195
         },
         "adaln_proj.linear.bias": {
           "repeat_bitwise_equal": true,
-          "candidate_rel_err_vs_golden": 0.008406963566864394,
-          "provider_rel_err_vs_golden": 0.009943437813721421,
+          "candidate_rel_err_vs_golden": 0.008406910450614789,
+          "provider_rel_err_vs_golden": 0.009057109372632969,
           "storage_dtype": "bfloat16",
-          "candidate_ulps_vs_golden": 1.22784423828125,
-          "provider_ulps_vs_golden": 1.4522476196289062
+          "candidate_ulps_vs_golden": 1.2278366088867188,
+          "provider_ulps_vs_golden": 1.322798728942871
         },
         "norm1.weight": {
           "repeat_bitwise_equal": true,
@@ -1110,11 +1110,11 @@
         },
         "temb": {
           "repeat_bitwise_equal": true,
-          "candidate_rel_err_vs_golden": 0.009134958131214774,
-          "provider_rel_err_vs_golden": 0.011789904665752707,
+          "candidate_rel_err_vs_golden": 0.009135109876725141,
+          "provider_rel_err_vs_golden": 0.011794718338450989,
           "storage_dtype": "float32",
-          "candidate_ulps_vs_golden": 121498.25,
-          "provider_ulps_vs_golden": 156810.0
+          "candidate_ulps_vs_golden": 121500.25,
+          "provider_ulps_vs_golden": 156874.0
         }
       },
       "nodes": [
@@ -1214,19 +1214,19 @@
       "leaves": {
         "adaln_proj.linear.weight": {
           "repeat_bitwise_equal": true,
-          "candidate_rel_err_vs_golden": 0.024610159719076763,
-          "provider_rel_err_vs_golden": 0.056114347778593254,
+          "candidate_rel_err_vs_golden": 0.02461000389144888,
+          "provider_rel_err_vs_golden": 0.04907519282435301,
           "storage_dtype": "bfloat16",
-          "candidate_ulps_vs_golden": 3.4961624145507812,
-          "provider_ulps_vs_golden": 7.971702575683594
+          "candidate_ulps_vs_golden": 3.4961395263671875,
+          "provider_ulps_vs_golden": 6.971706390380859
         },
         "adaln_proj.linear.bias": {
           "repeat_bitwise_equal": true,
-          "candidate_rel_err_vs_golden": 0.025269074058201033,
-          "provider_rel_err_vs_golden": 0.05637059715264792,
+          "candidate_rel_err_vs_golden": 0.02526890645838891,
+          "provider_rel_err_vs_golden": 0.04791922416490115,
           "storage_dtype": "bfloat16",
-          "candidate_ulps_vs_golden": 4.4848785400390625,
-          "provider_ulps_vs_golden": 10.004928588867188
+          "candidate_ulps_vs_golden": 4.4848480224609375,
+          "provider_ulps_vs_golden": 8.504936218261719
         },
         "norm1.weight": {
           "repeat_bitwise_equal": true,
@@ -1319,11 +1319,11 @@
         },
         "temb": {
           "repeat_bitwise_equal": true,
-          "candidate_rel_err_vs_golden": 0.011467925038451584,
-          "provider_rel_err_vs_golden": 0.015615101762456965,
+          "candidate_rel_err_vs_golden": 0.011467791977752724,
+          "provider_rel_err_vs_golden": 0.014677674354460454,
           "storage_dtype": "float32",
-          "candidate_ulps_vs_golden": 96958.875,
-          "provider_ulps_vs_golden": 132022.375
+          "candidate_ulps_vs_golden": 96957.75,
+          "provider_ulps_vs_golden": 124096.625
         }
       },
       "nodes": [

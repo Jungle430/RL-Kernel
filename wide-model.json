@@ -1,0 +1,23 @@
+{
+  "source_commit": "ef578bd5489945ca692555c5750d92ca8be7e9d0",
+  "gpu": "NVIDIA A40",
+  "torch": "2.8.0+cu128",
+  "triton": "3.4.0",
+  "dtype": "bfloat16",
+  "shape": [
+    8,
+    73426,
+    56,
+    128
+  ],
+  "strides": [
+    4111856,
+    56,
+    1,
+    32894848
+  ],
+  "channel_96_element_offset": 3157905408,
+  "elements_per_direction": 4210540544,
+  "forward_bitwise": true,
+  "input_gradient_bitwise": true
+}

@@ -1,3 +1,2 @@
-Mac CPU PyTorch 2.13.0: 135 passed, 52 skipped.
-Native unified forward and input gradient: BF16 and FP32 passed.
-Changed-file pre-commit hooks passed. CI-style mypy passed on 713 source files. Strict MkDocs build passed.
+Mac CPU, PyTorch 2.13.0: 135 passed, 53 skipped. Native BF16/FP32 unified forward and input-gradient checks passed.
+Changed-file pre-commit, mypy (713 source files) and strict MkDocs build passed.

@@ -1,12 +1,13 @@
 # MiniMax-H3 partial MM-RoPE on NVIDIA A40
 
-Measurements for [RL-Kernel PR #656](https://github.com/RL-Align/RL-Kernel/pull/656) at [`2c536198`](https://github.com/Jungle430/RL-Kernel/commit/2c536198e9b9e46c2073d1554110524ba5193067), targeting `test-h3` at `60c6aaf9`. The GPU run used the same Git tree as this commit. The final real-weight replay also records its clean checkout in the JSON.
+Measurements for [RL-Kernel PR #656](https://github.com/RL-Align/RL-Kernel/pull/656) at [`ef578bd5`](https://github.com/Jungle430/RL-Kernel/commit/ef578bd5489945ca692555c5750d92ca8be7e9d0), targeting `test-h3` at `60c6aaf9`. The GPU run used the same Git tree as this commit. The final real-weight replay also records its clean checkout in the JSON.
 
 | Check | Result |
 | --- | --- |
-| Standalone RoPE, registry, checker inputs and benchmark tests, two A40s | 144 passed |
+| Standalone RoPE, registry, checker inputs and benchmark tests, two A40s | 145 passed |
+| Large channel strides on A40 | The guarded FP32 regression fails on the parent commit and passes on the candidate. For a channel-major BF16 view of shape `[8,73426,56,128]`, all 4,210,540,544 forward values and all input gradients match a dense Native row bit-for-bit. [Parent failure](checks/before-fix.log) · [BF16 validation](wide-model.json) |
 | CUDA unified checker, Native and Triton, BF16 and FP32, forward and input gradient | 4/4 passed |
-| Legacy scalar-stride path, PyTorch 2.6.0+cu124 and Triton 3.2.0 | 26 selected tests passed |
+| Legacy scalar-stride path, PyTorch 2.6.0+cu124 and Triton 3.2.0 | 27 selected tests passed |
 | Pinned MiniMax-H3 block-0 weights, model/review/report tests | 40 passed, 2 failed at `norm1`, 1 SM90-only test skipped |
 | Unmodified target branch, the same two failing forward cases | Both failed at `norm1` |
 | Swapping only candidate RoPE for the provider in block-0 | All 17 forward-node hashes matched in each of tiny and small. Both RoPE nodes passed isolated acceptance in both layouts. |
@@ -27,6 +28,9 @@ From the tested source checkout on NVIDIA CUDA, with its H3 extensions built, ru
 
 ```bash
 python -m pytest -q tests/ops/rope/test_h3_mm_rope.py tests/benchmarks/test_h3_mm_rope_benchmark.py tests/validation/operators/test_operator_inputs.py tests/runtime/test_kernel_registry.py
+# Set this to the directory containing this report and wide_model.py.
+EVIDENCE_DIR=/path/to/evidence-checkout
+PYTHONPATH=. python "$EVIDENCE_DIR/wide_model.py" /tmp/wide-model.json
 python tools/weights/prepare_h3_weights.py --out /tmp/h3-weights --block
 export RL_KERNEL_H3_WEIGHTS=/tmp/h3-weights
 python -m pytest -q tests/models/minimax_h3/test_h3_one_block.py tests/models/minimax_h3/test_h3_review_fixes.py tests/models/minimax_h3/test_h3_report.py

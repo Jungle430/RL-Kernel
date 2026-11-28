@@ -32,7 +32,7 @@
               "atol": 0.02,
               "rtol": 0.016,
               "max_abs_error": 0.015625,
-              "mean_abs_error": 0.0006166885141283274,
+              "mean_abs_error": 0.0006166883977130055,
               "max_rel_error": 0.0038910505827516317,
               "passed": true,
               "judgment": "forward_accuracy",

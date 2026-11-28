@@ -1,0 +1,77 @@
+/workspace/old-rope/rl_engine/__init__.py
+F                                                                        [100%]
+=================================== FAILURES ===================================
+___________________ test_triton_channel_offsets_above_int32 ____________________
+
+    @needs_gpu
+    def test_triton_channel_offsets_above_int32():
+        """Check the last rotated channel and the passthrough tail with 64-bit offsets."""
+        from rl_engine.backends.shared.triton.rope.h3_mm_rope import TritonH3MMRoPEOp
+    
+        # Channel 95 is the first whose element offset exceeds signed int32. The
+        # guard keeps a wrapped address inside the allocation, so a regression
+        # reads a known zero and fails the value check without poisoning the GPU.
+        guard = 1 << 31
+        channel_stride = (guard - 1) // 95 + 1
+        storage_size = guard + 127 * channel_stride + 4
+        if torch.cuda.mem_get_info()[0] < storage_size * 4 + (512 << 20):
+            pytest.skip("large-stride FP32 views and their guard require 20 GiB of free memory")
+        storage = torch.empty(storage_size, dtype=torch.float32, device="cuda")
+        offsets = torch.arange(128, device="cuda", dtype=torch.int64) * channel_stride
+        wrapped = offsets.to(torch.int32).to(torch.int64)
+        storage[guard + wrapped[:, None] + torch.arange(4, device="cuda")] = 0
+    
+        # Four adjacent values per channel let x, grad_y, cos and sin share one
+        # backing allocation. Keep the dense originals as the independent oracle.
+        values = torch.randn((128, 4), generator=torch.Generator().manual_seed(656)).cuda()
+        channels = storage.as_strided((128, 4), (channel_stride, 1), storage_offset=guard)
+        channels.copy_(values)
+        x, grad_y, cos, sin = channels.T
+        shape = (1, 1, 1, 128)
+        actual, grad = _forward_backward(
+            TritonH3MMRoPEOp(), x.view(shape), cos[None, :96], sin[None, :96], grad_y.view(shape)
+        )
+        x, grad_y, cos, sin = values.T.contiguous()
+        expected, expected_grad = _forward_backward(
+            NativeH3MMRoPEOp(), x.view(shape), cos[None, :96], sin[None, :96], grad_y.view(shape)
+        )
+>       _assert_bits(actual, expected)
+
+/tmp/h3_before_fix_test.py:157: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+actual = tensor([[[[ 1.5790e+00, -3.4948e-01, -2.4945e-01, -6.6929e-01,  5.2638e-01,
+           -4.2324e-01,  1.9157e-01, -2.90...0000e+00,  0.0000e+00,  0.0000e+00,  0.0000e+00,
+            0.0000e+00,  0.0000e+00,  0.0000e+00]]]], device='cuda:0')
+expected = tensor([[[[ 1.5790e+00, -3.4948e-01, -2.4945e-01, -6.6929e-01,  5.2638e-01,
+           -4.2324e-01,  1.9157e-01, -2.90...0424e+00, -4.9694e-02, -2.7480e-02,  1.4929e+00,
+            4.5725e-01,  2.5884e-02,  2.6671e-01]]]], device='cuda:0')
+
+    def _assert_bits(actual, expected):
+        assert actual.shape == expected.shape and actual.dtype == expected.dtype
+>       assert torch.equal(
+            actual.detach().contiguous().view(torch.uint8),
+            expected.detach().contiguous().view(torch.uint8),
+        )
+E       AssertionError: assert False
+E        +  where False = <built-in method equal of type object at 0x7dbbdc2c94a0>(tensor([[[[106,  27, 202,  63, 131, 238, 178, 190, 247, 112, 127, 190, 178,  86,\n            43, 191, 181, 192,   6,  ...,   0,   0,   0,   0,\n             0,   0,   0,   0,   0,   0,   0,   0]]]], device='cuda:0',\n       dtype=torch.uint8), tensor([[[[106,  27, 202,  63, 131, 238, 178, 190, 247, 112, 127, 190, 178,  86,\n            43, 191, 181, 192,   6,  ...,  55,  29, 234,  62,\n            41,  10, 212,  60,  62, 142, 136,  62]]]], device='cuda:0',\n       dtype=torch.uint8))
+E        +    where <built-in method equal of type object at 0x7dbbdc2c94a0> = torch.equal
+E        +    and   tensor([[[[106,  27, 202,  63, 131, 238, 178, 190, 247, 112, 127, 190, 178,  86,\n            43, 191, 181, 192,   6,  ...,   0,   0,   0,   0,\n             0,   0,   0,   0,   0,   0,   0,   0]]]], device='cuda:0',\n       dtype=torch.uint8) = <built-in method view of Tensor object at 0x7dbae07fe490>(torch.uint8)
+E        +      where <built-in method view of Tensor object at 0x7dbae07fe490> = tensor([[[[ 1.5790e+00, -3.4948e-01, -2.4945e-01, -6.6929e-01,  5.2638e-01,\n           -4.2324e-01,  1.9157e-01, -2.90...0000e+00,  0.0000e+00,  0.0000e+00,  0.0000e+00,\n            0.0000e+00,  0.0000e+00,  0.0000e+00]]]], device='cuda:0').view
+E        +        where tensor([[[[ 1.5790e+00, -3.4948e-01, -2.4945e-01, -6.6929e-01,  5.2638e-01,\n           -4.2324e-01,  1.9157e-01, -2.90...0000e+00,  0.0000e+00,  0.0000e+00,  0.0000e+00,\n            0.0000e+00,  0.0000e+00,  0.0000e+00]]]], device='cuda:0') = <built-in method contiguous of Tensor object at 0x7dbae07fe490>()
+E        +          where <built-in method contiguous of Tensor object at 0x7dbae07fe490> = tensor([[[[ 1.5790e+00, -3.4948e-01, -2.4945e-01, -6.6929e-01,  5.2638e-01,\n           -4.2324e-01,  1.9157e-01, -2.90...0000e+00,  0.0000e+00,  0.0000e+00,  0.0000e+00,\n            0.0000e+00,  0.0000e+00,  0.0000e+00]]]], device='cuda:0').contiguous
+E        +            where tensor([[[[ 1.5790e+00, -3.4948e-01, -2.4945e-01, -6.6929e-01,  5.2638e-01,\n           -4.2324e-01,  1.9157e-01, -2.90...0000e+00,  0.0000e+00,  0.0000e+00,  0.0000e+00,\n            0.0000e+00,  0.0000e+00,  0.0000e+00]]]], device='cuda:0') = <built-in method detach of Tensor object at 0x7dbae15de580>()
+E        +              where <built-in method detach of Tensor object at 0x7dbae15de580> = tensor([[[[ 1.5790e+00, -3.4948e-01, -2.4945e-01, -6.6929e-01,  5.2638e-01,\n           -4.2324e-01,  1.9157e-01, -2.90...0000e+00,  0.0000e+00,  0.0000e+00,  0.0000e+00,\n            0.0000e+00,  0.0000e+00,  0.0000e+00]]]], device='cuda:0').detach
+E        +      and   torch.uint8 = torch.uint8
+E        +    and   tensor([[[[106,  27, 202,  63, 131, 238, 178, 190, 247, 112, 127, 190, 178,  86,\n            43, 191, 181, 192,   6,  ...,  55,  29, 234,  62,\n            41,  10, 212,  60,  62, 142, 136,  62]]]], device='cuda:0',\n       dtype=torch.uint8) = <built-in method view of Tensor object at 0x7dbaac29fe30>(torch.uint8)
+E        +      where <built-in method view of Tensor object at 0x7dbaac29fe30> = tensor([[[[ 1.5790e+00, -3.4948e-01, -2.4945e-01, -6.6929e-01,  5.2638e-01,\n           -4.2324e-01,  1.9157e-01, -2.90...0424e+00, -4.9694e-02, -2.7480e-02,  1.4929e+00,\n            4.5725e-01,  2.5884e-02,  2.6671e-01]]]], device='cuda:0').view
+E        +        where tensor([[[[ 1.5790e+00, -3.4948e-01, -2.4945e-01, -6.6929e-01,  5.2638e-01,\n           -4.2324e-01,  1.9157e-01, -2.90...0424e+00, -4.9694e-02, -2.7480e-02,  1.4929e+00,\n            4.5725e-01,  2.5884e-02,  2.6671e-01]]]], device='cuda:0') = <built-in method contiguous of Tensor object at 0x7dbaac29fe30>()
+E        +          where <built-in method contiguous of Tensor object at 0x7dbaac29fe30> = tensor([[[[ 1.5790e+00, -3.4948e-01, -2.4945e-01, -6.6929e-01,  5.2638e-01,\n           -4.2324e-01,  1.9157e-01, -2.90...0424e+00, -4.9694e-02, -2.7480e-02,  1.4929e+00,\n            4.5725e-01,  2.5884e-02,  2.6671e-01]]]], device='cuda:0').contiguous
+E        +            where tensor([[[[ 1.5790e+00, -3.4948e-01, -2.4945e-01, -6.6929e-01,  5.2638e-01,\n           -4.2324e-01,  1.9157e-01, -2.90...0424e+00, -4.9694e-02, -2.7480e-02,  1.4929e+00,\n            4.5725e-01,  2.5884e-02,  2.6671e-01]]]], device='cuda:0') = <built-in method detach of Tensor object at 0x7dbae07fe5d0>()
+E        +              where <built-in method detach of Tensor object at 0x7dbae07fe5d0> = tensor([[[[ 1.5790e+00, -3.4948e-01, -2.4945e-01, -6.6929e-01,  5.2638e-01,\n           -4.2324e-01,  1.9157e-01, -2.90...0424e+00, -4.9694e-02, -2.7480e-02,  1.4929e+00,\n            4.5725e-01,  2.5884e-02,  2.6671e-01]]]], device='cuda:0').detach
+E        +      and   torch.uint8 = torch.uint8
+
+/tmp/h3_before_fix_test.py:43: AssertionError
+=========================== short test summary info ============================
+FAILED ../../tmp/h3_before_fix_test.py::test_triton_channel_offsets_above_int32
+1 failed in 4.15s
