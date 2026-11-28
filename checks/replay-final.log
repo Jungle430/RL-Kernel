@@ -1,0 +1,12 @@
+WARNING 11-28 09:51:20 [RL-Kernel]: MUSA availability check failed: No module named 'torch_musa'
+INFO 11-28 09:51:20 [RL-Kernel]: RL-Engine initialized with NVIDIA CUDA backend (Version: 12.8)
+INFO 11-28 09:51:20 [RL-Kernel]: KernelRegistry initialized for cuda
+INFO 11-28 09:51:22 [RL-Kernel]: KernelRegistry initialized for cuda
+INFO 11-28 09:51:22 [RL-Kernel]: TritonDetGemmOp ready (deterministic, autotune disabled).
+INFO 11-28 09:51:22 [RL-Kernel]: Successfully linked to _C.deterministic_attention_forward/backward.
+INFO 11-28 09:51:22 [RL-Kernel]: Successfully linked to precompiled _C.swiglu_forward kernel.
+tiny S=264: first_drift=adaln_projection first_isolated_drift=adaln_projection first_rope_acceptance_failure=None repeat_drift=None batch_drift=None out err cand 5.20e-03 prov 1.07e-02
+tiny backward: leaves det, grad_repeat_drift=None grad_batch_drift=None dX batch-row True
+small S=925: first_drift=adaln_projection first_isolated_drift=adaln_projection first_rope_acceptance_failure=None repeat_drift=None batch_drift=None out err cand 7.87e-03 prov 7.87e-03
+small backward: leaves det, grad_repeat_drift=None grad_batch_drift=None dX batch-row True
+wrote /workspace/h3-evidence/block-replay-final.json

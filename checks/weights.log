@@ -1,0 +1,8 @@
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+ok  config.json  74c11bff524336576096993cbfcdcdc2ef4fa2fa4409df693bdcbc6c666282ae
+ok  diffusion_pytorch_model.safetensors.index.json  ac30a3b58963f2e735d493475fbb81853a5735ec947619648b3e045acda6783e
+ok  diffusion_pytorch_model-00001-of-00014.safetensors  2d847200c45c09dd7f973c1b096663068408ef851ee0b3711d059b6dc5dcd028
+wrote 12 tensors to /workspace/h3-weights/h3_conditioning.safetensors
+ok  diffusion_pytorch_model-00001-of-00014.safetensors  2d847200c45c09dd7f973c1b096663068408ef851ee0b3711d059b6dc5dcd028
+wrote 8 tensors to /workspace/h3-weights/h3_block0.safetensors
+export RL_KERNEL_H3_WEIGHTS=/workspace/h3-weights

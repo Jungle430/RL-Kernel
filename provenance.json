@@ -1,0 +1,23 @@
+{
+  "pr": "https://github.com/RL-Align/RL-Kernel/pull/656",
+  "source_commit": "2c536198e9b9e46c2073d1554110524ba5193067",
+  "source_tree": "46057b39a748b5a9843b8e9722630a33ddac897e",
+  "target_commit": "60c6aaf94b95976ad45ca9b30da8d0544d72d442",
+  "weight_revision": "42ed227ee7df40d41602854ae760620d6eb651fe",
+  "gpu_benchmark": {
+    "python": "3.12.3",
+    "torch": "2.8.0+cu128",
+    "triton": "3.4.0",
+    "cuda": "12.8",
+    "hip": null,
+    "gpu": "NVIDIA A40",
+    "compute_capability": [
+      8,
+      6
+    ],
+    "cpu_threads": 1
+  },
+  "samples_per_provider_and_mode": 40,
+  "warmups": 10,
+  "seed": 656
+}

@@ -1,0 +1,226 @@
+[
+  {
+    "layout": "tiny",
+    "seed": 0,
+    "nodes_compared": 17,
+    "changed_forward_node_hashes": [],
+    "first_rope_acceptance_failure": [
+      null,
+      null
+    ],
+    "isolated_provider_differences": {
+      "adaln_projection": {
+        "triton_rope": {
+          "bitwise_equal": false,
+          "max_abs": 0.0078125
+        },
+        "provider_rope": {
+          "bitwise_equal": false,
+          "max_abs": 0.0078125
+        }
+      },
+      "norm1": {
+        "triton_rope": {
+          "bitwise_equal": false,
+          "max_abs": 0.001953125
+        },
+        "provider_rope": {
+          "bitwise_equal": false,
+          "max_abs": 0.001953125
+        }
+      },
+      "q_norm": {
+        "triton_rope": {
+          "bitwise_equal": false,
+          "max_abs": 0.015625
+        },
+        "provider_rope": {
+          "bitwise_equal": false,
+          "max_abs": 0.015625
+        }
+      },
+      "k_norm": {
+        "triton_rope": {
+          "bitwise_equal": false,
+          "max_abs": 0.0078125
+        },
+        "provider_rope": {
+          "bitwise_equal": false,
+          "max_abs": 0.0078125
+        }
+      },
+      "attention": {
+        "triton_rope": {
+          "bitwise_equal": false,
+          "max_abs": 0.0625
+        },
+        "provider_rope": {
+          "bitwise_equal": false,
+          "max_abs": 0.0625
+        }
+      },
+      "o_proj": {
+        "triton_rope": {
+          "bitwise_equal": false,
+          "max_abs": 2.0
+        },
+        "provider_rope": {
+          "bitwise_equal": false,
+          "max_abs": 2.0
+        }
+      },
+      "norm2": {
+        "triton_rope": {
+          "bitwise_equal": false,
+          "max_abs": 0.001953125
+        },
+        "provider_rope": {
+          "bitwise_equal": false,
+          "max_abs": 0.001953125
+        }
+      },
+      "ffn_gate_up": {
+        "triton_rope": {
+          "bitwise_equal": false,
+          "max_abs": 0.125
+        },
+        "provider_rope": {
+          "bitwise_equal": false,
+          "max_abs": 0.125
+        }
+      },
+      "swiglu": {
+        "triton_rope": {
+          "bitwise_equal": false,
+          "max_abs": 0.5
+        },
+        "provider_rope": {
+          "bitwise_equal": false,
+          "max_abs": 0.5
+        }
+      },
+      "ffn_down": {
+        "triton_rope": {
+          "bitwise_equal": false,
+          "max_abs": 32.0
+        },
+        "provider_rope": {
+          "bitwise_equal": false,
+          "max_abs": 32.0
+        }
+      }
+    }
+  },
+  {
+    "layout": "small",
+    "seed": 0,
+    "nodes_compared": 17,
+    "changed_forward_node_hashes": [],
+    "first_rope_acceptance_failure": [
+      null,
+      null
+    ],
+    "isolated_provider_differences": {
+      "adaln_projection": {
+        "triton_rope": {
+          "bitwise_equal": false,
+          "max_abs": 0.0078125
+        },
+        "provider_rope": {
+          "bitwise_equal": false,
+          "max_abs": 0.0078125
+        }
+      },
+      "norm1": {
+        "triton_rope": {
+          "bitwise_equal": false,
+          "max_abs": 0.0078125
+        },
+        "provider_rope": {
+          "bitwise_equal": false,
+          "max_abs": 0.0078125
+        }
+      },
+      "q_norm": {
+        "triton_rope": {
+          "bitwise_equal": false,
+          "max_abs": 0.015625
+        },
+        "provider_rope": {
+          "bitwise_equal": false,
+          "max_abs": 0.015625
+        }
+      },
+      "k_norm": {
+        "triton_rope": {
+          "bitwise_equal": false,
+          "max_abs": 0.0078125
+        },
+        "provider_rope": {
+          "bitwise_equal": false,
+          "max_abs": 0.0078125
+        }
+      },
+      "attention": {
+        "triton_rope": {
+          "bitwise_equal": false,
+          "max_abs": 0.125
+        },
+        "provider_rope": {
+          "bitwise_equal": false,
+          "max_abs": 0.125
+        }
+      },
+      "o_proj": {
+        "triton_rope": {
+          "bitwise_equal": false,
+          "max_abs": 2.0
+        },
+        "provider_rope": {
+          "bitwise_equal": false,
+          "max_abs": 2.0
+        }
+      },
+      "norm2": {
+        "triton_rope": {
+          "bitwise_equal": false,
+          "max_abs": 0.00048828125
+        },
+        "provider_rope": {
+          "bitwise_equal": false,
+          "max_abs": 0.00048828125
+        }
+      },
+      "ffn_gate_up": {
+        "triton_rope": {
+          "bitwise_equal": false,
+          "max_abs": 0.125
+        },
+        "provider_rope": {
+          "bitwise_equal": false,
+          "max_abs": 0.125
+        }
+      },
+      "swiglu": {
+        "triton_rope": {
+          "bitwise_equal": false,
+          "max_abs": 0.5
+        },
+        "provider_rope": {
+          "bitwise_equal": false,
+          "max_abs": 0.5
+        }
+      },
+      "ffn_down": {
+        "triton_rope": {
+          "bitwise_equal": false,
+          "max_abs": 16.0
+        },
+        "provider_rope": {
+          "bitwise_equal": false,
+          "max_abs": 16.0
+        }
+      }
+    }
+  }
+]
