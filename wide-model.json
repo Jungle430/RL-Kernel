@@ -1,5 +1,5 @@
 {
-  "source_commit": "ef578bd5489945ca692555c5750d92ca8be7e9d0",
+  "source_commit": "614924581e676109e1c72acd388320627bbe0b12",
   "gpu": "NVIDIA A40",
   "torch": "2.8.0+cu128",
   "triton": "3.4.0",

@@ -1,0 +1,54 @@
+{
+  "revision": "head",
+  "commit": "614924581e676109e1c72acd388320627bbe0b12",
+  "shape": [
+    1,
+    73426,
+    56,
+    128
+  ],
+  "dtype": "fp32",
+  "gpu": "NVIDIA A40",
+  "torch": "2.8.0+cu128",
+  "seed": 656,
+  "baseline_allocated_bytes": 4269235200,
+  "peak_allocated_bytes": 8843123712,
+  "validation_extra_peak_bytes": 4573888512,
+  "checks": {
+    "acceptance": {
+      "reference": "forward_fp32",
+      "passed": true
+    },
+    "unrounded_math_diagnostic": {
+      "reference": "forward_unrounded_fp32",
+      "is_acceptance_gate": false,
+      "forward": {
+        "elements": 526317568,
+        "outside_tolerance": 0,
+        "max_abs_error": 0.0,
+        "max_error_over_tolerance": 0.0,
+        "examples": [],
+        "atol": 1e-05,
+        "rtol": 1e-05
+      },
+      "backward": {
+        "elements": 526317568,
+        "outside_tolerance": 0,
+        "max_abs_error": 0.0,
+        "max_error_over_tolerance": 0.0,
+        "examples": [],
+        "atol": 1e-05,
+        "rtol": 1e-05
+      },
+      "provider_backward": {
+        "elements": 526317568,
+        "outside_tolerance": 0,
+        "max_abs_error": 0.0,
+        "max_error_over_tolerance": 0.0,
+        "examples": [],
+        "atol": 1e-05,
+        "rtol": 1e-05
+      }
+    }
+  }
+}

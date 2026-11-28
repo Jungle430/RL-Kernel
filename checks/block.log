@@ -5,7 +5,7 @@ ___________________________ test_block_forward[tiny] ___________________________
 h3_block_weights_cuda = {'time_embedder.linear_1.weight': tensor([[ 0.0025,  0.0065, -0.0008,  ..., -0.0183, -0.0258, -0.0143],
         [ 0.00...dder.linear_2.bias': tensor([ 0.0441,  0.0200, -0.0723,  ...,  0.0195, -0.0645, -0.0310],
        device='cuda:0'), ...}
-ops = <rl_engine.validation.models.h3_block.CandidateOps object at 0x7eabd01b0d40>
+ops = <rl_engine.validation.models.h3_block.CandidateOps object at 0x741008b9d7f0>
 layout = 'tiny'
 
     @needs_gpu
@@ -33,7 +33,7 @@ __________________________ test_block_forward[small] ___________________________
 h3_block_weights_cuda = {'time_embedder.linear_1.weight': tensor([[ 0.0025,  0.0065, -0.0008,  ..., -0.0183, -0.0258, -0.0143],
         [ 0.00...dder.linear_2.bias': tensor([ 0.0441,  0.0200, -0.0723,  ...,  0.0195, -0.0645, -0.0310],
        device='cuda:0'), ...}
-ops = <rl_engine.validation.models.h3_block.CandidateOps object at 0x7eabd01b0d40>
+ops = <rl_engine.validation.models.h3_block.CandidateOps object at 0x741008b9d7f0>
 layout = 'small'
 
     @needs_gpu
@@ -59,4 +59,4 @@ tests/models/minimax_h3/test_h3_one_block.py:217: AssertionError
 =========================== short test summary info ============================
 FAILED tests/models/minimax_h3/test_h3_one_block.py::test_block_forward[tiny]
 FAILED tests/models/minimax_h3/test_h3_one_block.py::test_block_forward[small]
-2 failed, 40 passed, 1 skipped in 8.04s
+2 failed, 40 passed, 1 skipped in 18.79s

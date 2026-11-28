@@ -1,0 +1,26 @@
+{
+  "parent": "ef578bd5489945ca692555c5750d92ca8be7e9d0",
+  "head": "614924581e676109e1c72acd388320627bbe0b12",
+  "shape": [
+    1,
+    73426,
+    56,
+    128
+  ],
+  "gpu": "NVIDIA A40",
+  "method": "Fresh process per revision and dtype, eight-token warmup, synchronize, take the live-input allocation baseline, reset peak stats, run the complete check_case, synchronize, report peak active allocation minus baseline. Units are MiB (2^20 bytes).",
+  "results": {
+    "bf16": {
+      "baseline_mib": 2063.4599609375,
+      "parent_extra_mib": 10964.8779296875,
+      "head_extra_mib": 2348.75,
+      "saved_mib": 8616.1279296875
+    },
+    "fp32": {
+      "baseline_mib": 4071.4599609375,
+      "parent_extra_mib": 12707.9375,
+      "head_extra_mib": 4362.0,
+      "saved_mib": 8345.9375
+    }
+  }
+}

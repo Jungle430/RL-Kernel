@@ -1,0 +1,79 @@
+{
+  "revision": "parent",
+  "commit": "ef578bd5489945ca692555c5750d92ca8be7e9d0",
+  "shape": [
+    1,
+    73426,
+    56,
+    128
+  ],
+  "dtype": "bf16",
+  "gpu": "NVIDIA A40",
+  "torch": "2.8.0+cu128",
+  "seed": 656,
+  "baseline_allocated_bytes": 2163694592,
+  "peak_allocated_bytes": 13661202432,
+  "validation_extra_peak_bytes": 11497507840,
+  "checks": {
+    "acceptance": {
+      "reference": "forward_fp32",
+      "passed": true
+    },
+    "unrounded_math_diagnostic": {
+      "reference": "forward_unrounded_fp32",
+      "is_acceptance_gate": false,
+      "forward": {
+        "elements": 526317568,
+        "outside_tolerance": 0,
+        "max_abs_error": 0.039370059967041016,
+        "max_error_over_tolerance": 0.9541294574737549,
+        "examples": [],
+        "atol": 0.02,
+        "rtol": 0.016
+      },
+      "backward": {
+        "elements": 526317568,
+        "outside_tolerance": 0,
+        "max_abs_error": 0.025775432586669922,
+        "max_error_over_tolerance": 0.5251869559288025,
+        "examples": [],
+        "atol": 0.02,
+        "rtol": 0.016
+      },
+      "provider_backward": {
+        "elements": 526317568,
+        "outside_tolerance": 2,
+        "max_abs_error": 0.03844642639160156,
+        "max_error_over_tolerance": 1.143762230873108,
+        "examples": [
+          {
+            "index": [
+              0,
+              27470,
+              52,
+              81
+            ],
+            "actual": -0.0625,
+            "reference": -0.08696675300598145,
+            "abs_error": 0.024466753005981445,
+            "allowed_error": 0.02139146812260151
+          },
+          {
+            "index": [
+              0,
+              53026,
+              25,
+              34
+            ],
+            "actual": -0.046875,
+            "reference": -0.02565598487854004,
+            "abs_error": 0.02121901512145996,
+            "allowed_error": 0.02041049487888813
+          }
+        ],
+        "atol": 0.02,
+        "rtol": 0.016
+      }
+    }
+  }
+}

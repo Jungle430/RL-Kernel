@@ -9,7 +9,7 @@
     }
   },
   "reference_commit": "f53d552036a0d1bd5570782a39cd40cfabf112bc",
-  "rl_kernel_commit": "ef578bd5489945ca692555c5750d92ca8be7e9d0",
+  "rl_kernel_commit": "614924581e676109e1c72acd388320627bbe0b12",
   "tracked_tree_dirty": false,
   "environment": {
     "gpu": "NVIDIA A40",
@@ -1005,19 +1005,19 @@
       "leaves": {
         "adaln_proj.linear.weight": {
           "repeat_bitwise_equal": true,
-          "candidate_rel_err_vs_golden": 0.013879012400085588,
-          "provider_rel_err_vs_golden": 0.017363638108501587,
+          "candidate_rel_err_vs_golden": 0.013878916818962589,
+          "provider_rel_err_vs_golden": 0.022016352118187612,
           "storage_dtype": "bfloat16",
-          "candidate_ulps_vs_golden": 3.354267120361328,
-          "provider_ulps_vs_golden": 4.196428298950195
+          "candidate_ulps_vs_golden": 3.3542442321777344,
+          "provider_ulps_vs_golden": 5.320892333984375
         },
         "adaln_proj.linear.bias": {
           "repeat_bitwise_equal": true,
           "candidate_rel_err_vs_golden": 0.008406910450614789,
-          "provider_rel_err_vs_golden": 0.009057109372632969,
+          "provider_rel_err_vs_golden": 0.010369907194102548,
           "storage_dtype": "bfloat16",
           "candidate_ulps_vs_golden": 1.2278366088867188,
-          "provider_ulps_vs_golden": 1.322798728942871
+          "provider_ulps_vs_golden": 1.5145339965820312
         },
         "norm1.weight": {
           "repeat_bitwise_equal": true,
@@ -1110,11 +1110,11 @@
         },
         "temb": {
           "repeat_bitwise_equal": true,
-          "candidate_rel_err_vs_golden": 0.009135109876725141,
-          "provider_rel_err_vs_golden": 0.011794718338450989,
+          "candidate_rel_err_vs_golden": 0.00913496890309736,
+          "provider_rel_err_vs_golden": 0.013786464238561964,
           "storage_dtype": "float32",
-          "candidate_ulps_vs_golden": 121500.25,
-          "provider_ulps_vs_golden": 156874.0
+          "candidate_ulps_vs_golden": 121498.375,
+          "provider_ulps_vs_golden": 183364.9375
         }
       },
       "nodes": [
@@ -1214,19 +1214,19 @@
       "leaves": {
         "adaln_proj.linear.weight": {
           "repeat_bitwise_equal": true,
-          "candidate_rel_err_vs_golden": 0.02461000389144888,
-          "provider_rel_err_vs_golden": 0.04907519282435301,
+          "candidate_rel_err_vs_golden": 0.024609952830006287,
+          "provider_rel_err_vs_golden": 0.06667339945753863,
           "storage_dtype": "bfloat16",
-          "candidate_ulps_vs_golden": 3.4961395263671875,
-          "provider_ulps_vs_golden": 6.971706390380859
+          "candidate_ulps_vs_golden": 3.4961318969726562,
+          "provider_ulps_vs_golden": 9.471736907958984
         },
         "adaln_proj.linear.bias": {
           "repeat_bitwise_equal": true,
-          "candidate_rel_err_vs_golden": 0.02526890645838891,
-          "provider_rel_err_vs_golden": 0.04791922416490115,
+          "candidate_rel_err_vs_golden": 0.025268822658461237,
+          "provider_rel_err_vs_golden": 0.06763943813283176,
           "storage_dtype": "bfloat16",
-          "candidate_ulps_vs_golden": 4.4848480224609375,
-          "provider_ulps_vs_golden": 8.504936218261719
+          "candidate_ulps_vs_golden": 4.484832763671875,
+          "provider_ulps_vs_golden": 12.004974365234375
         },
         "norm1.weight": {
           "repeat_bitwise_equal": true,
@@ -1319,11 +1319,11 @@
         },
         "temb": {
           "repeat_bitwise_equal": true,
-          "candidate_rel_err_vs_golden": 0.011467791977752724,
-          "provider_rel_err_vs_golden": 0.014677674354460454,
+          "candidate_rel_err_vs_golden": 0.011467852472214853,
+          "provider_rel_err_vs_golden": 0.014651906665419247,
           "storage_dtype": "float32",
-          "candidate_ulps_vs_golden": 96957.75,
-          "provider_ulps_vs_golden": 124096.625
+          "candidate_ulps_vs_golden": 96958.25,
+          "provider_ulps_vs_golden": 123878.75
         }
       },
       "nodes": [

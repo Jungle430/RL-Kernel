@@ -1,7 +1,7 @@
 {
   "pr": "https://github.com/RL-Align/RL-Kernel/pull/656",
-  "source_commit": "ef578bd5489945ca692555c5750d92ca8be7e9d0",
-  "source_tree": "bcccb3185f96677d4b8d289cf8702068fa44cf48",
+  "source_commit": "614924581e676109e1c72acd388320627bbe0b12",
+  "source_tree": "873edd5b3b66e76f3503b80873aec03350359f46",
   "target_commit": "60c6aaf94b95976ad45ca9b30da8d0544d72d442",
   "weight_revision": "42ed227ee7df40d41602854ae760620d6eb651fe",
   "gpu_benchmark": {
@@ -19,5 +19,7 @@
   },
   "samples_per_provider_and_mode": 40,
   "warmups": 10,
-  "seed": 656
+  "seed": 656,
+  "benchmark_schema_version": 3,
+  "baseline_for_validation_peak": "ef578bd5489945ca692555c5750d92ca8be7e9d0"
 }
