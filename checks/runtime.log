@@ -1,0 +1,5 @@
+Python 3.12.3
+2.8.0+cu128 12.8 3.4.0 2
+index, name, driver_version, memory.total [MiB]
+0, NVIDIA A40, 595.112.07, 46068 MiB
+1, NVIDIA A40, 595.112.07, 46068 MiB

@@ -1,0 +1,139 @@
+....FF.FF.......                                                         [100%]
+=================================== FAILURES ===================================
+_____________ test_nodes_accuracy_repeat_batch_and_isolated[0-64] ______________
+
+refiner_weights = {'token_refiner.refiner_blocks.0.norm1.weight': tensor([0.9492, 0.7734, 0.9023,  ..., 0.8359, 0.7656, 0.8984], device=...     [-0.0776,  0.0403,  0.0126,  ..., -0.0128,  0.0439,  0.0193]],
+       device='cuda:0', dtype=torch.bfloat16), ...}
+block = 0, tokens = 64
+
+    @needs_gpu
+    @pytest.mark.parametrize("tokens", [1, 64, 257])
+    @pytest.mark.parametrize("block", [0, 1])
+    def test_nodes_accuracy_repeat_batch_and_isolated(refiner_weights, block, tokens):
+        report = hr.run_refiner_case(refiner_weights, block=block, tokens=tokens, seed=3)
+        assert report["first_repeat_drift"] is None
+        assert report["first_batch_drift"] is None
+        for entry in report["nodes"]:
+            name = entry["node"]
+            assert entry["candidate_rel_err_vs_golden"] <= (
+                FORWARD_FACTOR * entry["provider_rel_err_vs_golden"] + FORWARD_FLOOR
+            ), name
+            if entry["provider_bitwise_isolated_promised"]:
+>               assert entry["isolated_vs_provider"]["bitwise_equal"], name
+E               AssertionError: norm1
+E               assert False
+
+tests/models/minimax_h3/test_h3_token_refiner.py:96: AssertionError
+----------------------------- Captured stdout call -----------------------------
+INFO 11-28 12:05:20 [RL-Kernel]: KernelRegistry initialized for cuda
+INFO 11-28 12:05:20 [RL-Kernel]: TritonDetGemmOp ready (deterministic, autotune disabled).
+INFO 11-28 12:05:20 [RL-Kernel]: Successfully linked to _C.deterministic_attention_forward/backward.
+INFO 11-28 12:05:20 [RL-Kernel]: Successfully linked to precompiled _C.swiglu_forward kernel.
+------------------------------ Captured log call -------------------------------
+INFO     RL-Kernel:registry.py:1374 KernelRegistry initialized for cuda
+INFO     RL-Kernel:det_gemm.py:1425 TritonDetGemmOp ready (deterministic, autotune disabled).
+INFO     RL-Kernel:deterministic_attn.py:118 Successfully linked to _C.deterministic_attention_forward/backward.
+INFO     RL-Kernel:swiglu.py:112 Successfully linked to precompiled _C.swiglu_forward kernel.
+_____________ test_nodes_accuracy_repeat_batch_and_isolated[0-257] _____________
+
+refiner_weights = {'token_refiner.refiner_blocks.0.norm1.weight': tensor([0.9492, 0.7734, 0.9023,  ..., 0.8359, 0.7656, 0.8984], device=...     [-0.0776,  0.0403,  0.0126,  ..., -0.0128,  0.0439,  0.0193]],
+       device='cuda:0', dtype=torch.bfloat16), ...}
+block = 0, tokens = 257
+
+    @needs_gpu
+    @pytest.mark.parametrize("tokens", [1, 64, 257])
+    @pytest.mark.parametrize("block", [0, 1])
+    def test_nodes_accuracy_repeat_batch_and_isolated(refiner_weights, block, tokens):
+        report = hr.run_refiner_case(refiner_weights, block=block, tokens=tokens, seed=3)
+        assert report["first_repeat_drift"] is None
+        assert report["first_batch_drift"] is None
+        for entry in report["nodes"]:
+            name = entry["node"]
+            assert entry["candidate_rel_err_vs_golden"] <= (
+                FORWARD_FACTOR * entry["provider_rel_err_vs_golden"] + FORWARD_FLOOR
+            ), name
+            if entry["provider_bitwise_isolated_promised"]:
+>               assert entry["isolated_vs_provider"]["bitwise_equal"], name
+E               AssertionError: norm1
+E               assert False
+
+tests/models/minimax_h3/test_h3_token_refiner.py:96: AssertionError
+----------------------------- Captured stdout call -----------------------------
+INFO 11-28 12:05:20 [RL-Kernel]: KernelRegistry initialized for cuda
+INFO 11-28 12:05:20 [RL-Kernel]: TritonDetGemmOp ready (deterministic, autotune disabled).
+INFO 11-28 12:05:20 [RL-Kernel]: Successfully linked to _C.deterministic_attention_forward/backward.
+INFO 11-28 12:05:20 [RL-Kernel]: Successfully linked to precompiled _C.swiglu_forward kernel.
+------------------------------ Captured log call -------------------------------
+INFO     RL-Kernel:registry.py:1374 KernelRegistry initialized for cuda
+INFO     RL-Kernel:det_gemm.py:1425 TritonDetGemmOp ready (deterministic, autotune disabled).
+INFO     RL-Kernel:deterministic_attn.py:118 Successfully linked to _C.deterministic_attention_forward/backward.
+INFO     RL-Kernel:swiglu.py:112 Successfully linked to precompiled _C.swiglu_forward kernel.
+_____________ test_nodes_accuracy_repeat_batch_and_isolated[1-64] ______________
+
+refiner_weights = {'token_refiner.refiner_blocks.0.norm1.weight': tensor([0.9492, 0.7734, 0.9023,  ..., 0.8359, 0.7656, 0.8984], device=...     [-0.0776,  0.0403,  0.0126,  ..., -0.0128,  0.0439,  0.0193]],
+       device='cuda:0', dtype=torch.bfloat16), ...}
+block = 1, tokens = 64
+
+    @needs_gpu
+    @pytest.mark.parametrize("tokens", [1, 64, 257])
+    @pytest.mark.parametrize("block", [0, 1])
+    def test_nodes_accuracy_repeat_batch_and_isolated(refiner_weights, block, tokens):
+        report = hr.run_refiner_case(refiner_weights, block=block, tokens=tokens, seed=3)
+        assert report["first_repeat_drift"] is None
+        assert report["first_batch_drift"] is None
+        for entry in report["nodes"]:
+            name = entry["node"]
+            assert entry["candidate_rel_err_vs_golden"] <= (
+                FORWARD_FACTOR * entry["provider_rel_err_vs_golden"] + FORWARD_FLOOR
+            ), name
+            if entry["provider_bitwise_isolated_promised"]:
+>               assert entry["isolated_vs_provider"]["bitwise_equal"], name
+E               AssertionError: q_norm
+E               assert False
+
+tests/models/minimax_h3/test_h3_token_refiner.py:96: AssertionError
+----------------------------- Captured stdout call -----------------------------
+INFO 11-28 12:05:21 [RL-Kernel]: KernelRegistry initialized for cuda
+INFO 11-28 12:05:21 [RL-Kernel]: TritonDetGemmOp ready (deterministic, autotune disabled).
+INFO 11-28 12:05:21 [RL-Kernel]: Successfully linked to _C.deterministic_attention_forward/backward.
+INFO 11-28 12:05:21 [RL-Kernel]: Successfully linked to precompiled _C.swiglu_forward kernel.
+------------------------------ Captured log call -------------------------------
+INFO     RL-Kernel:registry.py:1374 KernelRegistry initialized for cuda
+INFO     RL-Kernel:det_gemm.py:1425 TritonDetGemmOp ready (deterministic, autotune disabled).
+INFO     RL-Kernel:deterministic_attn.py:118 Successfully linked to _C.deterministic_attention_forward/backward.
+INFO     RL-Kernel:swiglu.py:112 Successfully linked to precompiled _C.swiglu_forward kernel.
+_____________ test_nodes_accuracy_repeat_batch_and_isolated[1-257] _____________
+
+refiner_weights = {'token_refiner.refiner_blocks.0.norm1.weight': tensor([0.9492, 0.7734, 0.9023,  ..., 0.8359, 0.7656, 0.8984], device=...     [-0.0776,  0.0403,  0.0126,  ..., -0.0128,  0.0439,  0.0193]],
+       device='cuda:0', dtype=torch.bfloat16), ...}
+block = 1, tokens = 257
+
+    @needs_gpu
+    @pytest.mark.parametrize("tokens", [1, 64, 257])
+    @pytest.mark.parametrize("block", [0, 1])
+    def test_nodes_accuracy_repeat_batch_and_isolated(refiner_weights, block, tokens):
+        report = hr.run_refiner_case(refiner_weights, block=block, tokens=tokens, seed=3)
+        assert report["first_repeat_drift"] is None
+        assert report["first_batch_drift"] is None
+        for entry in report["nodes"]:
+            name = entry["node"]
+            assert entry["candidate_rel_err_vs_golden"] <= (
+                FORWARD_FACTOR * entry["provider_rel_err_vs_golden"] + FORWARD_FLOOR
+            ), name
+            if entry["provider_bitwise_isolated_promised"]:
+>               assert entry["isolated_vs_provider"]["bitwise_equal"], name
+E               AssertionError: norm1
+E               assert False
+
+tests/models/minimax_h3/test_h3_token_refiner.py:96: AssertionError
+----------------------------- Captured stdout call -----------------------------
+INFO 11-28 12:05:21 [RL-Kernel]: KernelRegistry initialized for cuda
+INFO 11-28 12:05:21 [RL-Kernel]: TritonDetGemmOp ready (deterministic, autotune disabled).
+INFO 11-28 12:05:21 [RL-Kernel]: Successfully linked to _C.deterministic_attention_forward/backward.
+INFO 11-28 12:05:21 [RL-Kernel]: Successfully linked to precompiled _C.swiglu_forward kernel.
+------------------------------ Captured log call -------------------------------
+INFO     RL-Kernel:registry.py:1374 KernelRegistry initialized for cuda
+INFO     RL-Kernel:det_gemm.py:1425 TritonDetGemmOp ready (deterministic, autotune disabled).
+INFO     RL-Kernel:deterministic_attn.py:118 Successfully linked to _C.deterministic_attention_forward/backward.
+INFO     RL-Kernel:swiglu.py:112 Successfully linked to precompiled _C.swiglu_forward kernel.
+4 failed, 12 passed in 3.98s

@@ -1,0 +1,178 @@
+{
+  "source": "57c8127c8f9a04940360c5d857bfe470c2b209b2",
+  "tree": "3ae83fd681cdd21e2d211d7866465a95227a041e",
+  "target": "60c6aaf94b95976ad45ca9b30da8d0544d72d442",
+  "weight_revision": "42ed227ee7df40d41602854ae760620d6eb651fe",
+  "environment": {
+    "python": "3.12.3",
+    "torch": "2.8.0+cu128",
+    "triton": "3.4.0",
+    "cuda": "12.8",
+    "hip": null,
+    "gpu": "NVIDIA A40",
+    "compute_capability": [
+      8,
+      6
+    ],
+    "cpu_threads": 1
+  },
+  "suites": {
+    "core": {
+      "passed": 152,
+      "skipped": [],
+      "failures": {}
+    },
+    "optimized": {
+      "passed": 14,
+      "skipped": [],
+      "failures": {}
+    },
+    "compat": {
+      "passed": 27,
+      "skipped": [],
+      "failures": {}
+    },
+    "trace": {
+      "passed": 32,
+      "skipped": [],
+      "failures": {}
+    },
+    "block": {
+      "passed": 44,
+      "skipped": [
+        "test_gemm_rows_run_their_operators_on_sm90"
+      ],
+      "failures": {
+        "test_block_forward[tiny]": "AssertionError: norm1\nassert False",
+        "test_block_forward[small]": "AssertionError: norm1\nassert False"
+      }
+    },
+    "base-block": {
+      "passed": 0,
+      "skipped": [],
+      "failures": {
+        "test_block_forward[tiny]": "AssertionError: norm1\nassert False",
+        "test_block_forward[small]": "AssertionError: norm1\nassert False"
+      }
+    },
+    "refiner": {
+      "passed": 12,
+      "skipped": [],
+      "failures": {
+        "test_nodes_accuracy_repeat_batch_and_isolated[0-64]": "AssertionError: norm1\nassert False",
+        "test_nodes_accuracy_repeat_batch_and_isolated[0-257]": "AssertionError: norm1\nassert False",
+        "test_nodes_accuracy_repeat_batch_and_isolated[1-64]": "AssertionError: q_norm\nassert False",
+        "test_nodes_accuracy_repeat_batch_and_isolated[1-257]": "AssertionError: norm1\nassert False"
+      }
+    },
+    "base-refiner": {
+      "passed": 12,
+      "skipped": [],
+      "failures": {
+        "test_nodes_accuracy_repeat_batch_and_isolated[0-64]": "AssertionError: norm1\nassert False",
+        "test_nodes_accuracy_repeat_batch_and_isolated[0-257]": "AssertionError: norm1\nassert False",
+        "test_nodes_accuracy_repeat_batch_and_isolated[1-64]": "AssertionError: q_norm\nassert False",
+        "test_nodes_accuracy_repeat_batch_and_isolated[1-257]": "AssertionError: norm1\nassert False"
+      }
+    },
+    "prev-refiner": {
+      "passed": 12,
+      "skipped": [],
+      "failures": {
+        "test_nodes_accuracy_repeat_batch_and_isolated[0-64]": "AssertionError: norm1\nassert False",
+        "test_nodes_accuracy_repeat_batch_and_isolated[0-257]": "AssertionError: norm1\nassert False",
+        "test_nodes_accuracy_repeat_batch_and_isolated[1-64]": "AssertionError: q_norm\nassert False",
+        "test_nodes_accuracy_repeat_batch_and_isolated[1-257]": "AssertionError: norm1\nassert False"
+      }
+    },
+    "cpu": {
+      "passed": 181,
+      "skipped": [
+        "test_forward_provider_parity_and_backward_contract[triton-False-17-56-dtype0]",
+        "test_forward_provider_parity_and_backward_contract[triton-False-17-56-dtype1]",
+        "test_forward_provider_parity_and_backward_contract[triton-False-264-14-dtype0]",
+        "test_forward_provider_parity_and_backward_contract[triton-False-264-14-dtype1]",
+        "test_forward_provider_parity_and_backward_contract[triton-True-17-56-dtype0]",
+        "test_forward_provider_parity_and_backward_contract[triton-True-17-56-dtype1]",
+        "test_forward_provider_parity_and_backward_contract[triton-True-264-14-dtype0]",
+        "test_forward_provider_parity_and_backward_contract[triton-True-264-14-dtype1]",
+        "test_mixed_layouts_preserve_rotation_and_gradient[triton-x]",
+        "test_mixed_layouts_preserve_rotation_and_gradient[triton-cos]",
+        "test_mixed_layouts_preserve_rotation_and_gradient[triton-sin]",
+        "test_mixed_layouts_preserve_rotation_and_gradient[triton-broadcast_grad_y]",
+        "test_triton_channel_offsets_above_int32",
+        "test_input_contract_rejects_invalid_metadata[triton-rank-ValueError-x must have shape]",
+        "test_input_contract_rejects_invalid_metadata[triton-channels-ValueError-x must have shape]",
+        "test_input_contract_rejects_invalid_metadata[triton-empty-ValueError-nonempty]",
+        "test_input_contract_rejects_invalid_metadata[triton-cos_shape-ValueError-cos must have shape]",
+        "test_input_contract_rejects_invalid_metadata[triton-sin_dtype-TypeError-sin must have dtype]",
+        "test_input_contract_rejects_invalid_metadata[triton-cos_device-ValueError-cos must be on x.device]",
+        "test_input_contract_rejects_invalid_metadata[triton-sin_trainable-ValueError-sin must not require gradients]",
+        "test_triton_nondefault_stream_and_graph_replay[dtype0]",
+        "test_triton_nondefault_stream_and_graph_replay[dtype1]",
+        "test_triton_uses_input_device_and_restores_current_device[dtype0]",
+        "test_triton_uses_input_device_and_restores_current_device[dtype1]",
+        "test_backward_rounds_once_using_forward_coefficients[triton]",
+        "test_backward_is_first_order_only[triton]",
+        "test_rejects_fp16[triton]",
+        "test_accuracy_against_forward_fp32[triton-420-dtype0]",
+        "test_accuracy_against_forward_fp32[triton-420-dtype1]",
+        "test_accuracy_against_forward_fp32[triton-0-dtype0]",
+        "test_accuracy_against_forward_fp32[triton-0-dtype1]",
+        "test_accuracy_against_forward_fp32[triton-1-dtype0]",
+        "test_accuracy_against_forward_fp32[triton-1-dtype1]",
+        "test_captured_bf16_pairs_preserve_model_and_backward[triton]",
+        "test_captured_bf16_pairs_unrounded_math_diagnostic[triton]",
+        "test_invariance_across_runtime_layouts[triton-False-dtype0]",
+        "test_invariance_across_runtime_layouts[triton-False-dtype1]",
+        "test_invariance_across_runtime_layouts[triton-True-dtype0]",
+        "test_invariance_across_runtime_layouts[triton-True-dtype1]",
+        "test_triton_long_h3_sequences[65535]",
+        "test_triton_long_h3_sequences[65536]",
+        "test_triton_long_h3_sequences[73426]",
+        "test_packed_permutation_head_shards_and_checkpoint[triton-dtype0]",
+        "test_packed_permutation_head_shards_and_checkpoint[triton-dtype1]",
+        "test_rope_replay_reports_the_registry_fallback",
+        "test_stack_rows_dispatch_to_cuda",
+        "test_block_forward[tiny]",
+        "test_block_forward[small]",
+        "test_block_report_names_the_failing_rope_node",
+        "test_block_backward",
+        "test_gemm_rows_run_their_operators_on_sm90",
+        "test_every_tensor_of_the_context_follows_the_weights",
+        "test_the_packed_layout_follows_weights_on_a_non_default_device",
+        "test_nodes_accuracy_repeat_batch_and_isolated[0-1]",
+        "test_nodes_accuracy_repeat_batch_and_isolated[0-64]",
+        "test_nodes_accuracy_repeat_batch_and_isolated[0-257]",
+        "test_nodes_accuracy_repeat_batch_and_isolated[1-1]",
+        "test_nodes_accuracy_repeat_batch_and_isolated[1-64]",
+        "test_nodes_accuracy_repeat_batch_and_isolated[1-257]",
+        "test_report_names_rows_status_and_backend_per_node",
+        "test_full_refiner_stack_against_golden_and_provider",
+        "test_refiner_rows_do_not_depend_on_batch_neighbours",
+        "test_backward_against_fp32_golden",
+        "test_operator_trace_covers_the_refiner_paths",
+        "test_text_path_context_projection_then_refiner",
+        "test_block_replay_trace_matches_h3_block_bindings"
+      ],
+      "failures": {}
+    }
+  },
+  "outliers": {
+    "forward": 2,
+    "backward": 0,
+    "provider_backward": 2
+  },
+  "combined_speedup": [
+    1.164898087820916,
+    3.51079933886876
+  ],
+  "validation_extra_mib": {
+    "bf16": 2348.75,
+    "fp32": 4362.0
+  },
+  "validation_baseline_mib": {
+    "bf16": 10964.8779296875,
+    "fp32": 12707.9375
+  }
+}

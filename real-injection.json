@@ -1,0 +1,596 @@
+{
+  "kind": "h3_one_block_replay",
+  "rfc": "RL-Align/RL-Kernel#420",
+  "model_revision": "42ed227ee7df40d41602854ae760620d6eb651fe",
+  "weights_sha256": {
+    "diffusion_pytorch_model-00001-of-00014.safetensors": {
+      "sha256": "2d847200c45c09dd7f973c1b096663068408ef851ee0b3711d059b6dc5dcd028",
+      "size_bytes": 4825958704
+    }
+  },
+  "reference_commit": "f53d552036a0d1bd5570782a39cd40cfabf112bc",
+  "rl_kernel_commit": "57c8127c8f9a04940360c5d857bfe470c2b209b2",
+  "tracked_tree_dirty": false,
+  "environment": {
+    "gpu": "NVIDIA A40",
+    "capability": [
+      8,
+      6
+    ],
+    "torch": "2.8.0+cu128",
+    "cuda": "12.8",
+    "python": "3.12.3",
+    "tf32": false
+  },
+  "nodes": [
+    {
+      "node": "adaln_projection",
+      "inputs": [
+        "temb"
+      ],
+      "rfc_row": "adaln_projection_3mod",
+      "status": "row",
+      "backend": "H3AdaLNProjectionCudaOp"
+    },
+    {
+      "node": "norm1",
+      "inputs": [
+        "hidden",
+        "adaln_projection"
+      ],
+      "rfc_row": "h3_rmsnorm",
+      "status": "row",
+      "backend": "H3RMSNormCudaOp.forward_modulated"
+    },
+    {
+      "node": "q_proj",
+      "inputs": [
+        "norm1"
+      ],
+      "rfc_row": "h3_qkv_gemm",
+      "status": "row",
+      "backend": "H3QKVGemmCudaOp.forward"
+    },
+    {
+      "node": "k_proj",
+      "inputs": [
+        "norm1"
+      ],
+      "rfc_row": "h3_qkv_gemm",
+      "status": "row",
+      "backend": "H3QKVGemmCudaOp.forward"
+    },
+    {
+      "node": "v_proj",
+      "inputs": [
+        "norm1"
+      ],
+      "rfc_row": "h3_qkv_gemm",
+      "status": "row",
+      "backend": "H3QKVGemmCudaOp.forward"
+    },
+    {
+      "node": "q_norm",
+      "inputs": [
+        "q_proj"
+      ],
+      "rfc_row": "h3_qk_rmsnorm_d128",
+      "status": "interim",
+      "backend": "H3RMSNormCudaOp.forward"
+    },
+    {
+      "node": "k_norm",
+      "inputs": [
+        "k_proj"
+      ],
+      "rfc_row": "h3_qk_rmsnorm_d128",
+      "status": "interim",
+      "backend": "H3RMSNormCudaOp.forward"
+    },
+    {
+      "node": "rope_q",
+      "inputs": [
+        "q_norm"
+      ],
+      "rfc_row": "h3_mm_rope_3axis_partial",
+      "status": "row",
+      "backend": "TritonH3MMRoPEOp"
+    },
+    {
+      "node": "rope_k",
+      "inputs": [
+        "k_norm"
+      ],
+      "rfc_row": "h3_mm_rope_3axis_partial",
+      "status": "row",
+      "backend": "TritonH3MMRoPEOp"
+    },
+    {
+      "node": "attention",
+      "inputs": [
+        "rope_q",
+        "rope_k",
+        "v_proj"
+      ],
+      "rfc_row": "h3_full_attention",
+      "status": "interim",
+      "backend": "DeterministicAttentionOp(causal=False)"
+    },
+    {
+      "node": "o_proj",
+      "inputs": [
+        "attention"
+      ],
+      "rfc_row": "h3_attention_o_gemm",
+      "status": "interim",
+      "backend": "triton _det_gemm_fp32_kernel (FP32 K loop, one BF16 rounding)"
+    },
+    {
+      "node": "residual_attn",
+      "inputs": [
+        "hidden",
+        "o_proj",
+        "adaln_projection"
+      ],
+      "rfc_row": "adaln_gate_residual",
+      "status": "row",
+      "backend": "H3GateResidualCudaOp"
+    },
+    {
+      "node": "norm2",
+      "inputs": [
+        "residual_attn",
+        "adaln_projection"
+      ],
+      "rfc_row": "h3_rmsnorm",
+      "status": "row",
+      "backend": "H3RMSNormCudaOp.forward_modulated"
+    },
+    {
+      "node": "ffn_gate_up",
+      "inputs": [
+        "norm2"
+      ],
+      "rfc_row": "h3_ffn_gate_up_gemm",
+      "status": "interim",
+      "backend": "triton _det_gemm_fp32_kernel (FP32 K loop, one BF16 rounding)"
+    },
+    {
+      "node": "swiglu",
+      "inputs": [
+        "ffn_gate_up"
+      ],
+      "rfc_row": "h3_swiglu",
+      "status": "interim",
+      "backend": "SwiGLUCudaOp"
+    },
+    {
+      "node": "ffn_down",
+      "inputs": [
+        "swiglu"
+      ],
+      "rfc_row": "h3_ffn_down_gemm",
+      "status": "interim",
+      "backend": "triton _det_gemm_fp32_kernel (FP32 K loop, one BF16 rounding)"
+    },
+    {
+      "node": "residual_mlp",
+      "inputs": [
+        "residual_attn",
+        "ffn_down",
+        "adaln_projection"
+      ],
+      "rfc_row": "adaln_gate_residual",
+      "status": "row",
+      "backend": "H3GateResidualCudaOp"
+    }
+  ],
+  "forward_cases": [
+    {
+      "layout": "tiny",
+      "seq_len": 264,
+      "seed": 0,
+      "backends": {
+        "projection": "rl_engine.backends.cuda.model_specific.minimax_h3.adaln_projection.H3AdaLNProjectionCudaOp",
+        "norm": "rl_engine.backends.cuda.model_specific.minimax_h3.rmsnorm.H3RMSNormCudaOp",
+        "gate": "rl_engine.backends.cuda.model_specific.minimax_h3.gate_residual.H3GateResidualCudaOp",
+        "rope": "rl_engine.backends.shared.triton.rope.h3_mm_rope.TritonH3MMRoPEOp",
+        "gemm": "rl_engine.backends.shared.triton.gemm.det_gemm.TritonDetGemmOp",
+        "qkv": "rl_engine.backends.cuda.model_specific.minimax_h3.projection.H3QKVGemmCudaOp",
+        "attention": "rl_engine.backends.cuda.attention.deterministic_attn.DeterministicAttentionOp",
+        "swiglu": "rl_engine.backends.cuda.activation.swiglu.SwiGLUCudaOp"
+      },
+      "golden_role": "block_mathematical_error_reference",
+      "rope_acceptance_reference": "forward_fp32",
+      "nodes": [
+        {
+          "node": "adaln_projection",
+          "rfc_row": "adaln_projection_3mod",
+          "status": "row",
+          "backend": "H3AdaLNProjectionCudaOp",
+          "provider_bitwise_isolated_promised": false,
+          "repeat_bitwise_equal": true,
+          "batch_row_bitwise_equal": true,
+          "chained_vs_provider": {
+            "bitwise_equal": false,
+            "max_abs": 0.0078125,
+            "first_differing_row": -1
+          },
+          "isolated_vs_provider": {
+            "bitwise_equal": false,
+            "max_abs": 0.0078125
+          },
+          "candidate_rel_err_vs_golden": 0.0024624891847536585,
+          "provider_rel_err_vs_golden": 0.0024624891847536585,
+          "candidate_sha256": "33aec0d42b5a02d05a44fe29b4a2d42d863c26e48f2a6e47f8e43a2bd0cb2751"
+        },
+        {
+          "node": "norm1",
+          "rfc_row": "h3_rmsnorm",
+          "status": "row",
+          "backend": "H3RMSNormCudaOp.forward_modulated",
+          "provider_bitwise_isolated_promised": true,
+          "repeat_bitwise_equal": true,
+          "batch_row_bitwise_equal": true,
+          "chained_vs_provider": {
+            "bitwise_equal": false,
+            "max_abs": 0.03515625,
+            "first_differing_row": 0
+          },
+          "isolated_vs_provider": {
+            "bitwise_equal": false,
+            "max_abs": 0.001953125
+          },
+          "candidate_rel_err_vs_golden": 0.005880371187105712,
+          "provider_rel_err_vs_golden": 0.005880371187105712,
+          "candidate_sha256": "249be91a69421a215d213989f63f571c0c4bba42c91cc52155bfc8849a04bf71"
+        },
+        {
+          "node": "q_proj",
+          "rfc_row": "h3_qkv_gemm",
+          "status": "row",
+          "backend": "H3QKVGemmCudaOp.forward",
+          "provider_bitwise_isolated_promised": false,
+          "repeat_bitwise_equal": true,
+          "batch_row_bitwise_equal": true,
+          "chained_vs_provider": {
+            "bitwise_equal": false,
+            "max_abs": 0.25,
+            "first_differing_row": 0
+          },
+          "isolated_vs_provider": {
+            "bitwise_equal": true,
+            "max_abs": 0.0
+          },
+          "candidate_rel_err_vs_golden": 0.0026548137484484983,
+          "provider_rel_err_vs_golden": 0.0026548137484484983,
+          "candidate_sha256": "4d4f5fd3c2331cb0e09c1140c1c7dd9b3a45de25ce9f9ea1dd3e27476b2f0751"
+        },
+        {
+          "node": "k_proj",
+          "rfc_row": "h3_qkv_gemm",
+          "status": "row",
+          "backend": "H3QKVGemmCudaOp.forward",
+          "provider_bitwise_isolated_promised": false,
+          "repeat_bitwise_equal": true,
+          "batch_row_bitwise_equal": true,
+          "chained_vs_provider": {
+            "bitwise_equal": false,
+            "max_abs": 0.25,
+            "first_differing_row": 0
+          },
+          "isolated_vs_provider": {
+            "bitwise_equal": true,
+            "max_abs": 0.0
+          },
+          "candidate_rel_err_vs_golden": 0.0027692352639607787,
+          "provider_rel_err_vs_golden": 0.0027692352639607787,
+          "candidate_sha256": "bb62d3804eab4e350590567d30b46b8a5e0c02ab92cffdffea9eda2819bc26c2"
+        },
+        {
+          "node": "v_proj",
+          "rfc_row": "h3_qkv_gemm",
+          "status": "row",
+          "backend": "H3QKVGemmCudaOp.forward",
+          "provider_bitwise_isolated_promised": false,
+          "repeat_bitwise_equal": true,
+          "batch_row_bitwise_equal": true,
+          "chained_vs_provider": {
+            "bitwise_equal": false,
+            "max_abs": 0.0625,
+            "first_differing_row": 0
+          },
+          "isolated_vs_provider": {
+            "bitwise_equal": true,
+            "max_abs": 0.0
+          },
+          "candidate_rel_err_vs_golden": 0.003925915399235702,
+          "provider_rel_err_vs_golden": 0.004045092748871536,
+          "candidate_sha256": "9de45fba72e7f7b4a46b92a479f7ae2bcad0e5b66134411eec5aca72212fda76"
+        },
+        {
+          "node": "q_norm",
+          "rfc_row": "h3_qk_rmsnorm_d128",
+          "status": "interim",
+          "backend": "H3RMSNormCudaOp.forward",
+          "provider_bitwise_isolated_promised": true,
+          "repeat_bitwise_equal": true,
+          "batch_row_bitwise_equal": true,
+          "chained_vs_provider": {
+            "bitwise_equal": false,
+            "max_abs": 0.0625,
+            "first_differing_row": 0
+          },
+          "isolated_vs_provider": {
+            "bitwise_equal": false,
+            "max_abs": 0.015625
+          },
+          "candidate_rel_err_vs_golden": 0.0055361330932493895,
+          "provider_rel_err_vs_golden": 0.0055361330932493895,
+          "candidate_sha256": "cb535e2d6bedfd8db1f81e51ded08a9c896af815c12b670d34cd3fcfd651c5cb"
+        },
+        {
+          "node": "k_norm",
+          "rfc_row": "h3_qk_rmsnorm_d128",
+          "status": "interim",
+          "backend": "H3RMSNormCudaOp.forward",
+          "provider_bitwise_isolated_promised": true,
+          "repeat_bitwise_equal": true,
+          "batch_row_bitwise_equal": true,
+          "chained_vs_provider": {
+            "bitwise_equal": false,
+            "max_abs": 0.0625,
+            "first_differing_row": 0
+          },
+          "isolated_vs_provider": {
+            "bitwise_equal": false,
+            "max_abs": 0.0078125
+          },
+          "candidate_rel_err_vs_golden": 0.00477155443557621,
+          "provider_rel_err_vs_golden": 0.00477155443557621,
+          "candidate_sha256": "dff7195978b1cc036736c429d6e8ac971a4fdb7383d6b217c804328f7b2e5be4"
+        },
+        {
+          "node": "rope_q",
+          "rfc_row": "h3_mm_rope_3axis_partial",
+          "status": "row",
+          "backend": "TritonH3MMRoPEOp",
+          "provider_bitwise_isolated_promised": true,
+          "repeat_bitwise_equal": true,
+          "batch_row_bitwise_equal": true,
+          "chained_vs_provider": {
+            "bitwise_equal": false,
+            "max_abs": 0.0625,
+            "first_differing_row": 0
+          },
+          "isolated_vs_provider": {
+            "bitwise_equal": true,
+            "max_abs": 0.0
+          },
+          "candidate_rel_err_vs_golden": 0.006878753492167752,
+          "provider_rel_err_vs_golden": 0.006878753492167752,
+          "candidate_sha256": "97c4cc8c8f788753e283148931b383e85844f076c97509c9fffdf7610fb05103",
+          "isolated_model_boundary_accuracy": {
+            "passed": true,
+            "outside_tolerance": 0,
+            "max_abs_error": 0.03125,
+            "atol": 0.02,
+            "rtol": 0.016
+          }
+        },
+        {
+          "node": "rope_k",
+          "rfc_row": "h3_mm_rope_3axis_partial",
+          "status": "row",
+          "backend": "TritonH3MMRoPEOp",
+          "provider_bitwise_isolated_promised": true,
+          "repeat_bitwise_equal": true,
+          "batch_row_bitwise_equal": true,
+          "chained_vs_provider": {
+            "bitwise_equal": false,
+            "max_abs": 0.0625,
+            "first_differing_row": 0
+          },
+          "isolated_vs_provider": {
+            "bitwise_equal": false,
+            "max_abs": null
+          },
+          "candidate_rel_err_vs_golden": 0.007536483717855335,
+          "provider_rel_err_vs_golden": 0.007536483717855335,
+          "candidate_sha256": "81126bcc43e929a606007fe930cfcf559d89eb424be041ae24da932b3fa52ffd",
+          "isolated_model_boundary_accuracy": {
+            "passed": false,
+            "outside_tolerance": 1,
+            "max_abs_error": null,
+            "atol": 0.02,
+            "rtol": 0.016
+          }
+        },
+        {
+          "node": "attention",
+          "rfc_row": "h3_full_attention",
+          "status": "interim",
+          "backend": "DeterministicAttentionOp(causal=False)",
+          "provider_bitwise_isolated_promised": false,
+          "repeat_bitwise_equal": true,
+          "batch_row_bitwise_equal": true,
+          "chained_vs_provider": {
+            "bitwise_equal": false,
+            "max_abs": 0.0625,
+            "first_differing_row": 0
+          },
+          "isolated_vs_provider": {
+            "bitwise_equal": false,
+            "max_abs": 0.0625
+          },
+          "candidate_rel_err_vs_golden": 0.008333781835392925,
+          "provider_rel_err_vs_golden": 0.008333781835392925,
+          "candidate_sha256": "45dfc87361b77e9f38a6e49eea787ac87ac1e77dd7ed0910dcb6114a854f3ad5"
+        },
+        {
+          "node": "o_proj",
+          "rfc_row": "h3_attention_o_gemm",
+          "status": "interim",
+          "backend": "triton _det_gemm_fp32_kernel (FP32 K loop, one BF16 rounding)",
+          "provider_bitwise_isolated_promised": false,
+          "repeat_bitwise_equal": true,
+          "batch_row_bitwise_equal": true,
+          "chained_vs_provider": {
+            "bitwise_equal": false,
+            "max_abs": 2.0,
+            "first_differing_row": 0
+          },
+          "isolated_vs_provider": {
+            "bitwise_equal": false,
+            "max_abs": 2.0
+          },
+          "candidate_rel_err_vs_golden": 0.0038092899117738153,
+          "provider_rel_err_vs_golden": 0.00402444794144056,
+          "candidate_sha256": "bfdc2b10ae32c54ff0629c51da16cb5293bf990f6bb18a7f45a27b11a53ffc3b"
+        },
+        {
+          "node": "residual_attn",
+          "rfc_row": "adaln_gate_residual",
+          "status": "row",
+          "backend": "H3GateResidualCudaOp",
+          "provider_bitwise_isolated_promised": true,
+          "repeat_bitwise_equal": true,
+          "batch_row_bitwise_equal": true,
+          "chained_vs_provider": {
+            "bitwise_equal": false,
+            "max_abs": 4.0,
+            "first_differing_row": 0
+          },
+          "isolated_vs_provider": {
+            "bitwise_equal": true,
+            "max_abs": 0.0
+          },
+          "candidate_rel_err_vs_golden": 0.006348274002371563,
+          "provider_rel_err_vs_golden": 0.007435056530771446,
+          "candidate_sha256": "507d28c14a637d6c99d674c91f1fb32a671a98fe433c2cc4983b264c5b77d606"
+        },
+        {
+          "node": "norm2",
+          "rfc_row": "h3_rmsnorm",
+          "status": "row",
+          "backend": "H3RMSNormCudaOp.forward_modulated",
+          "provider_bitwise_isolated_promised": true,
+          "repeat_bitwise_equal": true,
+          "batch_row_bitwise_equal": true,
+          "chained_vs_provider": {
+            "bitwise_equal": false,
+            "max_abs": 0.0625,
+            "first_differing_row": 0
+          },
+          "isolated_vs_provider": {
+            "bitwise_equal": false,
+            "max_abs": 0.001953125
+          },
+          "candidate_rel_err_vs_golden": 0.012567047442203836,
+          "provider_rel_err_vs_golden": 0.012567047442203836,
+          "candidate_sha256": "fda01cf247bae86c7a40098cea0b14b1c95e4f45f216eb6cfd89e698d325d4df"
+        },
+        {
+          "node": "ffn_gate_up",
+          "rfc_row": "h3_ffn_gate_up_gemm",
+          "status": "interim",
+          "backend": "triton _det_gemm_fp32_kernel (FP32 K loop, one BF16 rounding)",
+          "provider_bitwise_isolated_promised": false,
+          "repeat_bitwise_equal": true,
+          "batch_row_bitwise_equal": true,
+          "chained_vs_provider": {
+            "bitwise_equal": false,
+            "max_abs": 0.21875,
+            "first_differing_row": 0
+          },
+          "isolated_vs_provider": {
+            "bitwise_equal": false,
+            "max_abs": 0.125
+          },
+          "candidate_rel_err_vs_golden": 0.008596251854744549,
+          "provider_rel_err_vs_golden": 0.009017003175496582,
+          "candidate_sha256": "5badfe57476b1de860dd2bc59c02aef70dfce90c27e3d22ed333e69b3a71aeb9"
+        },
+        {
+          "node": "swiglu",
+          "rfc_row": "h3_swiglu",
+          "status": "interim",
+          "backend": "SwiGLUCudaOp",
+          "provider_bitwise_isolated_promised": false,
+          "repeat_bitwise_equal": true,
+          "batch_row_bitwise_equal": true,
+          "chained_vs_provider": {
+            "bitwise_equal": false,
+            "max_abs": 1.75,
+            "first_differing_row": 0
+          },
+          "isolated_vs_provider": {
+            "bitwise_equal": false,
+            "max_abs": 0.5
+          },
+          "candidate_rel_err_vs_golden": 0.013596293978125533,
+          "provider_rel_err_vs_golden": 0.013332109709317757,
+          "candidate_sha256": "86c066b9ec2cddfd5df67f04bd5ceaaa40e935711dd512a52040a172824e6325"
+        },
+        {
+          "node": "ffn_down",
+          "rfc_row": "h3_ffn_down_gemm",
+          "status": "interim",
+          "backend": "triton _det_gemm_fp32_kernel (FP32 K loop, one BF16 rounding)",
+          "provider_bitwise_isolated_promised": false,
+          "repeat_bitwise_equal": true,
+          "batch_row_bitwise_equal": true,
+          "chained_vs_provider": {
+            "bitwise_equal": false,
+            "max_abs": 32.0,
+            "first_differing_row": 0
+          },
+          "isolated_vs_provider": {
+            "bitwise_equal": false,
+            "max_abs": 32.0
+          },
+          "candidate_rel_err_vs_golden": 0.006764149237358791,
+          "provider_rel_err_vs_golden": 0.008535135587932664,
+          "candidate_sha256": "d1e92e841ea6b532d18aae1d9870e76dc8d20a59592645a8accdd259a7c7c8ca"
+        },
+        {
+          "node": "residual_mlp",
+          "rfc_row": "adaln_gate_residual",
+          "status": "row",
+          "backend": "H3GateResidualCudaOp",
+          "provider_bitwise_isolated_promised": true,
+          "repeat_bitwise_equal": true,
+          "batch_row_bitwise_equal": true,
+          "chained_vs_provider": {
+            "bitwise_equal": false,
+            "max_abs": 128.0,
+            "first_differing_row": 0
+          },
+          "isolated_vs_provider": {
+            "bitwise_equal": true,
+            "max_abs": 0.0
+          },
+          "candidate_rel_err_vs_golden": 0.005203089340149474,
+          "provider_rel_err_vs_golden": 0.010678863538354972,
+          "candidate_sha256": "8aeea016f35d4d029a2d7c631c260ab8d32d0cad70ac009469abeeca221246d0"
+        }
+      ],
+      "first_drift": "adaln_projection",
+      "first_isolated_drift": "adaln_projection",
+      "first_repeat_drift": null,
+      "first_batch_drift": null,
+      "first_rope_acceptance_failure": "rope_k",
+      "output": {
+        "candidate_rel_err_vs_golden": 0.005203089340149474,
+        "provider_rel_err_vs_golden": 0.010678863538354972,
+        "candidate_vs_provider_max_abs": 128.0
+      },
+      "permutation_probe": {
+        "bitwise_equal_after_permutation": false,
+        "max_abs": 1.0,
+        "differing_rows": 81
+      }
+    }
+  ],
+  "backward_cases": []
+}
